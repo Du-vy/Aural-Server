@@ -56,7 +56,19 @@ func run() error {
 		return err
 	}
 
-	log := logging.New(cfg.Log.Level, cfg.Log.Format)
+	log, logCloser, err := logging.Setup(logging.Options{
+		Level:      cfg.Log.Level,
+		Format:     cfg.Log.Format,
+		File:       cfg.Log.File,
+		FileLevel:  cfg.Log.FileLevel,
+		FileFormat: cfg.Log.FileFormat,
+		NoColor:    cfg.Log.NoColor,
+	})
+	if err != nil {
+		return fmt.Errorf("setup logging: %w", err)
+	}
+	defer logCloser.Close()
+
 	if created {
 		log.Info("wrote a default configuration file", slog.String("path", *configPath))
 	}
@@ -82,7 +94,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		printOwnerToken(token)
+		PrintOwnerToken(token, cfg.Log.NoColor)
 		return nil
 	}
 
@@ -90,30 +102,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	stats, _ := db.Stats(ctx)
+	PrintBanner(&cfg, stats)
+
 	if token != "" {
-		printOwnerToken(token)
+		PrintOwnerToken(token, cfg.Log.NoColor)
 	}
 
-	log.Info("starting",
+	log.Info("server ready",
+		slog.String("addr", cfg.Address()),
 		slog.String("version", buildinfo.Version),
-		slog.String("name", cfg.Server.Name),
-		slog.String("voice_mode", cfg.Voice.Mode),
-		slog.String("database", cfg.Database.Path))
+		slog.String("voice_mode", cfg.Voice.Mode))
 
 	return server.Run(ctx)
-}
-
-// printOwnerToken puts the token on stdout, where an operator copying it out of
-// a terminal or a log file will actually see it.
-func printOwnerToken(token string) {
-	fmt.Printf(`
-  ---------------------------------------------------------------
-   Owner token: %s
-
-   Redeem it once from a connected client to become this server
-   administrator. It is stored hashed and cannot be shown again;
-   run with -new-owner-token to issue a replacement.
-  ---------------------------------------------------------------
-
-`, token)
 }

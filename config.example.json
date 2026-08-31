@@ -30,6 +30,10 @@
   },
   "log": {
     "level": "info",
-    "format": "text"
+    "format": "pretty",
+    "file": "",
+    "file_level": "info",
+    "file_format": "json",
+    "no_color": false
   }
 }

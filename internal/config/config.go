@@ -74,12 +74,22 @@ type Database struct {
 	Path string `json:"path"`
 }
 
-// Log configures the structured logger.
+// Log configures the structured logger and optional disk logging.
 type Log struct {
 	// Level is one of debug, info, warn, error.
 	Level string `json:"level"`
-	// Format is "text" or "json".
+	// Format is "pretty", "text" or "json".
 	Format string `json:"format"`
+	// File is an optional path to write logs to (e.g. "logs/aural.log").
+	// Empty means file logging is disabled.
+	File string `json:"file"`
+	// FileLevel is the minimum log level for the file handler (debug, info, warn, error).
+	// When empty, it inherits Level.
+	FileLevel string `json:"file_level"`
+	// FileFormat is "json" or "text" for the file handler. Defaults to "json".
+	FileFormat string `json:"file_format"`
+	// NoColor disables ANSI color escape codes in console output.
+	NoColor bool `json:"no_color"`
 }
 
 // DefaultPort is the port an Aural server listens on unless told otherwise.
@@ -107,7 +117,14 @@ func Default() Config {
 		Voice:    Voice{Mode: protocol.VoiceModeClientHost},
 		TLS:      TLS{Enabled: false},
 		Database: Database{Path: "aural.db"},
-		Log:      Log{Level: "info", Format: "text"},
+		Log: Log{
+			Level:      "info",
+			Format:     "pretty",
+			File:       "",
+			FileLevel:  "info",
+			FileFormat: "json",
+			NoColor:    false,
+		},
 	}
 }
 
@@ -214,9 +231,23 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("log.level %q must be debug, info, warn or error", c.Log.Level)
 	}
 	switch c.Log.Format {
-	case "text", "json":
+	case "pretty", "text", "json":
 	default:
-		return fmt.Errorf("log.format %q must be text or json", c.Log.Format)
+		return fmt.Errorf("log.format %q must be pretty, text or json", c.Log.Format)
+	}
+	if c.Log.FileLevel != "" {
+		switch c.Log.FileLevel {
+		case "debug", "info", "warn", "error":
+		default:
+			return fmt.Errorf("log.file_level %q must be debug, info, warn or error", c.Log.FileLevel)
+		}
+	}
+	if c.Log.FileFormat != "" {
+		switch c.Log.FileFormat {
+		case "json", "text":
+		default:
+			return fmt.Errorf("log.file_format %q must be json or text", c.Log.FileFormat)
+		}
 	}
 	return nil
 }

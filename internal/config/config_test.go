@@ -73,3 +73,39 @@ func TestValidateRejectsAnUnreachableServer(t *testing.T) {
 		t.Fatal("a server nobody can enter should be refused")
 	}
 }
+
+func TestValidateLogConfiguration(t *testing.T) {
+	cfg := Default()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default config should be valid: %v", err)
+	}
+
+	cfg.Log.Format = "pretty"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("pretty format should be valid: %v", err)
+	}
+
+	cfg.Log.Format = "invalid_format"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("invalid format should be rejected")
+	}
+
+	cfg.Log.Format = "text"
+	cfg.Log.File = "logs/test.log"
+	cfg.Log.FileLevel = "invalid_level"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("invalid file_level should be rejected")
+	}
+
+	cfg.Log.FileLevel = "debug"
+	cfg.Log.FileFormat = "invalid_format"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("invalid file_format should be rejected")
+	}
+
+	cfg.Log.FileFormat = "json"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid file log config should pass: %v", err)
+	}
+}
+
