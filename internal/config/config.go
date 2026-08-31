@@ -23,6 +23,7 @@ type Config struct {
 	Server       Server       `json:"server"`
 	Registration Registration `json:"registration"`
 	Voice        Voice        `json:"voice"`
+	Uploads      Uploads      `json:"uploads"`
 	TLS          TLS          `json:"tls"`
 	Database     Database     `json:"database"`
 	Log          Log          `json:"log"`
@@ -62,6 +63,30 @@ type Voice struct {
 	Mode string `json:"mode"`
 }
 
+// Uploads governs file attachments. Both limits are in bytes so a server
+// operator can set them exactly; the client is told about them up front, so a
+// file too large is refused before it is sent rather than after.
+type Uploads struct {
+	// Enabled turns attachments off entirely. A server with it off still
+	// serves the files it already holds, so turning it off stops new uploads
+	// without breaking existing history.
+	Enabled bool `json:"enabled"`
+	// Path is the directory files are written under, relative to the working
+	// directory unless absolute.
+	Path string `json:"path"`
+	// MaxFileBytes caps one file.
+	MaxFileBytes int64 `json:"max_file_bytes"`
+	// MaxTotalBytes caps everything the server stores, across all channels.
+	// Zero means no ceiling beyond the disk itself.
+	MaxTotalBytes int64 `json:"max_total_bytes"`
+	// MaxPerMessage caps how many files one message may carry.
+	MaxPerMessage int `json:"max_per_message"`
+	// PendingTTLMinutes is how long a file that was uploaded but never posted
+	// is kept before it is swept. Someone who picks a file and then abandons
+	// the message leaves one behind, and it must not be kept forever.
+	PendingTTLMinutes int `json:"pending_ttl_minutes"`
+}
+
 // TLS serves the WebSocket over wss:// with a certificate you provide.
 type TLS struct {
 	Enabled  bool   `json:"enabled"`
@@ -95,6 +120,13 @@ type Log struct {
 // DefaultPort is the port an Aural server listens on unless told otherwise.
 const DefaultPort = 9871
 
+// The upload ceilings a fresh install starts from: 50 MiB for one file, 5 GiB
+// for everything the server holds.
+const (
+	DefaultMaxFileBytes  int64 = 50 * 1024 * 1024
+	DefaultMaxTotalBytes int64 = 5 * 1024 * 1024 * 1024
+)
+
 // Default returns the configuration a fresh install starts from.
 func Default() Config {
 	return Config{
@@ -114,7 +146,15 @@ func Default() Config {
 			MinUsernameLength: 3,
 			MaxUsernameLength: 32,
 		},
-		Voice:    Voice{Mode: protocol.VoiceModeClientHost},
+		Voice: Voice{Mode: protocol.VoiceModeClientHost},
+		Uploads: Uploads{
+			Enabled:           true,
+			Path:              "uploads",
+			MaxFileBytes:      DefaultMaxFileBytes,
+			MaxTotalBytes:     DefaultMaxTotalBytes,
+			MaxPerMessage:     10,
+			PendingTTLMinutes: 60,
+		},
 		TLS:      TLS{Enabled: false},
 		Database: Database{Path: "aural.db"},
 		Log: Log{
@@ -215,6 +255,28 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("voice.mode %q must be %q or %q",
 			c.Voice.Mode, protocol.VoiceModeClientHost, protocol.VoiceModeServerHost)
+	}
+
+	if c.Uploads.Enabled {
+		c.Uploads.Path = strings.TrimSpace(c.Uploads.Path)
+		if c.Uploads.Path == "" {
+			return errors.New("uploads.path must not be empty while uploads.enabled is true")
+		}
+		if c.Uploads.MaxFileBytes < 1 {
+			return errors.New("uploads.max_file_bytes must be at least 1")
+		}
+		if c.Uploads.MaxTotalBytes < 0 {
+			return errors.New("uploads.max_total_bytes must not be negative")
+		}
+		if c.Uploads.MaxTotalBytes > 0 && c.Uploads.MaxTotalBytes < c.Uploads.MaxFileBytes {
+			return errors.New("uploads.max_total_bytes is below max_file_bytes, no file could ever be stored")
+		}
+		if c.Uploads.MaxPerMessage < 1 {
+			return errors.New("uploads.max_per_message must be at least 1")
+		}
+		if c.Uploads.PendingTTLMinutes < 1 {
+			return errors.New("uploads.pending_ttl_minutes must be at least 1")
+		}
 	}
 
 	if c.TLS.Enabled && (c.TLS.CertFile == "" || c.TLS.KeyFile == "") {

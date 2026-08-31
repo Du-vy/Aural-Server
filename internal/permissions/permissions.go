@@ -21,6 +21,7 @@ const (
 	SendMessages   Permission = 1 << 3 // post in a text channel
 	ChangeNickname Permission = 1 << 4
 	Register       Permission = 1 << 5 // claim a guest identity as an account
+	AttachFiles    Permission = 1 << 6 // post files alongside a message
 
 	ManageChannels  Permission = 1 << 8
 	ManageRoles     Permission = 1 << 9
@@ -44,7 +45,7 @@ const None Permission = 0
 
 // order fixes the presentation order used by Names and by the client UI.
 var order = []Permission{
-	ViewChannel, Connect, Speak, SendMessages, ChangeNickname, Register,
+	ViewChannel, Connect, Speak, SendMessages, ChangeNickname, Register, AttachFiles,
 	ManageChannels, ManageRoles, ManageServer, ManageNicknames, ManageMessages,
 	KickUsers, MoveUsers, MuteUsers, DeafenUsers,
 	Administrator,
@@ -57,6 +58,7 @@ var names = map[Permission]string{
 	SendMessages:    "SendMessages",
 	ChangeNickname:  "ChangeNickname",
 	Register:        "Register",
+	AttachFiles:     "AttachFiles",
 	ManageChannels:  "ManageChannels",
 	ManageRoles:     "ManageRoles",
 	ManageServer:    "ManageServer",
@@ -80,7 +82,7 @@ var All = func() Permission {
 
 // DefaultEveryone is what an unconfigured server grants to every connected
 // user, guests included: they can look around, talk, and claim an account.
-const DefaultEveryone = ViewChannel | Connect | Speak | SendMessages | ChangeNickname | Register
+const DefaultEveryone = ViewChannel | Connect | Speak | SendMessages | ChangeNickname | Register | AttachFiles
 
 // DefaultRegistered is granted on top of DefaultEveryone once a user claims an
 // account. It is deliberately empty so that a fresh server treats guests and

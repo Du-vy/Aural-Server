@@ -10,6 +10,7 @@ import (
 	"github.com/aural-chat/aural-server/internal/permissions"
 	"github.com/aural-chat/aural-server/internal/protocol"
 	"github.com/aural-chat/aural-server/internal/store"
+	"github.com/aural-chat/aural-server/internal/uploads"
 )
 
 // maxChannelDepth bounds the ancestor walk so a cycle introduced by a bad write
@@ -28,6 +29,9 @@ type Hub struct {
 	cfgPath string
 	st      *store.Store
 	log     *slog.Logger
+	// files is nil on a server with uploads switched off, which every path
+	// that touches an attachment checks for.
+	files *uploads.Store
 
 	// cfgMu guards the only configuration fields that change while the server
 	// runs: the server name and description, both editable over the protocol.
@@ -62,7 +66,49 @@ func NewHub(ctx context.Context, cfg *config.Config, cfgPath string, st *store.S
 	if err := h.ReloadChannels(ctx); err != nil {
 		return nil, err
 	}
+	if cfg.Uploads.Enabled {
+		// The quota is measured against what the database already accounts
+		// for, so a restart neither forgets stored files nor double-counts them.
+		used, err := st.TotalAttachmentBytes(ctx)
+		if err != nil {
+			return nil, err
+		}
+		files, err := uploads.Open(cfg.Uploads.Path,
+			cfg.Uploads.MaxFileBytes, cfg.Uploads.MaxTotalBytes, used)
+		if err != nil {
+			return nil, err
+		}
+		h.files = files
+	}
 	return h, nil
+}
+
+// Files is the upload store, or nil when this server has uploads switched off.
+func (h *Hub) Files() *uploads.Store { return h.files }
+
+// UserPermissions resolves what a user may do, from the database rather than
+// from a live session. The HTTP upload endpoint needs it because a client may
+// legitimately be uploading over a connection the WebSocket has not caught up
+// with, and because presence is not what grants a permission: the account is.
+func (h *Hub) UserPermissions(ctx context.Context, u store.User) (permissions.Permission, []int64, error) {
+	explicit, err := h.st.RoleIDsForUser(ctx, u.ID)
+	if err != nil {
+		return permissions.None, nil, err
+	}
+	roleIDs := h.EffectiveRoleIDs(u, explicit)
+	return h.BasePermissions(roleIDs), roleIDs, nil
+}
+
+// RemoveFiles unlinks stored files and gives their room back to the quota. The
+// rows are already gone by the time it is called, so a failure to unlink costs
+// disk space and nothing else.
+func (h *Hub) RemoveFiles(attachments []store.Attachment) {
+	if h.files == nil {
+		return
+	}
+	for _, a := range attachments {
+		h.files.Remove(a.StorageKey, a.Size)
+	}
 }
 
 // ServerIdentity reads the two configuration fields that change at runtime.

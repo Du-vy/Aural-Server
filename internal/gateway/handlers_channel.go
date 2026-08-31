@@ -190,6 +190,17 @@ func handleChannelDelete(ctx context.Context, s *Session, raw json.RawMessage) (
 		return nil, failure
 	}
 
+	// A channel takes its messages with it, and they take their files. The
+	// rows go through the cascade, so what was held has to be read first.
+	doomed, err := s.hub.st.DescendantIDs(ctx, req.ChannelID)
+	if err != nil {
+		return nil, internalError(s, "delete the channel", err)
+	}
+	orphaned, err := s.hub.st.AttachmentsForChannels(ctx, append([]int64{req.ChannelID}, doomed...))
+	if err != nil {
+		return nil, internalError(s, "delete the channel", err)
+	}
+
 	cascaded, err := s.hub.st.DeleteChannel(ctx, req.ChannelID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -197,6 +208,7 @@ func handleChannelDelete(ctx context.Context, s *Session, raw json.RawMessage) (
 		}
 		return nil, internalError(s, "delete the channel", err)
 	}
+	s.hub.RemoveFiles(orphaned)
 	if err := s.hub.ReloadChannels(ctx); err != nil {
 		return nil, internalError(s, "reload the channel tree", err)
 	}

@@ -19,6 +19,12 @@ The default port is **9871**. Two plain HTTP endpoints sit alongside the socket:
 | --------- | -------------------------------------------------------------------- |
 | `GET /info`   | Unauthenticated server preview. A client shows it before connecting, and the future Aural Hub reads it to list servers. Sends `Access-Control-Allow-Origin: *`. |
 | `GET /health` | Liveness probe for process supervisors. Returns `ok`.            |
+| `POST /upload` | Uploads one file. See [Attachments](#attachments).               |
+| `GET /attachments/{key}/{filename}` | Serves an uploaded file.                |
+
+Files travel over HTTP rather than over the socket: a file does not fit the
+64 KiB frame budget, and HTTP is what gives an upload a progress bar and a
+download range requests, seeking and ordinary caching.
 
 The server pings every 30 seconds and drops a peer that does not pong within 10.
 `hello.heartbeatMs` reports the interval so a client can size its own timeout.
@@ -68,6 +74,9 @@ never on `message`.
 | `username_taken` | That username already exists. |
 | `already_registered` | This identity already has an account. |
 | `rate_limited` | Too many attempts. |
+| `too_large` | One upload exceeded the per-file ceiling. |
+| `storage_full` | The server-wide upload ceiling is reached. |
+| `uploads_disabled` | This server does not accept file uploads. |
 
 ## Numbers
 
@@ -235,7 +244,19 @@ channel never leaks through the presence list.
   "author": "Pablo",       // resolved live from the users table
   "content": "Hello",
   "createdAt": 1756600000, // Unix seconds
-  "editedAt": null
+  "editedAt": null,
+  "attachments": []        // absent when the message carries no files
+}
+
+// Attachment
+{
+  "id": 7,
+  "filename": "screenshot.png",
+  "contentType": "image/png",   // decided by the server, never by the uploader
+  "size": "184320",             // decimal string, as byte counts can exceed 2^53
+  "url": "/attachments/Yk3.../screenshot.png",  // relative to the server root
+  "width": 1280,                // images only, and only when readable
+  "height": 720
 }
 
 // ServerInfo
@@ -249,7 +270,14 @@ channel never leaks through the presence list.
   "passwordProtected": false,
   "registrationEnabled": true,
   "guestsAllowed": true,
-  "voiceMode": "client_host"  // client_host | server_host
+  "voiceMode": "client_host",  // client_host | server_host
+  "uploads": {
+    "enabled": true,
+    "maxFileBytes": "52428800",     // decimal strings, for the same reason
+    "maxTotalBytes": "5368709120",  // "0" means no ceiling but the disk
+    "usedBytes": "1048576",
+    "maxPerMessage": 10
+  }
 }
 ```
 
@@ -265,6 +293,7 @@ A 64-bit mask. `Administrator` bypasses every other check.
 | 3 | `SendMessages` | Post in a text channel |
 | 4 | `ChangeNickname` | Change your own nickname |
 | 5 | `Register` | Claim your identity as an account |
+| 6 | `AttachFiles` | Post files alongside a message |
 | 8 | `ManageChannels` | Create, edit and delete channels |
 | 9 | `ManageRoles` | Manage roles and channel overwrites |
 | 10 | `ManageServer` | Rename the server |
@@ -331,7 +360,7 @@ Every op below needs an authenticated session.
 | `channel.create` | `ManageChannels` on the parent | `{ name, type, parentId?, topic?, position?, userLimit? }`. |
 | `channel.update` | `ManageChannels` on the channel; `ManageRoles` to touch `overwrites` | `{ channelId, name?, topic?, parentId?, position?, userLimit?, overwrites? }`. |
 | `channel.delete` | `ManageChannels` on the channel | `{ channelId }`. Cascades to descendants. |
-| `message.send` | `SendMessages` on the channel | `{ channelId, content }`. Text channels only. Rate limited. |
+| `message.send` | `SendMessages`, plus `AttachFiles` to carry files | `{ channelId, content, attachments? }`. Text channels only. Rate limited. |
 | `message.history` | `ViewChannel` on the channel | `{ channelId, before?, limit? }`. Pages backwards; `limit` defaults to 50, capped at 100. |
 | `message.edit` | Author only | `{ messageId, content }`. |
 | `message.delete` | Author, or `ManageMessages` on the channel | `{ messageId }`. |
@@ -363,6 +392,65 @@ Two notes on `user.move`:
   selected client side.
 - `parentId` in `channel.update` is three-valued: absent leaves the parent alone,
   `null` detaches the channel to the root, and a number reparents it.
+
+## Attachments
+
+A file is posted in two steps. It is uploaded on its own, and the message that
+carries it names the id that came back. That split is what lets a client show an
+upload finishing while its author is still typing, and what lets the server
+refuse a file on its own terms rather than in the middle of sending a message.
+
+### `POST /upload?channel=<id>`
+
+```
+Authorization: Bearer <session token>
+Content-Type: multipart/form-data, with one part named "file"
+```
+
+The token is the same one `auth.token` resumes with. The caller must hold both
+`SendMessages` and `AttachFiles` in that channel, and the channel must be a text
+channel. On success the reply is `201` with one **Attachment** object; on failure
+it is a JSON body `{ "error": { "code", "message" } }` using the codes above, so
+one table of errors covers both halves of the protocol.
+
+An upload is **pending** until a message claims it. It belongs to the uploader
+and to the channel it was made for, it can be claimed exactly once, and one that
+is never posted is swept after `uploads.pending_ttl_minutes`.
+
+### `GET /attachments/{key}/{filename}`
+
+The `key` is an unguessable 192-bit value minted per upload, and it is the whole
+of the access control: a client cannot attach an `Authorization` header to an
+`<img>` or `<video>` tag, so the URL is the capability. This is the same model a
+CDN-backed chat uses, and it has the same consequence — **anyone given the link
+can fetch the file**, whether or not they could see the channel it was posted in.
+
+The response supports range requests, so a video can be seeked and a client can
+read only the head of a large text file. Three things are fixed by the server
+and never by the uploader:
+
+- **The content type comes from the extension**, against a fixed table. Anything
+  unrecognised is served as `application/octet-stream`.
+- **`X-Content-Type-Options: nosniff`** is always sent, so a browser cannot sniff
+  its way to a type the server did not choose.
+- **Only media, PDFs and plain text are served inline.** Everything else, SVG
+  included, is sent as a download. Adding `?download=1` forces a download for
+  any file.
+
+### Lifetime
+
+Files live and die with their message. `message.delete` removes the rows and
+then the files, and `channel.delete` does the same for everything the channel
+held. There is no separate permission and no separate operation for deleting a
+file: **moderating a file is moderating the message it arrived in**, so anyone
+who may delete the message — its author, or a holder of `ManageMessages` — takes
+its files with it. `message.edit` never touches attachments, which is also why a
+message that carries a file may be edited down to no text at all.
+
+Two limits are configured on the server and advertised in `ServerInfo.uploads`,
+so a client can refuse a file in the picker rather than after a long transfer:
+`maxFileBytes` for one file and `maxTotalBytes` for everything the server holds.
+They default to 50 MiB and 5 GiB.
 
 ## Events
 

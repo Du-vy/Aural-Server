@@ -14,3 +14,7 @@
 Thumbs.db
 .idea/
 .vscode/
+
+# Attachments written by the upload endpoint. Anchored to the root, or it
+# would also swallow the internal/uploads source package.
+/uploads/

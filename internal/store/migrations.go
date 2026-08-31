@@ -96,6 +96,38 @@ var migrations = []string{
 	-- History is always read newest first within one channel.
 	CREATE INDEX idx_messages_channel ON messages(channel_id, id DESC);
 	`,
+	// 3: file attachments.
+	`
+	CREATE TABLE attachments (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		-- NULL while the file has been uploaded but the message carrying it has
+		-- not been sent yet. Deleting the message takes its files with it, which
+		-- is what makes moderation of a file the same act as moderation of the
+		-- message it arrived in.
+		message_id   INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+		user_id      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+		-- The channel the file was uploaded for. It is checked again when the
+		-- message is sent, so a file cannot be moved into a channel its uploader
+		-- may not post in.
+		channel_id   INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+		-- storage_key is both the name on disk and the unguessable part of the
+		-- download URL.
+		storage_key  TEXT    NOT NULL UNIQUE,
+		filename     TEXT    NOT NULL,
+		content_type TEXT    NOT NULL,
+		size         INTEGER NOT NULL,
+		width        INTEGER,
+		height       INTEGER,
+		created_at   INTEGER NOT NULL
+	);
+	CREATE INDEX idx_attachments_message ON attachments(message_id);
+	CREATE INDEX idx_attachments_pending ON attachments(created_at) WHERE message_id IS NULL;
+
+	-- Existing servers seeded their everyone role before AttachFiles existed.
+	-- Granting it here keeps a server that upgrades behaving like a fresh one,
+	-- which is what an administrator who never touched the role expects.
+	UPDATE roles SET permissions = permissions | 64 WHERE managed = 'everyone';
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

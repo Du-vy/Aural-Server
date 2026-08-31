@@ -108,6 +108,9 @@ const (
 	ErrUsernameTaken      = "username_taken"
 	ErrAlreadyRegistered  = "already_registered"
 	ErrRateLimited        = "rate_limited"
+	ErrTooLarge           = "too_large"    // one upload exceeded the file ceiling
+	ErrStorageFull        = "storage_full" // the server-wide upload ceiling is reached
+	ErrUploadsDisabled    = "uploads_disabled"
 )
 
 // Error is the payload of an OpError reply.

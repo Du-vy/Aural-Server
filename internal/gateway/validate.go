@@ -192,9 +192,13 @@ func cleanMessage(in string) string {
 }
 
 // validateMessageContent normalises and checks the body of a message.
-func validateMessageContent(raw string) (string, *protocol.Error) {
+//
+// hasAttachments relaxes the one rule files change: a message that carries a
+// picture says something without a word of text, so emptiness is only an error
+// when there is nothing else in the message either.
+func validateMessageContent(raw string, hasAttachments bool) (string, *protocol.Error) {
 	content := cleanMessage(raw)
-	if content == "" {
+	if content == "" && !hasAttachments {
 		return "", protocol.Errorf(protocol.ErrBadRequest, "a message cannot be empty")
 	}
 	if utf8.RuneCountInString(content) > maxMessageRunes {

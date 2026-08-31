@@ -27,16 +27,33 @@ const (
 // WebSocket (in Hello) and over plain HTTP at GET /info, so a client can preview
 // a server before connecting to it.
 type ServerInfo struct {
-	Name                string `json:"name"`
-	Description         string `json:"description"`
-	ProtocolVersion     int    `json:"protocolVersion"`
-	SoftwareVersion     string `json:"softwareVersion"`
-	MaxUsers            int    `json:"maxUsers"`
-	OnlineUsers         int    `json:"onlineUsers"`
-	PasswordProtected   bool   `json:"passwordProtected"`
-	RegistrationEnabled bool   `json:"registrationEnabled"`
-	GuestsAllowed       bool   `json:"guestsAllowed"`
-	VoiceMode           string `json:"voiceMode"`
+	Name                string  `json:"name"`
+	Description         string  `json:"description"`
+	ProtocolVersion     int     `json:"protocolVersion"`
+	SoftwareVersion     string  `json:"softwareVersion"`
+	MaxUsers            int     `json:"maxUsers"`
+	OnlineUsers         int     `json:"onlineUsers"`
+	PasswordProtected   bool    `json:"passwordProtected"`
+	RegistrationEnabled bool    `json:"registrationEnabled"`
+	GuestsAllowed       bool    `json:"guestsAllowed"`
+	VoiceMode           string  `json:"voiceMode"`
+	Uploads             Uploads `json:"uploads"`
+}
+
+// Uploads tells a client what this server accepts before it sends anything, so
+// a file that is too large is refused in the picker rather than after a long
+// transfer. Byte counts are decimal strings for the same reason permission
+// masks are: they can exceed what a JavaScript number represents exactly.
+type Uploads struct {
+	Enabled bool `json:"enabled"`
+	// MaxFileBytes caps one file.
+	MaxFileBytes string `json:"maxFileBytes"`
+	// MaxTotalBytes caps everything the server stores. "0" means no ceiling.
+	MaxTotalBytes string `json:"maxTotalBytes"`
+	// UsedBytes is how much of that ceiling is already taken.
+	UsedBytes string `json:"usedBytes"`
+	// MaxPerMessage caps how many files one message may carry.
+	MaxPerMessage int `json:"maxPerMessage"`
 }
 
 // User is a member of the server. Guests are users too: they simply have no
@@ -99,6 +116,28 @@ type Message struct {
 	Content   string `json:"content"`
 	CreatedAt int64  `json:"createdAt"`
 	EditedAt  *int64 `json:"editedAt"`
+	// Attachments are the files posted with the message. They live and die
+	// with it: deleting the message deletes the files.
+	Attachments []Attachment `json:"attachments,omitempty"`
+}
+
+// Attachment is one file carried by a message.
+//
+// URL is relative to the server root, so a client that reached the server by
+// address, by hostname or through a reverse proxy all build the same working
+// link from the address they already hold. It embeds an unguessable key and
+// needs no further authentication, which is what lets an <img>, <audio> or
+// <video> tag load it directly.
+type Attachment struct {
+	ID          int64  `json:"id"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"contentType"`
+	// Size is a decimal string: a file may be larger than 2^53 bytes.
+	Size string `json:"size"`
+	URL  string `json:"url"`
+	// Width and Height are set for images whose dimensions could be read.
+	Width  *int `json:"width,omitempty"`
+	Height *int `json:"height,omitempty"`
 }
 
 // Hello is the first frame the server sends, before any authentication. It lets
@@ -205,6 +244,10 @@ type ChannelDeleteRequest struct {
 type MessageSendRequest struct {
 	ChannelID int64  `json:"channelId"`
 	Content   string `json:"content"`
+	// Attachments are the ids returned by POST /upload. A message may carry
+	// files with no text of its own, which is the one case where empty content
+	// is accepted.
+	Attachments []int64 `json:"attachments,omitempty"`
 }
 
 // MessageHistoryRequest pages backwards through a channel. Before is the id to

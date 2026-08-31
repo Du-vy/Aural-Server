@@ -20,6 +20,14 @@
   "voice": {
     "mode": "client_host"
   },
+  "uploads": {
+    "enabled": true,
+    "path": "uploads",
+    "max_file_bytes": 52428800,
+    "max_total_bytes": 5368709120,
+    "max_per_message": 10,
+    "pending_ttl_minutes": 60
+  },
   "tls": {
     "enabled": false,
     "cert_file": "",

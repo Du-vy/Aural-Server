@@ -1,6 +1,9 @@
 package gateway
 
 import (
+	"net/url"
+	"strconv"
+
 	"github.com/aural-chat/aural-server/internal/buildinfo"
 	"github.com/aural-chat/aural-server/internal/permissions"
 	"github.com/aural-chat/aural-server/internal/protocol"
@@ -42,9 +45,11 @@ func channelView(c store.Channel) protocol.Channel {
 	return out
 }
 
-// messageView converts a stored message into its wire form.
-func messageView(m store.Message) protocol.Message {
-	return protocol.Message{
+// messageView converts a stored message and the files it carries into the wire
+// form. A message with no files carries an absent field rather than an empty
+// list, which keeps the common frame the size it has always been.
+func messageView(m store.Message, attachments []store.Attachment) protocol.Message {
+	out := protocol.Message{
 		ID:        m.ID,
 		ChannelID: m.ChannelID,
 		UserID:    m.UserID,
@@ -52,6 +57,28 @@ func messageView(m store.Message) protocol.Message {
 		Content:   m.Content,
 		CreatedAt: m.CreatedAt,
 		EditedAt:  m.EditedAt,
+	}
+	for _, a := range attachments {
+		out.Attachments = append(out.Attachments, attachmentView(a))
+	}
+	return out
+}
+
+// attachmentView converts a stored attachment into its wire form.
+//
+// The URL is relative and carries the filename as its last segment, so a
+// browser saving the file gets the name it was uploaded under, and a client
+// reaching the server by address, by hostname or through a proxy all build the
+// same working link from the address they already hold.
+func attachmentView(a store.Attachment) protocol.Attachment {
+	return protocol.Attachment{
+		ID:          a.ID,
+		Filename:    a.Filename,
+		ContentType: a.ContentType,
+		Size:        strconv.FormatInt(a.Size, 10),
+		URL:         uploadPrefix + a.StorageKey + "/" + url.PathEscape(a.Filename),
+		Width:       a.Width,
+		Height:      a.Height,
 	}
 }
 
@@ -108,5 +135,22 @@ func (h *Hub) serverInfo() protocol.ServerInfo {
 		RegistrationEnabled: cfg.Registration.Enabled,
 		GuestsAllowed:       cfg.Registration.AllowGuests,
 		VoiceMode:           cfg.Voice.Mode,
+		Uploads:             h.uploadInfo(),
+	}
+}
+
+// uploadInfo is what a client is told about attachments before it sends one,
+// so a file that is too large is refused in the picker rather than after a
+// long transfer.
+func (h *Hub) uploadInfo() protocol.Uploads {
+	if h.files == nil {
+		return protocol.Uploads{Enabled: false, MaxFileBytes: "0", MaxTotalBytes: "0", UsedBytes: "0"}
+	}
+	return protocol.Uploads{
+		Enabled:       true,
+		MaxFileBytes:  strconv.FormatInt(h.files.MaxFileBytes(), 10),
+		MaxTotalBytes: strconv.FormatInt(h.files.MaxTotalBytes(), 10),
+		UsedBytes:     strconv.FormatInt(h.files.UsedBytes(), 10),
+		MaxPerMessage: h.cfg.Uploads.MaxPerMessage,
 	}
 }

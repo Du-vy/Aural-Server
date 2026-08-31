@@ -68,6 +68,14 @@ leave out falls back to its default. See `config.example.json` for the full file
     "min_password_length": 8
   },
   "voice": { "mode": "client_host" },  // client_host | server_host
+  "uploads": {
+    "enabled": true,
+    "path": "uploads",              // where files are written
+    "max_file_bytes": 52428800,     // 50 MiB, per file
+    "max_total_bytes": 5368709120,  // 5 GiB across the whole server; 0 = no cap
+    "max_per_message": 10,
+    "pending_ttl_minutes": 60       // how long an unposted upload is kept
+  },
   "tls": { "enabled": false, "cert_file": "", "key_file": "" },
   "database": { "path": "aural.db" },
   "log": { "level": "info", "format": "text" }
@@ -79,6 +87,24 @@ rejected at startup, since nobody could ever connect.
 
 `server.name` and `server.description` can also be changed at runtime by an
 administrator, and the change is written back to this file.
+
+### File uploads
+
+Both ceilings are yours to set: `max_file_bytes` caps one file and
+`max_total_bytes` caps everything the server stores. A client is told both
+before it sends anything, so a file that is too large is refused in the picker
+rather than after a long upload. Setting `uploads.enabled` to `false` stops new
+uploads while still serving the files already posted.
+
+Files are written under `uploads.path` and named by an unguessable key, which is
+also the only credential their download URL carries — a browser cannot put an
+`Authorization` header on an `<img>` tag. **Anyone given the link can fetch the
+file**, whether or not they could see the channel it was posted in. If that is
+not the trade you want for your server, turn uploads off.
+
+Deleting a message deletes the files it carried, on disk and in the database.
+That is the whole of the moderation story: anyone who may delete the message —
+its author, or a holder of `ManageMessages` — takes its files with it.
 
 ## How identity works
 
@@ -123,7 +149,7 @@ Three roles are built in and cannot be deleted:
 
 | Role | Held by | Default permissions |
 | --- | --- | --- |
-| `everyone` | Everyone, guests included | View, Connect, Speak, SendMessages, ChangeNickname, Register |
+| `everyone` | Everyone, guests included | View, Connect, Speak, SendMessages, ChangeNickname, Register, AttachFiles |
 | `Member` | Anyone who has claimed an account | None — a fresh server treats guests and members alike |
 | `Admin` | Whoever redeems the owner token | Administrator |
 
@@ -144,6 +170,7 @@ internal/config       JSON configuration, defaults and validation
 internal/store        SQLite schema, migrations and every query
 internal/auth         Argon2id passwords and opaque session tokens
 internal/permissions  the bitmask and the resolution rules
+internal/uploads      attachment storage on disk, quota and content types
 internal/protocol     the wire format, shared with the client
 internal/gateway      HTTP and WebSocket, the hub, and every op handler
 internal/logging      structured logger setup
@@ -180,11 +207,15 @@ over the cgo-based driver, and why cross-compiling needs nothing but `GOOS` and
 **v0.1** — identity and registration, channel tree, roles, permissions,
 presence, one connection per identity.
 
-**v0.2 (here)** — text channels: messages, paged history, editing, deletion,
+**v0.2** — text channels: messages, paged history, editing, deletion,
 per-connection rate limiting, and the `ManageMessages` permission. Emoji need
 no server support beyond not mangling them, which the test suite pins.
 
-**v0.3** — the audio plane. The protocol already advertises which of the two
+**v0.3 (here)** — file attachments: an HTTP upload endpoint, range-served
+downloads, configurable per-file and server-wide storage ceilings, the
+`AttachFiles` permission, and files that are deleted along with their message.
+
+**v0.4** — the audio plane. The protocol already advertises which of the two
 hosting models a server runs:
 
 - `client_host` — the first user to enter a voice channel relays its audio for
@@ -192,8 +223,8 @@ hosting models a server runs:
   the next user in the channel takes over.
 - `server_host` — the server relays all audio, the traditional model.
 
-**Later** — bans, per-user permission overwrites, message attachments, screen
-sharing, and Aural Hub, a directory for finding public servers.
+**Later** — bans, per-user permission overwrites, screen sharing, and Aural
+Hub, a directory for finding public servers.
 
 ## License
 

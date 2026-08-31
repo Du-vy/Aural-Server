@@ -30,6 +30,9 @@ type Server struct {
 	hub  *Hub
 	http *http.Server
 	seq  atomic.Int64
+	// uploads throttles the HTTP upload endpoint, which has no session of its
+	// own to hang a limiter off.
+	uploads *uploadLimiters
 }
 
 // New builds the gateway. cfgPath is where runtime configuration edits are
@@ -40,12 +43,16 @@ func New(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Stor
 		return nil, err
 	}
 
-	s := &Server{cfg: cfg, st: st, log: log, hub: hub}
+	s := &Server{cfg: cfg, st: st, log: log, hub: hub, uploads: newUploadLimiters()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /info", s.handleInfo)
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /ws", s.handleWebSocket)
+	mux.HandleFunc("POST /upload", s.handleUpload)
+	mux.HandleFunc("OPTIONS /upload", s.handlePreflight)
+	mux.HandleFunc("GET "+uploadPrefix+"{key}/{filename}", s.handleAttachment)
+	mux.HandleFunc("OPTIONS "+uploadPrefix+"{key}/{filename}", s.handlePreflight)
 
 	s.http = &http.Server{
 		Addr:              cfg.Address(),
@@ -68,6 +75,10 @@ func (s *Server) Handler() http.Handler { return s.http.Handler }
 // Run serves until ctx is cancelled, then drains and stops.
 func (s *Server) Run(ctx context.Context) error {
 	errs := make(chan error, 1)
+
+	if s.hub.Files() != nil {
+		go s.sweepPending(ctx)
+	}
 
 	go func() {
 		var err error
