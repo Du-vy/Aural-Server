@@ -17,6 +17,10 @@ const (
 	maxChannelName   = 64
 	maxTopicRunes    = 512
 	maxRoleName      = 48
+	maxMessageRunes  = 2000
+	// maxMessageNewlines keeps one message from scrolling everybody else's
+	// history off the screen.
+	maxMessageNewlines = 30
 )
 
 // cleanText strips control characters and collapses surrounding whitespace, so
@@ -155,4 +159,47 @@ func validateChannelType(kind string) *protocol.Error {
 	default:
 		return protocol.Errorf(protocol.ErrBadRequest, "channel type must be category, text or voice")
 	}
+}
+
+// cleanMessage strips control characters but keeps line breaks, which carry
+// meaning inside a message in a way they never do inside a name. A run of
+// blank lines is capped so one message cannot scroll everybody else's history
+// off the screen.
+func cleanMessage(in string) string {
+	var b strings.Builder
+	b.Grow(len(in))
+
+	newlines := 0
+	for _, r := range in {
+		switch {
+		case r == '\n':
+			newlines++
+			if newlines <= maxMessageNewlines {
+				b.WriteRune(r)
+			}
+			continue
+		case r == '\t':
+			b.WriteRune(' ')
+		case r == utf8.RuneError, unicode.IsControl(r):
+			// Dropped: no other control character means anything here.
+			continue
+		default:
+			b.WriteRune(r)
+		}
+		newlines = 0
+	}
+	return strings.Trim(b.String(), " \n")
+}
+
+// validateMessageContent normalises and checks the body of a message.
+func validateMessageContent(raw string) (string, *protocol.Error) {
+	content := cleanMessage(raw)
+	if content == "" {
+		return "", protocol.Errorf(protocol.ErrBadRequest, "a message cannot be empty")
+	}
+	if utf8.RuneCountInString(content) > maxMessageRunes {
+		return "", protocol.Errorf(protocol.ErrBadRequest,
+			fmt.Sprintf("a message must be at most %d characters", maxMessageRunes))
+	}
+	return content, nil
 }

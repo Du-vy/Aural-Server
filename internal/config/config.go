@@ -4,6 +4,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -128,10 +129,20 @@ func Load(path string) (Config, bool, error) {
 	}
 
 	// Decoding onto the defaults leaves absent keys at their default value.
-	if err := json.Unmarshal(raw, &cfg); err != nil {
+	if err := json.Unmarshal(stripBOM(raw), &cfg); err != nil {
 		return cfg, false, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	return cfg, false, cfg.Validate()
+}
+
+// utf8BOM is the byte order mark several Windows editors, and PowerShell's own
+// Out-File, prepend to a UTF-8 file. It is not valid JSON, so a configuration
+// saved by one of them would otherwise fail to parse with a message that gives
+// no hint of the real cause.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+func stripBOM(raw []byte) []byte {
+	return bytes.TrimPrefix(raw, utf8BOM)
 }
 
 // Save writes cfg to path as indented JSON.

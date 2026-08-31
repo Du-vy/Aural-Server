@@ -29,6 +29,11 @@ const (
 	maxAuthAttempts = 6
 	// writeTimeout bounds a single frame write to a stalled peer.
 	writeTimeout = 10 * time.Second
+	// messageBurst and messagesPerSecond throttle posting. The burst is what a
+	// person catching up on a conversation actually sends; the refill rate is
+	// what stops a script from filling everybody's scrollback.
+	messageBurst      = 8
+	messagesPerSecond = 1.5
 )
 
 // Session is one client connection and the identity behind it.
@@ -39,6 +44,10 @@ type Session struct {
 
 	conn *websocket.Conn
 	out  chan protocol.Envelope
+
+	// messages throttles the chat ops, which are the only ones a client sends
+	// in bulk during normal use.
+	messages *rateLimiter
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -55,12 +64,13 @@ type Session struct {
 
 func newSession(id int64, hub *Hub, conn *websocket.Conn, log *slog.Logger) *Session {
 	return &Session{
-		ID:     id,
-		hub:    hub,
-		log:    log.With(slog.Int64("session", id)),
-		conn:   conn,
-		out:    make(chan protocol.Envelope, outboundBuffer),
-		closed: make(chan struct{}),
+		ID:       id,
+		hub:      hub,
+		log:      log.With(slog.Int64("session", id)),
+		conn:     conn,
+		out:      make(chan protocol.Envelope, outboundBuffer),
+		closed:   make(chan struct{}),
+		messages: newRateLimiter(messageBurst, messagesPerSecond),
 	}
 }
 
@@ -324,6 +334,11 @@ var routes = map[string]route{
 	protocol.OpChannelCreate: {needsAuth: true, fn: handleChannelCreate},
 	protocol.OpChannelUpdate: {needsAuth: true, fn: handleChannelUpdate},
 	protocol.OpChannelDelete: {needsAuth: true, fn: handleChannelDelete},
+
+	protocol.OpMessageSend:    {needsAuth: true, fn: handleMessageSend},
+	protocol.OpMessageHistory: {needsAuth: true, fn: handleMessageHistory},
+	protocol.OpMessageEdit:    {needsAuth: true, fn: handleMessageEdit},
+	protocol.OpMessageDelete:  {needsAuth: true, fn: handleMessageDelete},
 
 	protocol.OpRoleCreate:   {needsAuth: true, fn: handleRoleCreate},
 	protocol.OpRoleUpdate:   {needsAuth: true, fn: handleRoleUpdate},

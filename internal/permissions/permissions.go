@@ -18,7 +18,7 @@ const (
 	ViewChannel    Permission = 1 << 0 // see a channel and its members
 	Connect        Permission = 1 << 1 // join a voice channel
 	Speak          Permission = 1 << 2 // transmit in a voice channel
-	SendMessages   Permission = 1 << 3 // reserved for text channels
+	SendMessages   Permission = 1 << 3 // post in a text channel
 	ChangeNickname Permission = 1 << 4
 	Register       Permission = 1 << 5 // claim a guest identity as an account
 
@@ -26,6 +26,9 @@ const (
 	ManageRoles     Permission = 1 << 9
 	ManageServer    Permission = 1 << 10
 	ManageNicknames Permission = 1 << 11
+	// ManageMessages covers other people's messages. Deleting your own needs
+	// no permission at all.
+	ManageMessages Permission = 1 << 12
 
 	KickUsers   Permission = 1 << 16
 	MoveUsers   Permission = 1 << 17
@@ -42,7 +45,7 @@ const None Permission = 0
 // order fixes the presentation order used by Names and by the client UI.
 var order = []Permission{
 	ViewChannel, Connect, Speak, SendMessages, ChangeNickname, Register,
-	ManageChannels, ManageRoles, ManageServer, ManageNicknames,
+	ManageChannels, ManageRoles, ManageServer, ManageNicknames, ManageMessages,
 	KickUsers, MoveUsers, MuteUsers, DeafenUsers,
 	Administrator,
 }
@@ -58,6 +61,7 @@ var names = map[Permission]string{
 	ManageRoles:     "ManageRoles",
 	ManageServer:    "ManageServer",
 	ManageNicknames: "ManageNicknames",
+	ManageMessages:  "ManageMessages",
 	KickUsers:       "KickUsers",
 	MoveUsers:       "MoveUsers",
 	MuteUsers:       "MuteUsers",

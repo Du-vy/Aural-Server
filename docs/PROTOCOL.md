@@ -227,6 +227,17 @@ channel never leaks through the presence list.
   "managed": "registered"  // "" | everyone | registered | admin
 }
 
+// Message
+{
+  "id": 12,
+  "channelId": 2,
+  "userId": 4,             // null once the author's account is gone
+  "author": "Pablo",       // resolved live from the users table
+  "content": "Hello",
+  "createdAt": 1756600000, // Unix seconds
+  "editedAt": null
+}
+
 // ServerInfo
 {
   "name": "Aural Server",
@@ -251,13 +262,14 @@ A 64-bit mask. `Administrator` bypasses every other check.
 | 0 | `ViewChannel` | See a channel and who is in it |
 | 1 | `Connect` | Join a voice channel |
 | 2 | `Speak` | Transmit in a voice channel |
-| 3 | `SendMessages` | Reserved for text channels |
+| 3 | `SendMessages` | Post in a text channel |
 | 4 | `ChangeNickname` | Change your own nickname |
 | 5 | `Register` | Claim your identity as an account |
 | 8 | `ManageChannels` | Create, edit and delete channels |
 | 9 | `ManageRoles` | Manage roles and channel overwrites |
 | 10 | `ManageServer` | Rename the server |
 | 11 | `ManageNicknames` | Change other nicknames |
+| 12 | `ManageMessages` | Delete other people's messages |
 | 16 | `KickUsers` | Disconnect a user |
 | 17 | `MoveUsers` | Move a user between voice channels |
 | 18 | `MuteUsers` | Reserved for voice moderation |
@@ -319,10 +331,31 @@ Every op below needs an authenticated session.
 | `channel.create` | `ManageChannels` on the parent | `{ name, type, parentId?, topic?, position?, userLimit? }`. |
 | `channel.update` | `ManageChannels` on the channel; `ManageRoles` to touch `overwrites` | `{ channelId, name?, topic?, parentId?, position?, userLimit?, overwrites? }`. |
 | `channel.delete` | `ManageChannels` on the channel | `{ channelId }`. Cascades to descendants. |
+| `message.send` | `SendMessages` on the channel | `{ channelId, content }`. Text channels only. Rate limited. |
+| `message.history` | `ViewChannel` on the channel | `{ channelId, before?, limit? }`. Pages backwards; `limit` defaults to 50, capped at 100. |
+| `message.edit` | Author only | `{ messageId, content }`. |
+| `message.delete` | Author, or `ManageMessages` on the channel | `{ messageId }`. |
 | `role.create` | `ManageRoles` | `{ name, color?, permissions?, hoist? }`. Lands below your rank. |
 | `role.update` | `ManageRoles` | `{ roleId, name?, color?, permissions?, position?, hoist? }`. |
 | `role.delete` | `ManageRoles` | `{ roleId }`. Managed roles cannot be deleted. |
 | `role.assign` / `role.unassign` | `ManageRoles` | `{ userId, roleId }`. The target may be offline. |
+
+Three notes on messages:
+
+- **Only the author may edit.** No permission overrides this, `Administrator`
+  included: putting words in somebody's mouth is not moderation. A moderator who
+  objects to a message deletes it, which is visible, rather than rewriting it,
+  which is not.
+- **`message.history` is ordered oldest first** and returns `hasMore`, which
+  reports whether anything older than the first entry remains. Paging uses
+  `before`, an exclusive message id, so a page stays stable while new messages
+  arrive at the other end.
+- **Posting is rate limited** per connection, as a token bucket. Exceeding it
+  returns `rate_limited`; the message is not stored.
+- **Content is sanitised, not transformed.** Control characters are dropped and
+  tabs become spaces, but line breaks are kept, and so is everything that holds
+  an emoji sequence together — zero width joiners, variation selectors, skin
+  tone modifiers and regional indicators. `content` comes back byte for byte.
 
 Two notes on `user.move`:
 
@@ -344,6 +377,9 @@ Two notes on `user.move`:
 | `channel.created` | `{ channel }` | Everyone who may see it. |
 | `channel.updated` | `{ channel }` | Everyone who may see it. |
 | `channel.deleted` | `{ channelId, cascaded }` | Everyone. |
+| `message.created` | `{ message }` | Everyone who may see the channel. |
+| `message.updated` | `{ message }` | Everyone who may see the channel. |
+| `message.deleted` | `{ messageId, channelId }` | Everyone who may see the channel. |
 | `role.created` / `role.updated` / `role.deleted` | `{ role }` / `{ roleId }` | Everyone. |
 | `server.updated` | `{ server }` | Everyone. |
 
@@ -360,6 +396,9 @@ refresh is worth.
 - **Channel membership is not persisted.** A user is in a voice channel for as
   long as the connection lasts, exactly as in TeamSpeak.
 - A user whose permission to be somewhere is revoked is moved out immediately.
+- **Messages outlive presence.** `ready.users` lists only who is connected, so
+  the author of an older message is usually somebody the client has never seen.
+  That is why every message carries `author` as well as `userId`.
 
 ## Not in version 1
 

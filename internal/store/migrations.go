@@ -80,6 +80,22 @@ var migrations = []string{
 		value TEXT NOT NULL
 	);
 	`,
+	// 2: text channel messages.
+	`
+	CREATE TABLE messages (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+		-- An author who is deleted leaves their messages behind, attributed to
+		-- the name captured in author rather than vanishing from the history.
+		user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+		author     TEXT    NOT NULL,
+		content    TEXT    NOT NULL,
+		created_at INTEGER NOT NULL,
+		edited_at  INTEGER
+	);
+	-- History is always read newest first within one channel.
+	CREATE INDEX idx_messages_channel ON messages(channel_id, id DESC);
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

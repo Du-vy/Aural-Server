@@ -7,8 +7,9 @@ servers: you run your own, and people reach it by address.
 Written in Go with no cgo, so a plain `go build` produces a single static binary
 for any target Go supports.
 
-> **Status: v0.1.** Identity, channels, roles and permissions are complete and
-> tested. The audio plane is not implemented yet — see [Roadmap](#roadmap).
+> **Status: v0.2.** Identity, channels, roles, permissions and text messaging
+> are complete and tested. The audio plane is not implemented yet — see
+> [Roadmap](#roadmap).
 
 ## Quick start
 
@@ -122,7 +123,7 @@ Three roles are built in and cannot be deleted:
 
 | Role | Held by | Default permissions |
 | --- | --- | --- |
-| `everyone` | Everyone, guests included | View, Connect, Speak, ChangeNickname, Register |
+| `everyone` | Everyone, guests included | View, Connect, Speak, SendMessages, ChangeNickname, Register |
 | `Member` | Anyone who has claimed an account | None — a fresh server treats guests and members alike |
 | `Admin` | Whoever redeems the owner token | Administrator |
 
@@ -176,10 +177,14 @@ over the cgo-based driver, and why cross-compiling needs nothing but `GOOS` and
 
 ## Roadmap
 
-**v0.1 (here)** — identity and registration, channel tree, roles, permissions,
+**v0.1** — identity and registration, channel tree, roles, permissions,
 presence, one connection per identity.
 
-**v0.2** — the audio plane. The protocol already advertises which of the two
+**v0.2 (here)** — text channels: messages, paged history, editing, deletion,
+per-connection rate limiting, and the `ManageMessages` permission. Emoji need
+no server support beyond not mangling them, which the test suite pins.
+
+**v0.3** — the audio plane. The protocol already advertises which of the two
 hosting models a server runs:
 
 - `client_host` — the first user to enter a voice channel relays its audio for
@@ -187,8 +192,8 @@ hosting models a server runs:
   the next user in the channel takes over.
 - `server_host` — the server relays all audio, the traditional model.
 
-**Later** — text channels and history, bans, per-user permission overwrites,
-screen sharing, and Aural Hub, a directory for finding public servers.
+**Later** — bans, per-user permission overwrites, message attachments, screen
+sharing, and Aural Hub, a directory for finding public servers.
 
 ## License
 

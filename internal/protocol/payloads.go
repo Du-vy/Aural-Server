@@ -84,6 +84,23 @@ type Role struct {
 	Managed     string `json:"managed"`
 }
 
+// Message is one post in a text channel.
+//
+// Author is carried alongside UserID because a client only knows the users who
+// are currently connected: presence is not persisted, so the author of an old
+// message is very often somebody the client has never seen. It is resolved
+// server-side from the users table, so a rename shows up throughout the
+// history rather than only on new messages.
+type Message struct {
+	ID        int64  `json:"id"`
+	ChannelID int64  `json:"channelId"`
+	UserID    *int64 `json:"userId"` // nil once an author's account is gone
+	Author    string `json:"author"`
+	Content   string `json:"content"`
+	CreatedAt int64  `json:"createdAt"`
+	EditedAt  *int64 `json:"editedAt"`
+}
+
 // Hello is the first frame the server sends, before any authentication. It lets
 // the client check protocol compatibility and decide which auth op to send.
 type Hello struct {
@@ -185,6 +202,36 @@ type ChannelDeleteRequest struct {
 	ChannelID int64 `json:"channelId"`
 }
 
+type MessageSendRequest struct {
+	ChannelID int64  `json:"channelId"`
+	Content   string `json:"content"`
+}
+
+// MessageHistoryRequest pages backwards through a channel. Before is the id to
+// stop short of, so paging is stable while new messages arrive at the end.
+type MessageHistoryRequest struct {
+	ChannelID int64 `json:"channelId"`
+	Before    int64 `json:"before,omitempty"`
+	Limit     int   `json:"limit,omitempty"`
+}
+
+// MessageHistoryResult is ordered oldest first, the order it is rendered in.
+type MessageHistoryResult struct {
+	ChannelID int64     `json:"channelId"`
+	Messages  []Message `json:"messages"`
+	// HasMore reports whether older messages remain before the first one here.
+	HasMore bool `json:"hasMore"`
+}
+
+type MessageEditRequest struct {
+	MessageID int64  `json:"messageId"`
+	Content   string `json:"content"`
+}
+
+type MessageDeleteRequest struct {
+	MessageID int64 `json:"messageId"`
+}
+
 type RoleCreateRequest struct {
 	Name        string `json:"name"`
 	Color       string `json:"color,omitempty"`
@@ -236,6 +283,17 @@ type ChannelDeletedEvent struct {
 	ChannelID int64 `json:"channelId"`
 	// Cascaded lists descendants removed along with the channel.
 	Cascaded []int64 `json:"cascaded"`
+}
+
+type MessageEvent struct {
+	Message Message `json:"message"`
+}
+
+// MessageDeletedEvent carries the channel as well, so a client can drop the
+// message without searching every channel it has cached.
+type MessageDeletedEvent struct {
+	MessageID int64 `json:"messageId"`
+	ChannelID int64 `json:"channelId"`
 }
 
 type RoleEvent struct {

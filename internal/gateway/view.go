@@ -42,6 +42,19 @@ func channelView(c store.Channel) protocol.Channel {
 	return out
 }
 
+// messageView converts a stored message into its wire form.
+func messageView(m store.Message) protocol.Message {
+	return protocol.Message{
+		ID:        m.ID,
+		ChannelID: m.ChannelID,
+		UserID:    m.UserID,
+		Author:    m.Author,
+		Content:   m.Content,
+		CreatedAt: m.CreatedAt,
+		EditedAt:  m.EditedAt,
+	}
+}
+
 // overwritesFromView converts wire overwrites back into stored ones, rejecting
 // masks that do not parse and roles that do not exist.
 func overwritesFromView(list []protocol.Overwrite, roleExists func(int64) bool) ([]permissions.Overwrite, error) {

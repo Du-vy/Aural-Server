@@ -54,6 +54,11 @@ const (
 	OpChannelUpdate = "channel.update"
 	OpChannelDelete = "channel.delete"
 
+	OpMessageSend    = "message.send"
+	OpMessageHistory = "message.history" // page backwards through a channel
+	OpMessageEdit    = "message.edit"
+	OpMessageDelete  = "message.delete"
+
 	OpRoleCreate   = "role.create"
 	OpRoleUpdate   = "role.update"
 	OpRoleDelete   = "role.delete"
@@ -74,6 +79,10 @@ const (
 	EvChannelCreated = "channel.created"
 	EvChannelUpdated = "channel.updated"
 	EvChannelDeleted = "channel.deleted"
+
+	EvMessageCreated = "message.created"
+	EvMessageUpdated = "message.updated"
+	EvMessageDeleted = "message.deleted"
 
 	EvRoleCreated = "role.created"
 	EvRoleUpdated = "role.updated"
