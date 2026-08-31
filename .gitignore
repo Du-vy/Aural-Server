@@ -1,0 +1,16 @@
+# Build output
+/aural-server
+/aural-server.exe
+/dist/
+
+# Runtime state, never committed
+/config.json
+*.db
+*.db-shm
+*.db-wal
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

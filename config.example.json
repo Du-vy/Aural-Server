@@ -1,0 +1,35 @@
+{
+  "server": {
+    "name": "Aural Server",
+    "description": "A self-hosted Aural server",
+    "bind": "0.0.0.0",
+    "port": 9871,
+    "password": "",
+    "max_users": 64,
+    "allowed_origins": [
+      "*"
+    ]
+  },
+  "registration": {
+    "enabled": true,
+    "allow_guests": true,
+    "min_password_length": 8,
+    "min_username_length": 3,
+    "max_username_length": 32
+  },
+  "voice": {
+    "mode": "client_host"
+  },
+  "tls": {
+    "enabled": false,
+    "cert_file": "",
+    "key_file": ""
+  },
+  "database": {
+    "path": "aural.db"
+  },
+  "log": {
+    "level": "info",
+    "format": "text"
+  }
+}
