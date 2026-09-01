@@ -149,6 +149,16 @@ var migrations = []string{
 	-- kind", which is a lookup by message and then by type.
 	CREATE INDEX idx_attachments_type ON attachments(message_id, content_type);
 	`,
+	// 5: OpenGraph link preview cache.
+	`
+	CREATE TABLE link_previews (
+		url_hash   TEXT    PRIMARY KEY,
+		url        TEXT    NOT NULL,
+		data_json  TEXT    NOT NULL,
+		fetched_at INTEGER NOT NULL
+	);
+	CREATE INDEX idx_link_previews_fetched ON link_previews(fetched_at);
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

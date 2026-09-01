@@ -53,6 +53,8 @@ func New(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Stor
 	mux.HandleFunc("OPTIONS /upload", s.handlePreflight)
 	mux.HandleFunc("GET "+uploadPrefix+"{key}/{filename}", s.handleAttachment)
 	mux.HandleFunc("OPTIONS "+uploadPrefix+"{key}/{filename}", s.handlePreflight)
+	mux.HandleFunc("GET /unfurl", s.handleUnfurl)
+	mux.HandleFunc("OPTIONS /unfurl", s.handlePreflight)
 
 	s.http = &http.Server{
 		Addr:              cfg.Address(),

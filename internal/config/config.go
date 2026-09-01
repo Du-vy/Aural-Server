@@ -24,6 +24,7 @@ type Config struct {
 	Registration Registration `json:"registration"`
 	Voice        Voice        `json:"voice"`
 	Uploads      Uploads      `json:"uploads"`
+	Unfurl       Unfurl       `json:"unfurl"`
 	TLS          TLS          `json:"tls"`
 	Database     Database     `json:"database"`
 	Log          Log          `json:"log"`
@@ -85,6 +86,14 @@ type Uploads struct {
 	// is kept before it is swept. Someone who picks a file and then abandons
 	// the message leaves one behind, and it must not be kept forever.
 	PendingTTLMinutes int `json:"pending_ttl_minutes"`
+}
+
+// Unfurl controls link preview fetching and caching.
+type Unfurl struct {
+	// Enabled allows the server to fetch and provide link previews.
+	Enabled bool `json:"enabled"`
+	// CacheTTLDays is how many days a link preview is kept before re-fetching. Default is 7.
+	CacheTTLDays int `json:"cache_ttl_days"`
 }
 
 // TLS serves the WebSocket over wss:// with a certificate you provide.
@@ -154,6 +163,10 @@ func Default() Config {
 			MaxTotalBytes:     DefaultMaxTotalBytes,
 			MaxPerMessage:     10,
 			PendingTTLMinutes: 60,
+		},
+		Unfurl: Unfurl{
+			Enabled:      true,
+			CacheTTLDays: 7,
 		},
 		TLS:      TLS{Enabled: false},
 		Database: Database{Path: "aural.db"},

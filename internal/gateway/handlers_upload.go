@@ -470,4 +470,13 @@ func (s *Server) sweepPendingOnce(ctx context.Context, cutoff int64) {
 	if removed > 0 {
 		s.log.Info("removed abandoned uploads", slog.Int("files", removed))
 	}
+
+	ttlDays := s.cfg.Unfurl.CacheTTLDays
+	if ttlDays <= 0 {
+		ttlDays = 7
+	}
+	pruneCutoff := time.Now().Add(-time.Duration(ttlDays) * 24 * time.Hour).Unix()
+	if pruned, err := s.st.PruneLinkPreviews(ctx, pruneCutoff); err == nil && pruned > 0 {
+		s.log.Info("pruned expired link previews", slog.Int64("count", pruned))
+	}
 }
