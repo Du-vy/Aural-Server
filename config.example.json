@@ -28,6 +28,9 @@
     "max_per_message": 10,
     "pending_ttl_minutes": 60
   },
+  "integrations": {
+    "klipy_api_key": ""
+  },
   "tls": {
     "enabled": false,
     "cert_file": "",

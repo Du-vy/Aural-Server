@@ -25,6 +25,7 @@ type Config struct {
 	Voice        Voice        `json:"voice"`
 	Uploads      Uploads      `json:"uploads"`
 	Unfurl       Unfurl       `json:"unfurl"`
+	Integrations Integrations `json:"integrations"`
 	TLS          TLS          `json:"tls"`
 	Database     Database     `json:"database"`
 	Log          Log          `json:"log"`
@@ -94,6 +95,11 @@ type Unfurl struct {
 	Enabled bool `json:"enabled"`
 	// CacheTTLDays is how many days a link preview is kept before re-fetching. Default is 7.
 	CacheTTLDays int `json:"cache_ttl_days"`
+}
+
+// Integrations holds third-party service credentials like Klipy.com.
+type Integrations struct {
+	KlipyAPIKey string `json:"klipy_api_key"`
 }
 
 // TLS serves the WebSocket over wss:// with a certificate you provide.
@@ -167,6 +173,9 @@ func Default() Config {
 		Unfurl: Unfurl{
 			Enabled:      true,
 			CacheTTLDays: 7,
+		},
+		Integrations: Integrations{
+			KlipyAPIKey: "",
 		},
 		TLS:      TLS{Enabled: false},
 		Database: Database{Path: "aural.db"},

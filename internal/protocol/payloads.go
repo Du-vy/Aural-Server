@@ -38,6 +38,7 @@ type ServerInfo struct {
 	GuestsAllowed       bool    `json:"guestsAllowed"`
 	VoiceMode           string  `json:"voiceMode"`
 	Uploads             Uploads `json:"uploads"`
+	KlipyAPIKey         string  `json:"klipyApiKey,omitempty"`
 }
 
 // Uploads tells a client what this server accepts before it sends anything, so
@@ -196,6 +197,7 @@ type ClaimAdminRequest struct {
 type ServerUpdateRequest struct {
 	Name        *string `json:"name,omitempty"`
 	Description *string `json:"description,omitempty"`
+	KlipyAPIKey *string `json:"klipyApiKey,omitempty"`
 }
 
 type UserUpdateRequest struct {

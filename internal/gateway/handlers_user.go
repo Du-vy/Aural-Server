@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 
 	"github.com/coder/websocket"
 
@@ -243,11 +244,11 @@ func handleServerUpdate(_ context.Context, s *Session, raw json.RawMessage) (any
 	if !base.Has(permissions.ManageServer) {
 		return nil, protocol.Errorf(protocol.ErrForbidden, "you are not allowed to manage this server")
 	}
-	if req.Name == nil && req.Description == nil {
+	if req.Name == nil && req.Description == nil && req.KlipyAPIKey == nil {
 		return nil, protocol.Errorf(protocol.ErrBadRequest, "nothing to update")
 	}
 
-	var name, description string
+	var name, description, klipyApiKey string
 	if req.Name != nil {
 		name = cleanText(*req.Name)
 		if name == "" {
@@ -263,8 +264,14 @@ func handleServerUpdate(_ context.Context, s *Session, raw json.RawMessage) (any
 			return nil, protocol.Errorf(protocol.ErrBadRequest, "server description must be at most 512 characters")
 		}
 	}
+	if req.KlipyAPIKey != nil {
+		klipyApiKey = strings.TrimSpace(*req.KlipyAPIKey)
+		if len(klipyApiKey) > 256 {
+			return nil, protocol.Errorf(protocol.ErrBadRequest, "klipy api key is too long")
+		}
+	}
 
-	if err := s.hub.updateServerIdentity(req.Name != nil, name, req.Description != nil, description); err != nil {
+	if err := s.hub.updateServerIdentity(req.Name != nil, name, req.Description != nil, description, req.KlipyAPIKey != nil, klipyApiKey); err != nil {
 		return nil, internalError(s, "save the configuration", err)
 	}
 

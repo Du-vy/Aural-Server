@@ -111,22 +111,24 @@ func (h *Hub) RemoveFiles(attachments []store.Attachment) {
 	}
 }
 
-// ServerIdentity reads the two configuration fields that change at runtime.
-func (h *Hub) ServerIdentity() (name, description string) {
+// ServerIdentity reads the configuration fields that change at runtime.
+func (h *Hub) ServerIdentity() (name, description, klipyApiKey string) {
 	h.cfgMu.RLock()
 	defer h.cfgMu.RUnlock()
-	return h.cfg.Server.Name, h.cfg.Server.Description
+	return h.cfg.Server.Name, h.cfg.Server.Description, h.cfg.Integrations.KlipyAPIKey
 }
 
-// updateServerIdentity applies a rename and persists it. The configuration file
-// is the source of truth on the next start, so the change has to reach it.
-func (h *Hub) updateServerIdentity(setName bool, name string, setDescription bool, description string) error {
+// updateServerIdentity applies configuration updates and persists them.
+func (h *Hub) updateServerIdentity(setName bool, name string, setDescription bool, description string, setKlipy bool, klipyApiKey string) error {
 	h.cfgMu.Lock()
 	if setName {
 		h.cfg.Server.Name = name
 	}
 	if setDescription {
 		h.cfg.Server.Description = description
+	}
+	if setKlipy {
+		h.cfg.Integrations.KlipyAPIKey = klipyApiKey
 	}
 	snapshot := *h.cfg
 	h.cfgMu.Unlock()
