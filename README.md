@@ -211,11 +211,16 @@ presence, one connection per identity.
 per-connection rate limiting, and the `ManageMessages` permission. Emoji need
 no server support beyond not mangling them, which the test suite pins.
 
-**v0.3 (here)** — file attachments: an HTTP upload endpoint, range-served
-downloads, configurable per-file and server-wide storage ceilings, the
-`AttachFiles` permission, and files that are deleted along with their message.
+**v0.3** — file attachments: an HTTP upload endpoint, range-served downloads,
+configurable per-file and server-wide storage ceilings, the `AttachFiles`
+permission, and files that are deleted along with their message.
 
-**v0.4** — the audio plane. The protocol already advertises which of the two
+**v0.4 (here)** — search: `message.search` across every channel a caller may
+read, filtered by author, channel, date and the kind of content a message
+carries, with the conversation either side of each hit. History gained two more
+cursors, `after` and `around`, so a result can be opened where it was written.
+
+**v0.5** — the audio plane. The protocol already advertises which of the two
 hosting models a server runs:
 
 - `client_host` — the first user to enter a voice channel relays its audio for

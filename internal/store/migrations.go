@@ -128,6 +128,27 @@ var migrations = []string{
 	-- which is what an administrator who never touched the role expects.
 	UPDATE roles SET permissions = permissions | 64 WHERE managed = 'everyone';
 	`,
+	// 4: message search.
+	`
+	-- search_text is the message folded down to what a search compares against:
+	-- lower case, accents removed. It is kept beside the content rather than
+	-- derived at query time because folding is done in Go, where the rules are
+	-- readable, rather than in SQL, where LOWER() only knows ASCII.
+	--
+	-- NULL means "not folded yet", which is what every row an upgrading server
+	-- already holds starts as. Backfill runs once at open and turns them all
+	-- into strings, after which the partial index below is empty and stays so.
+	ALTER TABLE messages ADD COLUMN search_text TEXT;
+	CREATE INDEX idx_messages_unindexed ON messages(id) WHERE search_text IS NULL;
+
+	-- A search narrowed by date walks this rather than every message it could
+	-- otherwise have to fold through.
+	CREATE INDEX idx_messages_created ON messages(created_at);
+
+	-- has:image and friends resolve to "does this message carry a file of that
+	-- kind", which is a lookup by message and then by type.
+	CREATE INDEX idx_attachments_type ON attachments(message_id, content_type);
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own
@@ -156,6 +177,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+	}
+	// Folding a message for search happens as it is written, so only the ones
+	// written before that column existed need catching up.
+	if err := s.backfillSearchText(ctx); err != nil {
+		return err
 	}
 	return s.seed(ctx)
 }

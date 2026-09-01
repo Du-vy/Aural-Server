@@ -34,6 +34,12 @@ const (
 	// what stops a script from filling everybody's scrollback.
 	messageBurst      = 8
 	messagesPerSecond = 1.5
+	// searchBurst and searchesPerSecond throttle searching, which is the one
+	// read that walks a channel's whole history rather than an index of it.
+	// The burst covers refining a query a few times in a row; the refill is
+	// what stops a script from turning that into a load generator.
+	searchBurst       = 6
+	searchesPerSecond = 1
 )
 
 // Session is one client connection and the identity behind it.
@@ -48,6 +54,9 @@ type Session struct {
 	// messages throttles the chat ops, which are the only ones a client sends
 	// in bulk during normal use.
 	messages *rateLimiter
+	// searches throttles searching, which costs far more per request than
+	// anything else a client can ask for.
+	searches *rateLimiter
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -71,6 +80,7 @@ func newSession(id int64, hub *Hub, conn *websocket.Conn, log *slog.Logger) *Ses
 		out:      make(chan protocol.Envelope, outboundBuffer),
 		closed:   make(chan struct{}),
 		messages: newRateLimiter(messageBurst, messagesPerSecond),
+		searches: newRateLimiter(searchBurst, searchesPerSecond),
 	}
 }
 
@@ -337,6 +347,7 @@ var routes = map[string]route{
 
 	protocol.OpMessageSend:    {needsAuth: true, fn: handleMessageSend},
 	protocol.OpMessageHistory: {needsAuth: true, fn: handleMessageHistory},
+	protocol.OpMessageSearch:  {needsAuth: true, fn: handleMessageSearch},
 	protocol.OpMessageEdit:    {needsAuth: true, fn: handleMessageEdit},
 	protocol.OpMessageDelete:  {needsAuth: true, fn: handleMessageDelete},
 

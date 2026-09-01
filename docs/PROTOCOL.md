@@ -361,7 +361,8 @@ Every op below needs an authenticated session.
 | `channel.update` | `ManageChannels` on the channel; `ManageRoles` to touch `overwrites` | `{ channelId, name?, topic?, parentId?, position?, userLimit?, overwrites? }`. |
 | `channel.delete` | `ManageChannels` on the channel | `{ channelId }`. Cascades to descendants. |
 | `message.send` | `SendMessages`, plus `AttachFiles` to carry files | `{ channelId, content, attachments? }`. Text channels only. Rate limited. |
-| `message.history` | `ViewChannel` on the channel | `{ channelId, before?, limit? }`. Pages backwards; `limit` defaults to 50, capped at 100. |
+| `message.history` | `ViewChannel` on the channel | `{ channelId, before?, after?, around?, limit? }`. One cursor at a time; `limit` defaults to 50, capped at 100. |
+| `message.search` | `ViewChannel`, per channel | `{ query?, channelIds?, authorIds?, has?, after?, before?, sort?, limit?, offset? }`. Runs only over the channels the caller may read. Rate limited. |
 | `message.edit` | Author only | `{ messageId, content }`. |
 | `message.delete` | Author, or `ManageMessages` on the channel | `{ messageId }`. |
 | `role.create` | `ManageRoles` | `{ name, color?, permissions?, hoist? }`. Lands below your rank. |
@@ -375,10 +376,13 @@ Three notes on messages:
   included: putting words in somebody's mouth is not moderation. A moderator who
   objects to a message deletes it, which is visible, rather than rewriting it,
   which is not.
-- **`message.history` is ordered oldest first** and returns `hasMore`, which
-  reports whether anything older than the first entry remains. Paging uses
-  `before`, an exclusive message id, so a page stays stable while new messages
-  arrive at the other end.
+- **`message.history` is ordered oldest first** and returns `hasMore` and
+  `hasMoreAfter`, which report whether anything remains before the first entry
+  or past the last one. The three cursors are exclusive of one another and all
+  exclusive of the message they name: `before` pages backwards, `after` pages
+  forwards, and `around` centres a page on one message, which is how a search
+  result is opened in the conversation it came from. Sending none of them reads
+  the newest page. Sending more than one is `bad_request`.
 - **Posting is rate limited** per connection, as a token bucket. Exceeding it
   returns `rate_limited`; the message is not stored.
 - **Content is sanitised, not transformed.** Control characters are dropped and
@@ -392,6 +396,65 @@ Two notes on `user.move`:
   selected client side.
 - `parentId` in `channel.update` is three-valued: absent leaves the parent alone,
   `null` detaches the channel to the root, and a number reparents it.
+
+## Search
+
+`message.search` looks through the history of every channel the caller may read.
+It is a read, so it needs no permission of its own: what narrows it is the
+permission model deciding which channels the query may run over at all. A
+channel the caller cannot see is dropped from `channelIds` rather than refused,
+because it is absent from their channel tree and a search must not be the one
+place that admits it exists.
+
+```jsonc
+{
+  "op": "message.search",
+  "d": {
+    "query": "deploy \"release notes\"",
+    "channelIds": [2],
+    "authorIds": [7],
+    "has": ["link"],
+    "after": 1767225600,
+    "before": 1769904000,
+    "sort": "relevance",
+    "limit": 25,
+    "offset": 0
+  }
+}
+// result: { "hits": [ { "message": Message, "before"?: Message, "after"?: Message } ],
+//           "total": 128, "offset": 0, "limit": 25 }
+```
+
+Every field narrows the result and they are combined with AND; entries within
+one field are alternatives, so two authors mean "either of them". A request that
+narrows nothing at all is `bad_request`: a search needs something to look for.
+
+- **`query` is free text.** Whitespace separates terms, all of which must appear
+  in the message, and double quotes hold a phrase together. At most eight terms
+  are read from one query.
+- **Matching is by substring, not by word.** Text is compared against a folded
+  copy of the message: lower case, with Latin accents removed. So `cafe` finds
+  "CAFÉ", `ploy` finds "deployment", and `世界` finds "你好世界". A word index
+  would have to decide where words end, and no one tokenizer decides that
+  correctly for Spanish and Chinese at once. Only the Latin blocks are folded:
+  in Devanagari the Unicode category that holds Latin accents holds vowels
+  instead, and stripping those would change the word.
+- **`has`** is any of `link`, `file`, `image`, `video`, `sound`. `link` matches
+  an http(s) URL in the text; the rest match the media type of a file the
+  message carries.
+- **`after` is inclusive and `before` exclusive**, both Unix seconds, so one day
+  is `[start, start + 86400)`.
+- **`sort`** is `newest` (the default), `oldest`, or `relevance`. Relevance has
+  no corpus statistics behind it and does not pretend to: a message where the
+  whole query appears as written outranks one where the words merely all appear,
+  a message that repeats them outranks one that mentions them once, and recency
+  breaks the remaining ties. Without terms to weigh, it is `newest`.
+- **`total` counts every match**, not just the page, which is what lets a client
+  page through them. `limit` defaults to 25 and is capped at 50; `offset` may not
+  exceed 5000, past which refining the search finds what scrolling will not.
+- **A hit carries its neighbours.** `before` and `after` are the messages either
+  side of it in its own channel, absent at the edges of a history. They travel
+  with the hit because a line of chat rarely means anything alone.
 
 ## Attachments
 

@@ -250,12 +250,22 @@ type MessageSendRequest struct {
 	Attachments []int64 `json:"attachments,omitempty"`
 }
 
-// MessageHistoryRequest pages backwards through a channel. Before is the id to
-// stop short of, so paging is stable while new messages arrive at the end.
+// MessageHistoryRequest reads one page of a channel.
+//
+// The three cursors are exclusive of one another and all are exclusive of the
+// message they name, so paging stays stable while new messages arrive at the
+// end. Sending none of them reads the newest page.
 type MessageHistoryRequest struct {
 	ChannelID int64 `json:"channelId"`
-	Before    int64 `json:"before,omitempty"`
-	Limit     int   `json:"limit,omitempty"`
+	// Before pages backwards, stopping short of this id.
+	Before int64 `json:"before,omitempty"`
+	// After pages forwards, starting past this id. It is what a client walks
+	// back to the present with after jumping into the middle of a channel.
+	After int64 `json:"after,omitempty"`
+	// Around centres a page on this id, which is how a search result is opened
+	// in the conversation it came from.
+	Around int64 `json:"around,omitempty"`
+	Limit  int   `json:"limit,omitempty"`
 }
 
 // MessageHistoryResult is ordered oldest first, the order it is rendered in.
@@ -264,6 +274,74 @@ type MessageHistoryResult struct {
 	Messages  []Message `json:"messages"`
 	// HasMore reports whether older messages remain before the first one here.
 	HasMore bool `json:"hasMore"`
+	// HasMoreAfter reports whether newer messages remain past the last one
+	// here, which is how a client knows it is holding the present or a window
+	// somewhere behind it.
+	HasMoreAfter bool `json:"hasMoreAfter"`
+}
+
+// Search sort orders.
+const (
+	SortNewest    = "newest"    // most recent first, the default
+	SortOldest    = "oldest"    // least recent first
+	SortRelevance = "relevance" // best text match first, newest breaking ties
+)
+
+// Kinds of content a search can require a message to carry.
+const (
+	HasLink  = "link"  // the text contains an http(s) URL
+	HasFile  = "file"  // the message carries an attachment of any kind
+	HasImage = "image" // ... an image
+	HasVideo = "video" // ... a video
+	HasSound = "sound" // ... an audio file
+)
+
+// MessageSearchRequest looks through every channel the caller may read.
+//
+// Every field narrows the result, and all of them are combined with AND: a
+// search with a query and two channels means "this text, in either of these
+// channels". Within one repeated field the entries are alternatives, so two
+// authors mean "either of them", which is what a filter chip in the interface
+// reads as.
+type MessageSearchRequest struct {
+	// Query is free text. Whitespace separates terms, all of which must appear
+	// somewhere in the message; double quotes hold a phrase together.
+	Query string `json:"query,omitempty"`
+	// ChannelIDs narrows to these channels. Ones the caller may not read are
+	// dropped rather than refused, exactly as they are absent from the tree.
+	ChannelIDs []int64 `json:"channelIds,omitempty"`
+	AuthorIDs  []int64 `json:"authorIds,omitempty"`
+	// Has requires each named kind of content to be present.
+	Has []string `json:"has,omitempty"`
+	// After and Before bound the send time, in Unix seconds. After is
+	// inclusive and Before is exclusive, so one day is [start, start+86400).
+	After  int64  `json:"after,omitempty"`
+	Before int64  `json:"before,omitempty"`
+	Sort   string `json:"sort,omitempty"`
+	Limit  int    `json:"limit,omitempty"`
+	Offset int    `json:"offset,omitempty"`
+}
+
+// MessageSearchHit is one match and the conversation immediately around it.
+//
+// The neighbours travel with the hit because a line of chat rarely means
+// anything alone: what makes a result recognisable is the message before it.
+type MessageSearchHit struct {
+	Message Message `json:"message"`
+	// Before and After hold the message either side of the hit in its own
+	// channel, when there is one.
+	Before *Message `json:"before,omitempty"`
+	After  *Message `json:"after,omitempty"`
+}
+
+// MessageSearchResult is one page of matches.
+type MessageSearchResult struct {
+	Hits []MessageSearchHit `json:"hits"`
+	// Total is how many messages matched in all, which is what lets a client
+	// page and say how much it found.
+	Total  int `json:"total"`
+	Offset int `json:"offset"`
+	Limit  int `json:"limit"`
 }
 
 type MessageEditRequest struct {

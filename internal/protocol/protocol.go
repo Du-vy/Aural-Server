@@ -55,7 +55,8 @@ const (
 	OpChannelDelete = "channel.delete"
 
 	OpMessageSend    = "message.send"
-	OpMessageHistory = "message.history" // page backwards through a channel
+	OpMessageHistory = "message.history" // page through a channel
+	OpMessageSearch  = "message.search"  // look through every readable channel
 	OpMessageEdit    = "message.edit"
 	OpMessageDelete  = "message.delete"
 

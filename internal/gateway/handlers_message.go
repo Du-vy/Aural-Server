@@ -16,6 +16,19 @@ const (
 	// defaultHistoryLimit is one screenful with room to scroll.
 	defaultHistoryLimit = 50
 	maxHistoryLimit     = 100
+
+	// defaultSearchLimit is one page of results in the side panel.
+	defaultSearchLimit = 25
+	maxSearchLimit     = 50
+	// maxSearchOffset bounds how deep paging may go. Past this, refining the
+	// search finds what scrolling will not.
+	maxSearchOffset = 5000
+	// maxSearchTerms bounds how many substrings one query is split into, so a
+	// pasted paragraph cannot turn into a hundred scans of the history.
+	maxSearchTerms = 8
+	// maxSearchAuthors bounds the from: filter for the same reason. Nobody
+	// narrows a search to a dozen people; a script would name thousands.
+	maxSearchAuthors = 16
 )
 
 // handleMessageSend posts a message to a text channel.
@@ -106,11 +119,25 @@ func (s *Session) validateAttachmentIDs(ids []int64) ([]int64, *protocol.Error) 
 	return ids, nil
 }
 
-// handleMessageHistory pages backwards through a channel.
+// handleMessageHistory reads one page of a channel.
+//
+// The page is anchored by at most one of the three cursors: backwards from
+// before, forwards from after, or centred on around. Reading with none of them
+// gives the newest page, which is what opening a channel asks for.
 func handleMessageHistory(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
 	req, failure := decode[protocol.MessageHistoryRequest](raw)
 	if failure != nil {
 		return nil, failure
+	}
+	cursors := 0
+	for _, cursor := range []int64{req.Before, req.After, req.Around} {
+		if cursor > 0 {
+			cursors++
+		}
+	}
+	if cursors > 1 {
+		return nil, protocol.Errorf(protocol.ErrBadRequest,
+			"before, after and around name three different pages; send one")
 	}
 	// Reading needs only the right to see the channel: a member who may not
 	// post can still follow along.
@@ -126,42 +153,210 @@ func handleMessageHistory(ctx context.Context, s *Session, raw json.RawMessage) 
 		limit = maxHistoryLimit
 	}
 
-	page, err := s.hub.st.MessagesBefore(ctx, req.ChannelID, req.Before, limit)
+	// Every page leaves here oldest first, the order it is rendered in, whether
+	// the query that produced it walked the index that way or the other.
+	var (
+		page []store.Message
+		err  error
+	)
+	switch {
+	case req.Around > 0:
+		page, err = s.hub.st.MessagesAround(ctx, req.ChannelID, req.Around, limit)
+	case req.After > 0:
+		page, err = s.hub.st.MessagesAfter(ctx, req.ChannelID, req.After, limit)
+	default:
+		page, err = s.hub.st.MessagesBefore(ctx, req.ChannelID, req.Before, limit)
+		reverse(page)
+	}
 	if err != nil {
 		return nil, internalError(s, "read the channel history", err)
 	}
 
-	// One query serves the whole page, rather than one per message.
-	ids := make([]int64, 0, len(page))
-	for _, m := range page {
-		ids = append(ids, m.ID)
-	}
-	attachments, err := s.hub.st.AttachmentsForMessages(ctx, ids)
-	if err != nil {
-		return nil, internalError(s, "read the channel history", err)
+	views, failure := s.messageViews(ctx, page, "read the channel history")
+	if failure != nil {
+		return nil, failure
 	}
 
-	// The store walks the index newest first; clients render oldest first.
-	views := make([]protocol.Message, 0, len(page))
-	for i := len(page) - 1; i >= 0; i-- {
-		views = append(views, messageView(page[i], attachments[page[i].ID]))
-	}
-
-	hasMore := false
+	result := protocol.MessageHistoryResult{ChannelID: req.ChannelID, Messages: views}
 	if len(page) > 0 {
-		// page is newest first, so its last entry is the oldest one read.
-		oldest := page[len(page)-1].ID
-		hasMore, err = s.hub.st.HasMessagesBefore(ctx, req.ChannelID, oldest)
+		result.HasMore, err = s.hub.st.HasMessagesBefore(ctx, req.ChannelID, page[0].ID)
+		if err != nil {
+			return nil, internalError(s, "read the channel history", err)
+		}
+		result.HasMoreAfter, err = s.hub.st.HasMessagesAfter(ctx, req.ChannelID, page[len(page)-1].ID)
 		if err != nil {
 			return nil, internalError(s, "read the channel history", err)
 		}
 	}
+	return result, nil
+}
 
-	return protocol.MessageHistoryResult{
-		ChannelID: req.ChannelID,
-		Messages:  views,
-		HasMore:   hasMore,
+// handleMessageSearch looks through every channel the caller may read.
+//
+// Searching is a read, so it needs no more than the right to see a channel; the
+// permission model does the narrowing, by deciding which channels the query is
+// allowed to run over at all.
+func handleMessageSearch(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
+	req, failure := decode[protocol.MessageSearchRequest](raw)
+	if failure != nil {
+		return nil, failure
+	}
+
+	filter, failure := s.searchFilter(req)
+	if failure != nil {
+		return nil, failure
+	}
+	// Checked after validation so a malformed search is reported as malformed
+	// even while the connection is being throttled.
+	if !s.searches.allow() {
+		return nil, protocol.Errorf(protocol.ErrRateLimited, "you are searching too quickly")
+	}
+
+	hits, total, err := s.hub.st.SearchMessages(ctx, filter)
+	if err != nil {
+		return nil, internalError(s, "search the history", err)
+	}
+
+	views, failure := s.searchHits(ctx, hits)
+	if failure != nil {
+		return nil, failure
+	}
+	return protocol.MessageSearchResult{
+		Hits:   views,
+		Total:  total,
+		Offset: filter.Offset,
+		Limit:  filter.Limit,
 	}, nil
+}
+
+// searchFilter turns a request into the query the store runs, refusing the ones
+// that ask for nothing and quietly dropping the channels the caller may not see.
+func (s *Session) searchFilter(req protocol.MessageSearchRequest) (store.SearchFilter, *protocol.Error) {
+	filter := store.SearchFilter{
+		Terms:  store.SearchTerms(req.Query, maxSearchTerms),
+		After:  req.After,
+		Before: req.Before,
+		Sort:   protocol.SortNewest,
+		Limit:  defaultSearchLimit,
+		Offset: req.Offset,
+	}
+
+	if len(req.AuthorIDs) > maxSearchAuthors {
+		return filter, protocol.Errorf(protocol.ErrBadRequest,
+			fmt.Sprintf("a search may name at most %d authors", maxSearchAuthors))
+	}
+	filter.AuthorIDs = dedupe(req.AuthorIDs)
+
+	// Repeating a requirement asks for the same thing twice, so it is collapsed
+	// rather than turned into a second identical clause.
+	seen := map[string]bool{}
+	for _, has := range req.Has {
+		switch has {
+		case protocol.HasLink, protocol.HasFile, protocol.HasImage, protocol.HasVideo, protocol.HasSound:
+			if !seen[has] {
+				seen[has] = true
+				filter.Has = append(filter.Has, has)
+			}
+		default:
+			return filter, protocol.Errorf(protocol.ErrBadRequest,
+				"a message can be required to have a link, file, image, video or sound")
+		}
+	}
+	switch req.Sort {
+	case "", protocol.SortNewest:
+	case protocol.SortOldest, protocol.SortRelevance:
+		filter.Sort = req.Sort
+	default:
+		return filter, protocol.Errorf(protocol.ErrBadRequest,
+			"results can be sorted newest, oldest or by relevance")
+	}
+	if req.Limit > 0 {
+		filter.Limit = min(req.Limit, maxSearchLimit)
+	}
+	if filter.Offset < 0 || filter.Offset > maxSearchOffset {
+		return filter, protocol.Errorf(protocol.ErrBadRequest,
+			"a search cannot be paged that far; narrow it instead")
+	}
+	if len(filter.Terms) == 0 && len(filter.AuthorIDs) == 0 && len(filter.Has) == 0 &&
+		filter.After == 0 && filter.Before == 0 && len(req.ChannelIDs) == 0 {
+		return filter, protocol.Errorf(protocol.ErrBadRequest, "a search needs something to look for")
+	}
+
+	// A channel the caller may not read is dropped rather than refused: it is
+	// absent from their channel tree, and a search must not be the one place
+	// that admits it exists.
+	wanted := map[int64]bool{}
+	for _, id := range req.ChannelIDs {
+		wanted[id] = true
+	}
+	for _, channel := range s.hub.VisibleChannels(s) {
+		if channel.Type != protocol.ChannelText {
+			continue
+		}
+		if len(wanted) == 0 || wanted[channel.ID] {
+			filter.ChannelIDs = append(filter.ChannelIDs, channel.ID)
+		}
+	}
+	return filter, nil
+}
+
+// searchHits renders a page of matches together with the line either side of
+// each of them, which is what makes a result recognisable at a glance.
+func (s *Session) searchHits(ctx context.Context, hits []store.Message) ([]protocol.MessageSearchHit, *protocol.Error) {
+	if len(hits) == 0 {
+		return []protocol.MessageSearchHit{}, nil
+	}
+
+	ids := make([]int64, 0, len(hits))
+	for _, hit := range hits {
+		ids = append(ids, hit.ID)
+	}
+	neighbours, err := s.hub.st.NeighbourIDs(ctx, ids)
+	if err != nil {
+		return nil, internalError(s, "search the history", err)
+	}
+
+	// The hits and everything around them are read and rendered as one set, so
+	// a page of results costs the same handful of queries however long it is.
+	around := ids
+	for _, n := range neighbours {
+		if n.Before != nil {
+			around = append(around, *n.Before)
+		}
+		if n.After != nil {
+			around = append(around, *n.After)
+		}
+	}
+	surrounding, err := s.hub.st.MessagesByID(ctx, around)
+	if err != nil {
+		return nil, internalError(s, "search the history", err)
+	}
+	views, failure := s.messageViews(ctx, surrounding, "search the history")
+	if failure != nil {
+		return nil, failure
+	}
+	byID := make(map[int64]protocol.Message, len(views))
+	for _, view := range views {
+		byID[view.ID] = view
+	}
+
+	out := make([]protocol.MessageSearchHit, 0, len(hits))
+	for _, hit := range hits {
+		entry := protocol.MessageSearchHit{Message: byID[hit.ID]}
+		n := neighbours[hit.ID]
+		if n.Before != nil {
+			if view, ok := byID[*n.Before]; ok {
+				entry.Before = &view
+			}
+		}
+		if n.After != nil {
+			if view, ok := byID[*n.After]; ok {
+				entry.After = &view
+			}
+		}
+		out = append(out, entry)
+	}
+	return out, nil
 }
 
 // handleMessageEdit rewrites a message.
@@ -262,6 +457,50 @@ func handleMessageDelete(ctx context.Context, s *Session, raw json.RawMessage) (
 }
 
 // --- helpers ----------------------------------------------------------------
+
+// dedupe keeps the first of each id, which is what a repeated filter means.
+func dedupe(ids []int64) []int64 {
+	if len(ids) < 2 {
+		return ids
+	}
+	seen := make(map[int64]bool, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// reverse flips a page in place, which is how a query that walked the index
+// newest first becomes the oldest-first order every page is rendered in.
+func reverse(page []store.Message) {
+	for i, j := 0, len(page)-1; i < j; i, j = i+1, j-1 {
+		page[i], page[j] = page[j], page[i]
+	}
+}
+
+// messageViews renders a run of messages along with the files they carry. One
+// query serves the whole run, rather than one per message.
+func (s *Session) messageViews(ctx context.Context, page []store.Message, doing string) ([]protocol.Message, *protocol.Error) {
+	ids := make([]int64, 0, len(page))
+	for _, m := range page {
+		ids = append(ids, m.ID)
+	}
+	attachments, err := s.hub.st.AttachmentsForMessages(ctx, ids)
+	if err != nil {
+		return nil, internalError(s, doing, err)
+	}
+
+	views := make([]protocol.Message, 0, len(page))
+	for _, m := range page {
+		views = append(views, messageView(m, attachments[m.ID]))
+	}
+	return views, nil
+}
 
 // requireTextChannel checks that a channel exists, is a text channel, and that
 // the caller holds want inside it.
