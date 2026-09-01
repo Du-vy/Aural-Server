@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // User is a member of the server. A guest is a user whose Username is still
@@ -16,6 +17,10 @@ type User struct {
 	Nickname     string
 	Username     *string
 	PasswordHash *string
+	Avatar       *string
+	Banner       *string
+	Status       string
+	CustomStatus string
 	RegisteredAt *int64
 	CreatedAt    int64
 	LastSeenAt   int64
@@ -25,18 +30,21 @@ type User struct {
 func (u User) Registered() bool { return u.Username != nil }
 
 const (
-	userColumns    = `id, nickname, username, password_hash, registered_at, created_at, last_seen_at`
-	userColumnsAsU = `u.id, u.nickname, u.username, u.password_hash, u.registered_at, u.created_at, u.last_seen_at`
+	userColumns    = `id, nickname, username, password_hash, avatar, banner, status, custom_status, registered_at, created_at, last_seen_at`
+	userColumnsAsU = `u.id, u.nickname, u.username, u.password_hash, u.avatar, u.banner, u.status, u.custom_status, u.registered_at, u.created_at, u.last_seen_at`
 )
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Nickname, &u.Username, &u.PasswordHash, &u.RegisteredAt, &u.CreatedAt, &u.LastSeenAt)
+	err := row.Scan(&u.ID, &u.Nickname, &u.Username, &u.PasswordHash, &u.Avatar, &u.Banner, &u.Status, &u.CustomStatus, &u.RegisteredAt, &u.CreatedAt, &u.LastSeenAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, ErrNotFound
 	}
 	if err != nil {
 		return User{}, fmt.Errorf("store: scan user: %w", err)
+	}
+	if u.Status == "" {
+		u.Status = "online"
 	}
 	return u, nil
 }
@@ -45,7 +53,7 @@ func scanUser(row interface{ Scan(...any) error }) (User, error) {
 func (s *Store) CreateGuest(ctx context.Context, nickname string) (User, error) {
 	ts := now()
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO users (nickname, created_at, last_seen_at) VALUES (?, ?, ?)`,
+		`INSERT INTO users (nickname, status, custom_status, created_at, last_seen_at) VALUES (?, 'online', '', ?, ?)`,
 		nickname, ts, ts)
 	if err != nil {
 		return User{}, fmt.Errorf("store: create guest: %w", err)
@@ -54,7 +62,7 @@ func (s *Store) CreateGuest(ctx context.Context, nickname string) (User, error) 
 	if err != nil {
 		return User{}, fmt.Errorf("store: create guest: %w", err)
 	}
-	return User{ID: id, Nickname: nickname, CreatedAt: ts, LastSeenAt: ts}, nil
+	return User{ID: id, Nickname: nickname, Status: "online", CustomStatus: "", CreatedAt: ts, LastSeenAt: ts}, nil
 }
 
 // UserByID looks up one user.
@@ -118,6 +126,81 @@ func (s *Store) SetNickname(ctx context.Context, id int64, nickname string) erro
 		return fmt.Errorf("store: set nickname: %w", err)
 	}
 	return requireOneRow(res, "user")
+}
+
+// SetAvatar changes the avatar URL of a user.
+func (s *Store) SetAvatar(ctx context.Context, id int64, avatar *string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE users SET avatar = ? WHERE id = ?`, avatar, id)
+	if err != nil {
+		return fmt.Errorf("store: set avatar: %w", err)
+	}
+	return requireOneRow(res, "user")
+}
+
+// SetBanner changes the banner URL of a user.
+func (s *Store) SetBanner(ctx context.Context, id int64, banner *string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE users SET banner = ? WHERE id = ?`, banner, id)
+	if err != nil {
+		return fmt.Errorf("store: set banner: %w", err)
+	}
+	return requireOneRow(res, "user")
+}
+
+// SetStatus changes the status and optional custom status of a user.
+func (s *Store) SetStatus(ctx context.Context, id int64, status string, customStatus *string) error {
+	var res sql.Result
+	var err error
+	if customStatus != nil {
+		res, err = s.db.ExecContext(ctx, `UPDATE users SET status = ?, custom_status = ? WHERE id = ?`, status, *customStatus, id)
+	} else {
+		res, err = s.db.ExecContext(ctx, `UPDATE users SET status = ? WHERE id = ?`, status, id)
+	}
+	if err != nil {
+		return fmt.Errorf("store: set status: %w", err)
+	}
+	return requireOneRow(res, "user")
+}
+
+// UpdateProfile updates nickname, avatar, banner, status, or custom status for a user.
+func (s *Store) UpdateProfile(ctx context.Context, id int64, nickname *string, avatar **string, banner **string, status *string, customStatus *string) (User, error) {
+	var sets []string
+	var args []any
+
+	if nickname != nil {
+		sets = append(sets, "nickname = ?")
+		args = append(args, *nickname)
+	}
+	if avatar != nil {
+		sets = append(sets, "avatar = ?")
+		args = append(args, *avatar)
+	}
+	if banner != nil {
+		sets = append(sets, "banner = ?")
+		args = append(args, *banner)
+	}
+	if status != nil {
+		sets = append(sets, "status = ?")
+		args = append(args, *status)
+	}
+	if customStatus != nil {
+		sets = append(sets, "custom_status = ?")
+		args = append(args, *customStatus)
+	}
+
+	if len(sets) == 0 {
+		return s.UserByID(ctx, id)
+	}
+
+	args = append(args, id)
+	query := fmt.Sprintf("UPDATE users SET %s WHERE id = ?", strings.Join(sets, ", "))
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return User{}, fmt.Errorf("store: update profile: %w", err)
+	}
+	if err := requireOneRow(res, "user"); err != nil {
+		return User{}, err
+	}
+	return s.UserByID(ctx, id)
 }
 
 // TouchUser records that the user was seen just now.

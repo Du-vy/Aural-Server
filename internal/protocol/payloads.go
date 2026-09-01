@@ -49,6 +49,10 @@ type Uploads struct {
 	Enabled bool `json:"enabled"`
 	// MaxFileBytes caps one file.
 	MaxFileBytes string `json:"maxFileBytes"`
+	// MaxAvatarBytes caps one user avatar image.
+	MaxAvatarBytes string `json:"maxAvatarBytes"`
+	// MaxBannerBytes caps one user banner image.
+	MaxBannerBytes string `json:"maxBannerBytes"`
 	// MaxTotalBytes caps everything the server stores. "0" means no ceiling.
 	MaxTotalBytes string `json:"maxTotalBytes"`
 	// UsedBytes is how much of that ceiling is already taken.
@@ -60,13 +64,17 @@ type Uploads struct {
 // User is a member of the server. Guests are users too: they simply have no
 // username yet.
 type User struct {
-	ID         int64   `json:"id"`
-	Nickname   string  `json:"nickname"`
-	Username   *string `json:"username"` // nil while the user is still a guest
-	Registered bool    `json:"registered"`
-	Roles      []int64 `json:"roles"`
-	ChannelID  *int64  `json:"channelId"` // nil when the user is in no channel
-	Online     bool    `json:"online"`
+	ID           int64   `json:"id"`
+	Nickname     string  `json:"nickname"`
+	Username     *string `json:"username"` // nil while the user is still a guest
+	Registered   bool    `json:"registered"`
+	Roles        []int64 `json:"roles"`
+	ChannelID    *int64  `json:"channelId"` // nil when the user is in no channel
+	Online       bool    `json:"online"`
+	Status       string  `json:"status"` // "online", "idle", "dnd", "offline", "invisible"
+	CustomStatus string  `json:"customStatus,omitempty"`
+	Avatar       *string `json:"avatar,omitempty"`
+	Banner       *string `json:"banner,omitempty"`
 }
 
 // Overwrite is a per-channel permission adjustment for one role. Allow and Deny
@@ -202,8 +210,12 @@ type ServerUpdateRequest struct {
 
 type UserUpdateRequest struct {
 	// UserID defaults to the caller when omitted.
-	UserID   *int64  `json:"userId,omitempty"`
-	Nickname *string `json:"nickname,omitempty"`
+	UserID       *int64   `json:"userId,omitempty"`
+	Nickname     *string  `json:"nickname,omitempty"`
+	Status       *string  `json:"status,omitempty"`
+	CustomStatus *string  `json:"customStatus,omitempty"`
+	Avatar       **string `json:"avatar,omitempty"`
+	Banner       **string `json:"banner,omitempty"`
 }
 
 type UserMoveRequest struct {

@@ -272,9 +272,12 @@ func (s *Session) finishAuth(ctx context.Context, user store.User, tokenHash, ra
 
 	ready := h.buildReady(s, rawToken)
 	view := s.view()
-	h.BroadcastTo(protocol.Event(protocol.EvUserConnected, protocol.UserEvent{User: view}), func(other *Session) bool {
-		return other != s
-	})
+	for _, other := range h.Sessions() {
+		if other != s {
+			masked := h.MaskUser(other, view)
+			other.Send(protocol.Event(protocol.EvUserConnected, protocol.UserEvent{User: masked}))
+		}
+	}
 
 	s.log.Info("authenticated",
 		slog.Int64("user", user.ID),
@@ -305,7 +308,7 @@ func (h *Hub) buildReady(s *Session, sessionToken string) protocol.Ready {
 	sessions := h.Sessions()
 	users := make([]protocol.User, 0, len(sessions))
 	for _, other := range sessions {
-		users = append(users, h.maskUser(s, other.view()))
+		users = append(users, h.MaskUser(s, other.view()))
 	}
 
 	return protocol.Ready{
@@ -317,15 +320,6 @@ func (h *Hub) buildReady(s *Session, sessionToken string) protocol.Ready {
 		Permissions:  base.String(),
 		Server:       h.serverInfo(),
 	}
-}
-
-// maskUser hides the channel of a user sitting somewhere the viewer cannot see,
-// so a restricted channel does not leak through the presence list.
-func (h *Hub) maskUser(viewer *Session, view protocol.User) protocol.User {
-	if view.ChannelID != nil && !h.SessionCanView(viewer, *view.ChannelID) {
-		view.ChannelID = nil
-	}
-	return view
 }
 
 // internalError logs the cause and returns the opaque error the client sees.

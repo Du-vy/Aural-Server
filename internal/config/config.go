@@ -78,6 +78,10 @@ type Uploads struct {
 	Path string `json:"path"`
 	// MaxFileBytes caps one file.
 	MaxFileBytes int64 `json:"max_file_bytes"`
+	// MaxAvatarBytes caps one user avatar image.
+	MaxAvatarBytes int64 `json:"max_avatar_bytes"`
+	// MaxBannerBytes caps one user profile banner image.
+	MaxBannerBytes int64 `json:"max_banner_bytes"`
 	// MaxTotalBytes caps everything the server stores, across all channels.
 	// Zero means no ceiling beyond the disk itself.
 	MaxTotalBytes int64 `json:"max_total_bytes"`
@@ -136,10 +140,12 @@ type Log struct {
 const DefaultPort = 9871
 
 // The upload ceilings a fresh install starts from: 50 MiB for one file, 5 GiB
-// for everything the server holds.
+// for everything the server holds, 8 MiB for an avatar, 16 MiB for a banner.
 const (
-	DefaultMaxFileBytes  int64 = 50 * 1024 * 1024
-	DefaultMaxTotalBytes int64 = 5 * 1024 * 1024 * 1024
+	DefaultMaxFileBytes   int64 = 50 * 1024 * 1024
+	DefaultMaxAvatarBytes int64 = 8 * 1024 * 1024
+	DefaultMaxBannerBytes int64 = 16 * 1024 * 1024
+	DefaultMaxTotalBytes  int64 = 5 * 1024 * 1024 * 1024
 )
 
 // Default returns the configuration a fresh install starts from.
@@ -166,6 +172,8 @@ func Default() Config {
 			Enabled:           true,
 			Path:              "uploads",
 			MaxFileBytes:      DefaultMaxFileBytes,
+			MaxAvatarBytes:    DefaultMaxAvatarBytes,
+			MaxBannerBytes:    DefaultMaxBannerBytes,
 			MaxTotalBytes:     DefaultMaxTotalBytes,
 			MaxPerMessage:     10,
 			PendingTTLMinutes: 60,
@@ -286,6 +294,12 @@ func (c *Config) Validate() error {
 		}
 		if c.Uploads.MaxFileBytes < 1 {
 			return errors.New("uploads.max_file_bytes must be at least 1")
+		}
+		if c.Uploads.MaxAvatarBytes < 1 {
+			c.Uploads.MaxAvatarBytes = DefaultMaxAvatarBytes
+		}
+		if c.Uploads.MaxBannerBytes < 1 {
+			c.Uploads.MaxBannerBytes = DefaultMaxBannerBytes
 		}
 		if c.Uploads.MaxTotalBytes < 0 {
 			return errors.New("uploads.max_total_bytes must not be negative")

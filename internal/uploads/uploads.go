@@ -109,17 +109,18 @@ type Saved struct {
 }
 
 // Save streams r into the upload directory.
-//
-// expected is the declared length, from Content-Length; it is a hint used to
-// reserve quota, and never trusted as the real size. A body that turns out
-// longer than the per-file ceiling is refused mid-stream and its partial file
-// removed, so a lying client cannot fill the disk.
 func (s *Store) Save(r io.Reader, contentLength int64) (Saved, error) {
+	return s.SaveWithLimit(r, contentLength, s.maxFile)
+}
+
+// SaveWithLimit streams r into the upload directory, capped at maxBytes.
+func (s *Store) SaveWithLimit(r io.Reader, contentLength, maxBytes int64) (Saved, error) {
+	if maxBytes <= 0 || (s.maxFile > 0 && maxBytes > s.maxFile) {
+		maxBytes = s.maxFile
+	}
 	reserved := contentLength
-	if reserved <= 0 || reserved > s.maxFile {
-		// An unknown or implausible length reserves the whole per-file
-		// allowance, which is the most this upload could legitimately become.
-		reserved = s.maxFile
+	if reserved <= 0 || reserved > maxBytes {
+		reserved = maxBytes
 	}
 	if err := s.reserve(reserved); err != nil {
 		return Saved{}, err
@@ -146,7 +147,7 @@ func (s *Store) Save(r io.Reader, contentLength int64) (Saved, error) {
 	// One byte past the ceiling is read on purpose: a body that produces it is
 	// over the limit, and stopping exactly at the limit could not tell the
 	// difference between a file that fits and one that was truncated.
-	written, err := io.Copy(file, io.LimitReader(r, s.maxFile+1))
+	written, err := io.Copy(file, io.LimitReader(r, maxBytes+1))
 	closeErr := file.Close()
 
 	switch {
@@ -156,7 +157,7 @@ func (s *Store) Save(r io.Reader, contentLength int64) (Saved, error) {
 	case closeErr != nil:
 		s.discard(path, reserved)
 		return Saved{}, fmt.Errorf("uploads: write %s: %w", key, closeErr)
-	case written > s.maxFile:
+	case written > maxBytes:
 		s.discard(path, reserved)
 		return Saved{}, ErrTooLarge
 	case written == 0:

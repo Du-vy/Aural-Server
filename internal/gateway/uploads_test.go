@@ -406,3 +406,116 @@ func TestAFileIsNamedButNeverPathed(t *testing.T) {
 		t.Fatalf("an uninterpretable file must be a download, got %q", disposition)
 	}
 }
+
+func (h *harness) uploadAvatar(token, filename string, content []byte) *http.Response {
+	h.t.Helper()
+
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	part, err := form.CreateFormFile("file", filename)
+	if err != nil {
+		h.t.Fatalf("create form file: %v", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		h.t.Fatalf("write form part: %v", err)
+	}
+	if err := form.Close(); err != nil {
+		h.t.Fatalf("close form: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, h.http.URL+"/upload/avatar", &body)
+	if err != nil {
+		h.t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatalf("post /upload/avatar: %v", err)
+	}
+	return res
+}
+
+func (h *harness) uploadBanner(token, filename string, content []byte) *http.Response {
+	h.t.Helper()
+
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	part, err := form.CreateFormFile("file", filename)
+	if err != nil {
+		h.t.Fatalf("create form file: %v", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		h.t.Fatalf("write form part: %v", err)
+	}
+	if err := form.Close(); err != nil {
+		h.t.Fatalf("close form: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, h.http.URL+"/upload/banner", &body)
+	if err != nil {
+		h.t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatalf("post /upload/banner: %v", err)
+	}
+	return res
+}
+
+func TestAvatarAndBannerUploads(t *testing.T) {
+	h := newHarness(t, withUploads(t, nil))
+
+	alice := h.dial()
+	ready := alice.guest("Alice")
+
+	// 1. Upload valid avatar
+	avatarBytes := pngBytes(t, 128, 128)
+	res := h.uploadAvatar(ready.SessionToken, "avatar.png", avatarBytes)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("upload avatar: got status %d", res.StatusCode)
+	}
+	var avatarResult struct {
+		URL  string        `json:"url"`
+		User protocol.User `json:"user"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&avatarResult); err != nil {
+		t.Fatalf("decode avatar response: %v", err)
+	}
+	res.Body.Close()
+	if avatarResult.User.Avatar == nil || *avatarResult.User.Avatar != avatarResult.URL {
+		t.Fatalf("avatar url mismatch: %v vs %v", avatarResult.User.Avatar, avatarResult.URL)
+	}
+
+	// 2. Upload valid banner
+	bannerBytes := pngBytes(t, 600, 200)
+	resBanner := h.uploadBanner(ready.SessionToken, "banner.png", bannerBytes)
+	if resBanner.StatusCode != http.StatusOK {
+		t.Fatalf("upload banner: got status %d", resBanner.StatusCode)
+	}
+	var bannerResult struct {
+		URL  string        `json:"url"`
+		User protocol.User `json:"user"`
+	}
+	if err := json.NewDecoder(resBanner.Body).Decode(&bannerResult); err != nil {
+		t.Fatalf("decode banner response: %v", err)
+	}
+	resBanner.Body.Close()
+	if bannerResult.User.Banner == nil || *bannerResult.User.Banner != bannerResult.URL {
+		t.Fatalf("banner url mismatch: %v vs %v", bannerResult.User.Banner, bannerResult.URL)
+	}
+
+	// 3. Disallowed format for avatar
+	resBad := h.uploadAvatar(ready.SessionToken, "virus.exe", []byte("bad executable"))
+	if resBad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad format should be 400, got %d", resBad.StatusCode)
+	}
+	resBad.Body.Close()
+}
+

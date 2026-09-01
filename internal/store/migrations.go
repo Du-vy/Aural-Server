@@ -159,6 +159,13 @@ var migrations = []string{
 	);
 	CREATE INDEX idx_link_previews_fetched ON link_previews(fetched_at);
 	`,
+	// 6: user avatars, banners, and status.
+	`
+	ALTER TABLE users ADD COLUMN avatar TEXT;
+	ALTER TABLE users ADD COLUMN banner TEXT;
+	ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'online';
+	ALTER TABLE users ADD COLUMN custom_status TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

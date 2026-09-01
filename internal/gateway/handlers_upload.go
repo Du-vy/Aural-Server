@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -180,6 +182,231 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, attachmentView(created))
 }
 
+func isAllowedImageFormat(filename string) bool {
+	ext := strings.ToLower(filepath.Ext(filename))
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) removeStoredMedia(mediaURL string) {
+	files := s.hub.Files()
+	if files == nil || !strings.HasPrefix(mediaURL, uploadPrefix) {
+		return
+	}
+	trimmed := strings.TrimPrefix(mediaURL, uploadPrefix)
+	parts := strings.SplitN(trimmed, "/", 2)
+	if len(parts) == 0 {
+		return
+	}
+	key := parts[0]
+	path, err := files.Path(key)
+	if err != nil {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	files.Remove(key, info.Size())
+}
+
+type MediaUploadResult struct {
+	URL  string        `json:"url"`
+	User protocol.User `json:"user"`
+}
+
+// handleAvatarUpload uploads and sets the user's avatar.
+//
+//	POST /upload/avatar
+//	Authorization: Bearer <session token>
+//	Content-Type: multipart/form-data, one part named "file"
+func (s *Server) handleAvatarUpload(w http.ResponseWriter, r *http.Request) {
+	s.applyCORS(w, r)
+
+	files := s.hub.Files()
+	if files == nil {
+		writeAPIError(w, http.StatusForbidden, protocol.ErrUploadsDisabled,
+			"this server does not accept file uploads")
+		return
+	}
+
+	user, failure := s.authenticateRequest(r)
+	if failure != nil {
+		writeProtocolError(w, failure)
+		return
+	}
+
+	if !s.uploads.allow(user.ID) {
+		writeAPIError(w, http.StatusTooManyRequests, protocol.ErrRateLimited,
+			"you are uploading files too quickly")
+		return
+	}
+
+	part, filename, failure := openUploadPart(r)
+	if failure != nil {
+		writeProtocolError(w, failure)
+		return
+	}
+	defer part.Close()
+
+	if !isAllowedImageFormat(filename) {
+		writeAPIError(w, http.StatusBadRequest, protocol.ErrBadRequest,
+			"unsupported image format; allowed formats are JPG, PNG, WebP, GIF, AVIF, BMP")
+		return
+	}
+
+	maxBytes := s.cfg.Uploads.MaxAvatarBytes
+	if maxBytes <= 0 {
+		maxBytes = files.MaxFileBytes()
+	}
+
+	saved, err := files.SaveWithLimit(part, r.ContentLength, maxBytes)
+	switch {
+	case errors.Is(err, uploads.ErrTooLarge):
+		writeAPIError(w, http.StatusRequestEntityTooLarge, protocol.ErrTooLarge,
+			fmt.Sprintf("avatars on this server may be at most %s", humanBytes(maxBytes)))
+		return
+	case errors.Is(err, uploads.ErrQuotaExceeded):
+		writeAPIError(w, http.StatusInsufficientStorage, protocol.ErrStorageFull,
+			"this server has no storage left for new files")
+		return
+	case err != nil:
+		s.log.Error("store avatar upload", slog.Any("error", err))
+		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the file could not be stored")
+		return
+	}
+
+	// Remove previous uploaded avatar if it was stored on the server
+	if user.Avatar != nil && strings.HasPrefix(*user.Avatar, uploadPrefix) {
+		s.removeStoredMedia(*user.Avatar)
+	}
+
+	avatarURL := uploadPrefix + saved.Key + "/" + url.PathEscape(filename)
+	if err := s.st.SetAvatar(r.Context(), user.ID, &avatarURL); err != nil {
+		files.Remove(saved.Key, saved.Size)
+		s.log.Error("record avatar", slog.Any("error", err))
+		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the avatar could not be recorded")
+		return
+	}
+
+	updatedUser, err := s.st.UserByID(r.Context(), user.ID)
+	if err != nil {
+		updatedUser = user
+		updatedUser.Avatar = &avatarURL
+	}
+
+	if sess, ok := s.hub.SessionForUser(user.ID); ok {
+		sess.setUser(updatedUser)
+		view := sess.view()
+		s.hub.BroadcastUserUpdated(view)
+		writeJSON(w, http.StatusOK, MediaUploadResult{URL: avatarURL, User: view})
+		return
+	}
+
+	base, roleIDs, _ := s.hub.UserPermissions(r.Context(), updatedUser)
+	_ = base
+	view := userView(updatedUser, roleIDs, nil, false)
+	writeJSON(w, http.StatusOK, MediaUploadResult{URL: avatarURL, User: view})
+}
+
+// handleBannerUpload uploads and sets the user's profile banner.
+//
+//	POST /upload/banner
+//	Authorization: Bearer <session token>
+//	Content-Type: multipart/form-data, one part named "file"
+func (s *Server) handleBannerUpload(w http.ResponseWriter, r *http.Request) {
+	s.applyCORS(w, r)
+
+	files := s.hub.Files()
+	if files == nil {
+		writeAPIError(w, http.StatusForbidden, protocol.ErrUploadsDisabled,
+			"this server does not accept file uploads")
+		return
+	}
+
+	user, failure := s.authenticateRequest(r)
+	if failure != nil {
+		writeProtocolError(w, failure)
+		return
+	}
+
+	if !s.uploads.allow(user.ID) {
+		writeAPIError(w, http.StatusTooManyRequests, protocol.ErrRateLimited,
+			"you are uploading files too quickly")
+		return
+	}
+
+	part, filename, failure := openUploadPart(r)
+	if failure != nil {
+		writeProtocolError(w, failure)
+		return
+	}
+	defer part.Close()
+
+	if !isAllowedImageFormat(filename) {
+		writeAPIError(w, http.StatusBadRequest, protocol.ErrBadRequest,
+			"unsupported image format; allowed formats are JPG, PNG, WebP, GIF, AVIF, BMP")
+		return
+	}
+
+	maxBytes := s.cfg.Uploads.MaxBannerBytes
+	if maxBytes <= 0 {
+		maxBytes = files.MaxFileBytes()
+	}
+
+	saved, err := files.SaveWithLimit(part, r.ContentLength, maxBytes)
+	switch {
+	case errors.Is(err, uploads.ErrTooLarge):
+		writeAPIError(w, http.StatusRequestEntityTooLarge, protocol.ErrTooLarge,
+			fmt.Sprintf("banners on this server may be at most %s", humanBytes(maxBytes)))
+		return
+	case errors.Is(err, uploads.ErrQuotaExceeded):
+		writeAPIError(w, http.StatusInsufficientStorage, protocol.ErrStorageFull,
+			"this server has no storage left for new files")
+		return
+	case err != nil:
+		s.log.Error("store banner upload", slog.Any("error", err))
+		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the file could not be stored")
+		return
+	}
+
+	// Remove previous uploaded banner if it was stored on the server
+	if user.Banner != nil && strings.HasPrefix(*user.Banner, uploadPrefix) {
+		s.removeStoredMedia(*user.Banner)
+	}
+
+	bannerURL := uploadPrefix + saved.Key + "/" + url.PathEscape(filename)
+	if err := s.st.SetBanner(r.Context(), user.ID, &bannerURL); err != nil {
+		files.Remove(saved.Key, saved.Size)
+		s.log.Error("record banner", slog.Any("error", err))
+		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the banner could not be recorded")
+		return
+	}
+
+	updatedUser, err := s.st.UserByID(r.Context(), user.ID)
+	if err != nil {
+		updatedUser = user
+		updatedUser.Banner = &bannerURL
+	}
+
+	if sess, ok := s.hub.SessionForUser(user.ID); ok {
+		sess.setUser(updatedUser)
+		view := sess.view()
+		s.hub.BroadcastUserUpdated(view)
+		writeJSON(w, http.StatusOK, MediaUploadResult{URL: bannerURL, User: view})
+		return
+	}
+
+	base, roleIDs, _ := s.hub.UserPermissions(r.Context(), updatedUser)
+	_ = base
+	view := userView(updatedUser, roleIDs, nil, false)
+	writeJSON(w, http.StatusOK, MediaUploadResult{URL: bannerURL, User: view})
+}
+
 // openUploadPart finds the file part of a multipart body and returns it
 // unbuffered, so the bytes go straight from the socket to the disk.
 func openUploadPart(r *http.Request) (io.ReadCloser, string, *protocol.Error) {
@@ -268,51 +495,55 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The routed value rather than the raw path: a filename is percent-encoded
-	// into the URL, and re-splitting the decoded path would mishandle one that
-	// decodes to contain a separator.
-	attachment, err := s.st.AttachmentByStorageKey(r.Context(), r.PathValue("key"))
-	if errors.Is(err, store.ErrNotFound) {
-		http.NotFound(w, r)
-		return
+	key := r.PathValue("key")
+	rawFilename := r.PathValue("filename")
+	filename, err := url.PathUnescape(rawFilename)
+	if err != nil || filename == "" {
+		filename = rawFilename
 	}
-	if err != nil {
+
+	var contentType string
+	var modTime time.Time
+
+	attachment, err := s.st.AttachmentByStorageKey(r.Context(), key)
+	if err == nil {
+		filename = attachment.Filename
+		contentType = attachment.ContentType
+		modTime = time.Unix(attachment.CreatedAt, 0)
+	} else if errors.Is(err, store.ErrNotFound) {
+		contentType = uploads.ContentType(filename)
+	} else {
 		s.log.Error("read attachment", slog.Any("error", err))
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	file, _, err := files.Open(attachment.StorageKey)
+	file, info, err := files.Open(key)
 	if err != nil {
-		// A row whose file is gone is a server that lost data, not a bad
-		// request, so it is worth saying so in the log.
-		s.log.Warn("attachment file is missing",
-			slog.Int64("attachment", attachment.ID), slog.String("key", attachment.StorageKey))
+		s.log.Warn("attachment file is missing", slog.String("key", key))
 		http.NotFound(w, r)
 		return
 	}
 	defer file.Close()
 
-	inline := uploads.Inline(attachment.ContentType) && !r.URL.Query().Has("download")
+	if modTime.IsZero() && info != nil {
+		modTime = info.ModTime()
+	}
+
+	inline := uploads.Inline(contentType) && !r.URL.Query().Has("download")
 	disposition := "attachment"
 	if inline {
 		disposition = "inline"
 	}
 
-	w.Header().Set("Content-Type", attachment.ContentType)
-	// The type above is decided from the extension by the server; letting a
-	// browser sniff its way to a different one is exactly what must not happen.
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Disposition",
-		mime.FormatMediaType(disposition, map[string]string{"filename": attachment.Filename}))
-	// A stored file never changes: its key is minted per upload. Caching it
-	// hard is what keeps scrolling through history from refetching every image.
+		mime.FormatMediaType(disposition, map[string]string{"filename": filename}))
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("Accept-Ranges", "bytes")
 
-	// ServeContent handles Range and conditional requests, which is what lets a
-	// video be seeked instead of only played from the start.
-	http.ServeContent(w, r, attachment.Filename, time.Unix(attachment.CreatedAt, 0), file)
+	http.ServeContent(w, r, filename, modTime, file)
 }
 
 // --- HTTP plumbing ----------------------------------------------------------

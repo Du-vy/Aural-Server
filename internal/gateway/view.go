@@ -109,14 +109,22 @@ func userView(u store.User, roleIDs []int64, channelID *int64, online bool) prot
 	if ids == nil {
 		ids = []int64{}
 	}
+	status := u.Status
+	if status == "" {
+		status = "online"
+	}
 	return protocol.User{
-		ID:         u.ID,
-		Nickname:   u.Nickname,
-		Username:   u.Username,
-		Registered: u.Registered(),
-		Roles:      ids,
-		ChannelID:  channelID,
-		Online:     online,
+		ID:           u.ID,
+		Nickname:     u.Nickname,
+		Username:     u.Username,
+		Registered:   u.Registered(),
+		Roles:        ids,
+		ChannelID:    channelID,
+		Online:       online,
+		Status:       status,
+		CustomStatus: u.CustomStatus,
+		Avatar:       u.Avatar,
+		Banner:       u.Banner,
 	}
 }
 
@@ -145,13 +153,22 @@ func (h *Hub) serverInfo() protocol.ServerInfo {
 // long transfer.
 func (h *Hub) uploadInfo() protocol.Uploads {
 	if h.files == nil {
-		return protocol.Uploads{Enabled: false, MaxFileBytes: "0", MaxTotalBytes: "0", UsedBytes: "0"}
+		return protocol.Uploads{
+			Enabled:        false,
+			MaxFileBytes:   "0",
+			MaxAvatarBytes: "0",
+			MaxBannerBytes: "0",
+			MaxTotalBytes:  "0",
+			UsedBytes:      "0",
+		}
 	}
 	return protocol.Uploads{
-		Enabled:       true,
-		MaxFileBytes:  strconv.FormatInt(h.files.MaxFileBytes(), 10),
-		MaxTotalBytes: strconv.FormatInt(h.files.MaxTotalBytes(), 10),
-		UsedBytes:     strconv.FormatInt(h.files.UsedBytes(), 10),
-		MaxPerMessage: h.cfg.Uploads.MaxPerMessage,
+		Enabled:        true,
+		MaxFileBytes:   strconv.FormatInt(h.files.MaxFileBytes(), 10),
+		MaxAvatarBytes: strconv.FormatInt(h.cfg.Uploads.MaxAvatarBytes, 10),
+		MaxBannerBytes: strconv.FormatInt(h.cfg.Uploads.MaxBannerBytes, 10),
+		MaxTotalBytes:  strconv.FormatInt(h.files.MaxTotalBytes(), 10),
+		UsedBytes:      strconv.FormatInt(h.files.UsedBytes(), 10),
+		MaxPerMessage:  h.cfg.Uploads.MaxPerMessage,
 	}
 }

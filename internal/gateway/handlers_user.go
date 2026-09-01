@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 
@@ -15,14 +16,31 @@ import (
 	"github.com/aural-chat/aural-server/internal/store"
 )
 
-// handleUserUpdate changes a nickname, either the caller's own or, with
-// ManageNicknames, somebody else's.
+func validateStatus(status string) (string, *protocol.Error) {
+	status = strings.ToLower(strings.TrimSpace(status))
+	switch status {
+	case "online", "idle", "dnd", "invisible", "offline":
+		return status, nil
+	default:
+		return "", protocol.Errorf(protocol.ErrBadRequest, "invalid status: must be online, idle, dnd, or invisible")
+	}
+}
+
+func validateMediaURL(urlStr string, name string) (string, *protocol.Error) {
+	trimmed := strings.TrimSpace(urlStr)
+	if len(trimmed) > 2048 {
+		return "", protocol.Errorf(protocol.ErrBadRequest, fmt.Sprintf("%s URL is too long", name))
+	}
+	return trimmed, nil
+}
+
+// handleUserUpdate changes profile attributes (nickname, status, customStatus, avatar, banner).
 func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
 	req, failure := decode[protocol.UserUpdateRequest](raw)
 	if failure != nil {
 		return nil, failure
 	}
-	if req.Nickname == nil {
+	if req.Nickname == nil && req.Status == nil && req.CustomStatus == nil && req.Avatar == nil && req.Banner == nil {
 		return nil, protocol.Errorf(protocol.ErrBadRequest, "nothing to update")
 	}
 
@@ -31,44 +49,98 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 		targetID = *req.UserID
 	}
 
+	isSelf := targetID == s.UserID()
 	base, _ := s.Permissions()
-	if targetID == s.UserID() {
-		if !base.Has(permissions.ChangeNickname) {
-			return nil, protocol.Errorf(protocol.ErrForbidden, "you are not allowed to change your nickname")
+
+	var validatedNickname *string
+	if req.Nickname != nil {
+		if isSelf {
+			if !base.Has(permissions.ChangeNickname) {
+				return nil, protocol.Errorf(protocol.ErrForbidden, "you are not allowed to change your nickname")
+			}
+		} else {
+			if !base.Has(permissions.ManageNicknames) {
+				return nil, protocol.Errorf(protocol.ErrForbidden, "you are not allowed to change other nicknames")
+			}
+			if failure := s.hub.requireOutranks(s, targetID); failure != nil {
+				return nil, failure
+			}
 		}
-	} else {
-		if !base.Has(permissions.ManageNicknames) {
-			return nil, protocol.Errorf(protocol.ErrForbidden, "you are not allowed to change other nicknames")
-		}
-		if failure := s.hub.requireOutranks(s, targetID); failure != nil {
+		nickname, failure := validateNickname(*req.Nickname)
+		if failure != nil {
 			return nil, failure
+		}
+		validatedNickname = &nickname
+	}
+
+	if !isSelf && (req.Status != nil || req.CustomStatus != nil || req.Avatar != nil || req.Banner != nil) {
+		return nil, protocol.Errorf(protocol.ErrForbidden, "you may only update your own profile details")
+	}
+
+	var validatedStatus *string
+	if req.Status != nil {
+		st, failure := validateStatus(*req.Status)
+		if failure != nil {
+			return nil, failure
+		}
+		validatedStatus = &st
+	}
+
+	var validatedCustomStatus *string
+	if req.CustomStatus != nil {
+		cs := strings.TrimSpace(*req.CustomStatus)
+		if len([]rune(cs)) > 128 {
+			return nil, protocol.Errorf(protocol.ErrBadRequest, "custom status must be at most 128 characters")
+		}
+		validatedCustomStatus = &cs
+	}
+
+	var validatedAvatar **string
+	if req.Avatar != nil {
+		if *req.Avatar == nil || **req.Avatar == "" {
+			var empty *string = nil
+			validatedAvatar = &empty
+		} else {
+			val, failure := validateMediaURL(**req.Avatar, "avatar")
+			if failure != nil {
+				return nil, failure
+			}
+			var ptr *string = &val
+			validatedAvatar = &ptr
 		}
 	}
 
-	nickname, failure := validateNickname(*req.Nickname)
-	if failure != nil {
-		return nil, failure
+	var validatedBanner **string
+	if req.Banner != nil {
+		if *req.Banner == nil || **req.Banner == "" {
+			var empty *string = nil
+			validatedBanner = &empty
+		} else {
+			val, failure := validateMediaURL(**req.Banner, "banner")
+			if failure != nil {
+				return nil, failure
+			}
+			var ptr *string = &val
+			validatedBanner = &ptr
+		}
 	}
-	if err := s.hub.st.SetNickname(ctx, targetID, nickname); err != nil {
+
+	updatedUser, err := s.hub.st.UpdateProfile(ctx, targetID, validatedNickname, validatedAvatar, validatedBanner, validatedStatus, validatedCustomStatus)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, protocol.Errorf(protocol.ErrNotFound, "no such user")
 		}
-		return nil, internalError(s, "set nickname", err)
+		return nil, internalError(s, "update user profile", err)
 	}
 
 	target, ok := s.hub.SessionForUser(targetID)
 	if !ok {
-		// The user is offline; the new nickname is already persisted and will
-		// show up the next time they connect.
 		return struct{}{}, nil
 	}
 
-	user := target.User()
-	user.Nickname = nickname
-	target.setUser(user)
-
+	target.setUser(updatedUser)
 	view := target.view()
-	s.hub.Broadcast(protocol.Event(protocol.EvUserUpdated, protocol.UserEvent{User: view}))
+	s.hub.BroadcastUserUpdated(view)
 	return protocol.UserEvent{User: view}, nil
 }
 

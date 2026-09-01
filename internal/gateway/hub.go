@@ -460,3 +460,24 @@ func (h *Hub) VisibleChannels(s *Session) []store.Channel {
 	}
 	return out
 }
+
+// MaskUser masks sensitive presence for other viewers (e.g. invisible status or hidden voice channels).
+func (h *Hub) MaskUser(viewer *Session, view protocol.User) protocol.User {
+	if viewer.UserID() != view.ID && (view.Status == "invisible" || view.Status == "offline") {
+		view.Online = false
+		view.Status = "offline"
+		view.ChannelID = nil
+	}
+	if view.ChannelID != nil && !h.SessionCanView(viewer, *view.ChannelID) {
+		view.ChannelID = nil
+	}
+	return view
+}
+
+// BroadcastUserUpdated announces a user update, properly masked per viewer.
+func (h *Hub) BroadcastUserUpdated(user protocol.User) {
+	for _, s := range h.Sessions() {
+		masked := h.MaskUser(s, user)
+		s.Send(protocol.Event(protocol.EvUserUpdated, protocol.UserEvent{User: masked}))
+	}
+}
