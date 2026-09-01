@@ -30,9 +30,13 @@ type Server struct {
 	hub  *Hub
 	http *http.Server
 	seq  atomic.Int64
-	// uploads throttles the HTTP upload endpoint, which has no session of its
-	// own to hang a limiter off.
-	uploads *uploadLimiters
+	// uploads, unfurls and klipy throttle the HTTP endpoints, which have no
+	// session of their own to hang a limiter off. Each costs something
+	// different — disk, an outbound fetch, somebody else's quota — so each
+	// gets its own rate rather than sharing one.
+	uploads *userLimiters
+	unfurls *userLimiters
+	klipy   *userLimiters
 }
 
 // New builds the gateway. cfgPath is where runtime configuration edits are
@@ -43,7 +47,12 @@ func New(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Stor
 		return nil, err
 	}
 
-	s := &Server{cfg: cfg, st: st, log: log, hub: hub, uploads: newUploadLimiters()}
+	s := &Server{
+		cfg: cfg, st: st, log: log, hub: hub,
+		uploads: newUserLimiters(uploadBurst, uploadsPerSecond),
+		unfurls: newUserLimiters(unfurlBurst, unfurlsPerSecond),
+		klipy:   newUserLimiters(klipyBurst, klipyPerSecond),
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /info", s.handleInfo)
@@ -59,6 +68,8 @@ func New(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Stor
 	mux.HandleFunc("OPTIONS "+uploadPrefix+"{key}/{filename}", s.handlePreflight)
 	mux.HandleFunc("GET /unfurl", s.handleUnfurl)
 	mux.HandleFunc("OPTIONS /unfurl", s.handlePreflight)
+	mux.HandleFunc("GET /klipy/{kind}/{action}", s.handleKlipy)
+	mux.HandleFunc("OPTIONS /klipy/{kind}/{action}", s.handlePreflight)
 
 	s.http = &http.Server{
 		Addr:              cfg.Address(),
@@ -83,6 +94,9 @@ func (s *Server) Run(ctx context.Context) error {
 	errs := make(chan error, 1)
 
 	if s.hub.Files() != nil {
+		// Before the listener, deliberately: the sweep is only unambiguous
+		// while nothing is uploading.
+		s.sweepOrphanedFiles(ctx)
 		go s.sweepPending(ctx)
 	}
 
@@ -178,13 +192,19 @@ func (s *Server) finishSession(session *Session) {
 		return
 	}
 	userID := session.UserID()
+	status := session.User().Status
 	s.hub.Remove(session)
 
 	if _, stillOnline := s.hub.SessionForUser(userID); stillOnline {
 		// A newer connection took the identity over; presence never dropped.
 		return
 	}
-	s.hub.Broadcast(protocol.Event(protocol.EvUserDisconnected, protocol.UserDisconnectedEvent{UserID: userID}))
+	if !HidesPresence(status) {
+		// Nobody was told they were here, so nobody is told they have gone:
+		// a departure for a user the rest of the server believes is offline
+		// is what would give away that they were not.
+		s.hub.Broadcast(protocol.Event(protocol.EvUserDisconnected, protocol.UserDisconnectedEvent{UserID: userID}))
+	}
 	s.log.Info("disconnected", slog.Int64("user", userID))
 }
 

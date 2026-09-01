@@ -257,7 +257,7 @@ func (s *Session) changeRoleMembership(ctx context.Context, raw json.RawMessage,
 	}
 
 	view := target.view()
-	s.hub.Broadcast(protocol.Event(protocol.EvUserUpdated, protocol.UserEvent{User: view}))
+	s.hub.BroadcastUserUpdated(view)
 	// The target may now see, or stop seeing, whole parts of the tree.
 	target.Send(protocol.Event(protocol.EvReady, s.hub.buildReady(target, "")))
 	s.hub.evictFromUnreachableChannels()

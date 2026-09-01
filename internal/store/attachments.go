@@ -225,6 +225,30 @@ func (s *Store) TotalAttachmentBytes(ctx context.Context) (int64, error) {
 	return total.Int64, nil
 }
 
+// AttachmentKeys lists every storage key an attachment row still points at,
+// which together with ProfileMediaKeys is everything the upload directory is
+// allowed to be holding.
+func (s *Store) AttachmentKeys(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT storage_key FROM attachments`)
+	if err != nil {
+		return nil, fmt.Errorf("store: read attachment keys: %w", err)
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("store: scan attachment key: %w", err)
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read attachment keys: %w", err)
+	}
+	return keys, nil
+}
+
 // PendingAttachmentsBefore lists uploads that were never posted and are older
 // than cutoff. A writer who picks a file and then abandons the message leaves
 // one behind, and it must not be kept forever.

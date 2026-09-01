@@ -166,6 +166,26 @@ var migrations = []string{
 	ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'online';
 	ALTER TABLE users ADD COLUMN custom_status TEXT NOT NULL DEFAULT '';
 	`,
+	// 7: the files behind avatars and banners.
+	//
+	// They cannot live in attachments: that table needs a channel, and the
+	// sweep that reclaims abandoned uploads deletes every row in it that no
+	// message carries, which is every avatar there would ever be. Their own
+	// table is what lets the quota count them and a restart remember them.
+	`
+	CREATE TABLE profile_media (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		-- kind is 'avatar' or 'banner'. A user holds at most one of each; the
+		-- previous row is deleted as the new one is written.
+		kind        TEXT    NOT NULL,
+		storage_key TEXT    NOT NULL UNIQUE,
+		filename    TEXT    NOT NULL,
+		size        INTEGER NOT NULL,
+		created_at  INTEGER NOT NULL
+	);
+	CREATE INDEX idx_profile_media_owner ON profile_media(user_id, kind);
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

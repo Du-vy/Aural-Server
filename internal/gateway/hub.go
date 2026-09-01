@@ -69,10 +69,18 @@ func NewHub(ctx context.Context, cfg *config.Config, cfgPath string, st *store.S
 	if cfg.Uploads.Enabled {
 		// The quota is measured against what the database already accounts
 		// for, so a restart neither forgets stored files nor double-counts them.
+		// Both tables count: an avatar takes the same disk an attachment does,
+		// and leaving it out drifts the ceiling further from the truth with
+		// every picture uploaded.
 		used, err := st.TotalAttachmentBytes(ctx)
 		if err != nil {
 			return nil, err
 		}
+		pictures, err := st.TotalProfileMediaBytes(ctx)
+		if err != nil {
+			return nil, err
+		}
+		used += pictures
 		files, err := uploads.Open(cfg.Uploads.Path,
 			cfg.Uploads.MaxFileBytes, cfg.Uploads.MaxTotalBytes, used)
 		if err != nil {
@@ -112,10 +120,19 @@ func (h *Hub) RemoveFiles(attachments []store.Attachment) {
 }
 
 // ServerIdentity reads the configuration fields that change at runtime.
-func (h *Hub) ServerIdentity() (name, description, klipyApiKey string) {
+func (h *Hub) ServerIdentity() (name, description string) {
 	h.cfgMu.RLock()
 	defer h.cfgMu.RUnlock()
-	return h.cfg.Server.Name, h.cfg.Server.Description, h.cfg.Integrations.KlipyAPIKey
+	return h.cfg.Server.Name, h.cfg.Server.Description
+}
+
+// KlipyAPIKey is the operator's Klipy credential, which only the proxy handler
+// is meant to read. It is deliberately not part of ServerIdentity: that feeds
+// the public server preview, and a secret has no business travelling with it.
+func (h *Hub) KlipyAPIKey() string {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	return h.cfg.Integrations.KlipyAPIKey
 }
 
 // updateServerIdentity applies configuration updates and persists them.
@@ -461,11 +478,28 @@ func (h *Hub) VisibleChannels(s *Session) []store.Channel {
 	return out
 }
 
-// MaskUser masks sensitive presence for other viewers (e.g. invisible status or hidden voice channels).
+// HidesPresence reports whether a status is one that makes a connected user
+// look offline to everyone but themselves.
+//
+// The promise invisible mode makes is not "shown as offline" but "not shown":
+// a presence list that carries only connected users would give an invisible
+// one away by carrying them at all, however they were labelled.
+func HidesPresence(status string) bool {
+	return status == "invisible" || status == "offline"
+}
+
+// MaskUser is the last line of defence over a user view that reaches somebody
+// else: it drops a channel the viewer may not see, and flattens a hidden user
+// to a plain offline one. Callers are expected to leave a hidden user out of
+// the list entirely rather than rely on this; it is what keeps a view safe if
+// one forgets.
 func (h *Hub) MaskUser(viewer *Session, view protocol.User) protocol.User {
-	if viewer.UserID() != view.ID && (view.Status == "invisible" || view.Status == "offline") {
+	if viewer.UserID() != view.ID && HidesPresence(view.Status) {
 		view.Online = false
 		view.Status = "offline"
+		// A custom status that keeps changing on an offline user is itself a
+		// tell, so it goes with the rest of the presence.
+		view.CustomStatus = ""
 		view.ChannelID = nil
 	}
 	if view.ChannelID != nil && !h.SessionCanView(viewer, *view.ChannelID) {
@@ -474,10 +508,39 @@ func (h *Hub) MaskUser(viewer *Session, view protocol.User) protocol.User {
 	return view
 }
 
-// BroadcastUserUpdated announces a user update, properly masked per viewer.
-func (h *Hub) BroadcastUserUpdated(user protocol.User) {
+// BroadcastUserUpdated announces a change to a connected user whose presence
+// has not changed, which is every change but the one that sets a status.
+func (h *Hub) BroadcastUserUpdated(view protocol.User) {
+	h.BroadcastUserPresence(view.Status, view)
+}
+
+// BroadcastUserPresence announces a change to a connected user. was is the
+// status the rest of the server last saw them with, which is what decides how
+// the change has to read to everybody else.
+//
+// A genuinely offline user generates no events at all, so neither may a hidden
+// one: becoming hidden is announced as a departure, staying hidden is announced
+// to nobody, and becoming visible again arrives as an ordinary update, which is
+// the same frame a client already treats as an arrival.
+func (h *Hub) BroadcastUserPresence(was string, view protocol.User) {
+	// The subject always sees themselves whole; masking is for everybody else.
+	if own, ok := h.SessionForUser(view.ID); ok {
+		own.Send(protocol.Event(protocol.EvUserUpdated, protocol.UserEvent{User: view}))
+	}
+
+	hiddenBefore, hiddenNow := HidesPresence(was), HidesPresence(view.Status)
 	for _, s := range h.Sessions() {
-		masked := h.MaskUser(s, user)
-		s.Send(protocol.Event(protocol.EvUserUpdated, protocol.UserEvent{User: masked}))
+		if s.UserID() == view.ID {
+			continue
+		}
+		switch {
+		case hiddenNow && hiddenBefore:
+			// They are not in this viewer's list to update, and saying
+			// anything at all would reveal that they could have been.
+		case hiddenNow:
+			s.Send(protocol.Event(protocol.EvUserDisconnected, protocol.UserDisconnectedEvent{UserID: view.ID}))
+		default:
+			s.Send(protocol.Event(protocol.EvUserUpdated, protocol.UserEvent{User: h.MaskUser(s, view)}))
+		}
 	}
 }

@@ -38,7 +38,11 @@ type ServerInfo struct {
 	GuestsAllowed       bool    `json:"guestsAllowed"`
 	VoiceMode           string  `json:"voiceMode"`
 	Uploads             Uploads `json:"uploads"`
-	KlipyAPIKey         string  `json:"klipyApiKey,omitempty"`
+	// KlipyEnabled reports that this server holds a Klipy credential and will
+	// proxy GIF and sticker lookups. The credential itself never leaves the
+	// server: it is the operator's, not the client's, and this preview is
+	// unauthenticated.
+	KlipyEnabled bool `json:"klipyEnabled"`
 }
 
 // Uploads tells a client what this server accepts before it sends anything, so
@@ -210,12 +214,19 @@ type ServerUpdateRequest struct {
 
 type UserUpdateRequest struct {
 	// UserID defaults to the caller when omitted.
-	UserID       *int64   `json:"userId,omitempty"`
-	Nickname     *string  `json:"nickname,omitempty"`
-	Status       *string  `json:"status,omitempty"`
-	CustomStatus *string  `json:"customStatus,omitempty"`
-	Avatar       **string `json:"avatar,omitempty"`
-	Banner       **string `json:"banner,omitempty"`
+	UserID       *int64  `json:"userId,omitempty"`
+	Nickname     *string `json:"nickname,omitempty"`
+	Status       *string `json:"status,omitempty"`
+	CustomStatus *string `json:"customStatus,omitempty"`
+	// Avatar and Banner are absent to leave a picture alone and empty to remove
+	// it. A JSON null cannot carry that difference: encoding/json turns both an
+	// absent key and an explicit null into a nil pointer, so a pointer-to-a-
+	// pointer looks exactly like an untouched field when the client sends null.
+	// An empty string is what "remove this picture" looks like on the wire, and
+	// it can never collide with a real value: a picture must name a file this
+	// server stores.
+	Avatar *string `json:"avatar,omitempty"`
+	Banner *string `json:"banner,omitempty"`
 }
 
 type UserMoveRequest struct {

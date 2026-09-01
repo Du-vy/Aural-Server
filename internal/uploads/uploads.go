@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ErrTooLarge means one file exceeded the per-file ceiling.
@@ -266,11 +267,22 @@ func validKey(key string) bool {
 // Sweep walks the upload directory and removes files no key in keep names. It
 // is what reclaims bytes left behind by a crash between writing a file and
 // recording its row.
-func (s *Store) Sweep(keep map[string]struct{}) (removed int, err error) {
+//
+// A file younger than minAge is left alone whatever keep says. A row is written
+// after the bytes it names, so there is always a moment where a perfectly good
+// upload has no row yet: without the guard, sweeping during that moment would
+// delete the file out from under the request still handling it. The caller is
+// expected to sweep at startup, when nothing is in flight, and the guard is
+// what keeps that from being the only reason this is safe.
+//
+// keep has to be complete. A partial set does not sweep less, it deletes more,
+// so a caller that could not read every key must not call this at all.
+func (s *Store) Sweep(keep map[string]struct{}, minAge time.Duration) (removed int, err error) {
 	shards, err := os.ReadDir(s.root)
 	if err != nil {
 		return 0, fmt.Errorf("uploads: read %s: %w", s.root, err)
 	}
+	cutoff := time.Now().Add(-minAge)
 	for _, shard := range shards {
 		if !shard.IsDir() {
 			continue
@@ -285,6 +297,10 @@ func (s *Store) Sweep(keep map[string]struct{}) (removed int, err error) {
 				continue
 			}
 			if _, held := keep[name]; held {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil || info.ModTime().After(cutoff) {
 				continue
 			}
 			if os.Remove(filepath.Join(s.root, shard.Name(), name)) == nil {

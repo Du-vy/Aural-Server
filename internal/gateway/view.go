@@ -131,7 +131,7 @@ func userView(u store.User, roleIDs []int64, channelID *int64, online bool) prot
 // serverInfo is the public description handed to clients and to GET /info.
 func (h *Hub) serverInfo() protocol.ServerInfo {
 	cfg := h.cfg
-	name, description, klipyApiKey := h.ServerIdentity()
+	name, description := h.ServerIdentity()
 	return protocol.ServerInfo{
 		Name:                name,
 		Description:         description,
@@ -144,7 +144,7 @@ func (h *Hub) serverInfo() protocol.ServerInfo {
 		GuestsAllowed:       cfg.Registration.AllowGuests,
 		VoiceMode:           cfg.Voice.Mode,
 		Uploads:             h.uploadInfo(),
-		KlipyAPIKey:         klipyApiKey,
+		KlipyEnabled:        h.KlipyAPIKey() != "",
 	}
 }
 

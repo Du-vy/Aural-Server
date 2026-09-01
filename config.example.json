@@ -30,6 +30,10 @@
     "max_per_message": 10,
     "pending_ttl_minutes": 60
   },
+  "unfurl": {
+    "enabled": true,
+    "cache_ttl_days": 7
+  },
   "integrations": {
     "klipy_api_key": ""
   },

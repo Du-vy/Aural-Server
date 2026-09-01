@@ -13,14 +13,51 @@ ws://HOST:PORT/ws      plaintext
 wss://HOST:PORT/ws     when tls.enabled is set in the server configuration
 ```
 
-The default port is **9871**. Two plain HTTP endpoints sit alongside the socket:
+The default port is **9871**. A handful of plain HTTP endpoints sit alongside
+the socket. Everything but the first two takes the same bearer session token the
+socket resumes with, in an `Authorization: Bearer <token>` header:
 
 | Endpoint  | Purpose                                                              |
 | --------- | -------------------------------------------------------------------- |
 | `GET /info`   | Unauthenticated server preview. A client shows it before connecting, and the future Aural Hub reads it to list servers. Sends `Access-Control-Allow-Origin: *`. |
 | `GET /health` | Liveness probe for process supervisors. Returns `ok`.            |
 | `POST /upload` | Uploads one file. See [Attachments](#attachments).               |
+| `POST /upload/avatar`, `POST /upload/banner` | Replaces the caller's own avatar or profile banner. |
 | `GET /attachments/{key}/{filename}` | Serves an uploaded file.                |
+| `GET /unfurl?url=` | Fetches a page and returns its OpenGraph metadata. See [Link previews](#link-previews). |
+| `GET /klipy/{kind}/{action}` | Proxies a GIF or sticker lookup. See [GIFs and stickers](#gifs-and-stickers). |
+
+Because `GET /info` is unauthenticated, everything it carries is public. No
+credential the operator configures appears in it: the Klipy integration is
+reported as the boolean `klipyEnabled` and never as the key behind it.
+
+### Link previews
+
+`GET /unfurl?url=<target>` fetches the target and returns the OpenGraph and
+`<meta>` data found in it, which is what lets a client show a rich preview for a
+link that would otherwise be blocked by CORS.
+
+It requires a session, for the same reason the upload endpoint does: the fetch
+goes out from the server's address rather than the caller's, so an open one is
+an anonymous fetcher pointed at the public internet. Results are cached in
+SQLite for `unfurl.cache_ttl_days`, and a cache hit costs the caller nothing
+against the rate limit. Targets that resolve to a loopback, private, link-local,
+carrier-grade NAT or NAT64-mapped address are refused, and only `http` and
+`https` are followed.
+
+### GIFs and stickers
+
+`GET /klipy/{kind}/{action}` proxies one lookup to Klipy, where `kind` is `gifs`
+or `stickers` and `action` is `categories` (gifs only), `trending` or `search`.
+`q` carries a search term and `limit` bounds the result count. The answer is
+Klipy's own JSON, handed back untouched.
+
+The credential belongs to the operator and never reaches a client. Klipy carries
+it in the request path, so a client holding it would leak it into every proxy
+log between the two; `ServerInfo.klipyEnabled` reports only whether the server
+can answer at all. A Klipy key is also rated by the hour rather than by the
+member, so one cache in front of one key is what lets a room full of people open
+the same trending list for a single upstream call.
 
 Files travel over HTTP rather than over the socket: a file does not fit the
 64 KiB frame budget, and HTTP is what gives an upload a progress bar and a
@@ -479,6 +516,16 @@ one table of errors covers both halves of the protocol.
 An upload is **pending** until a message claims it. It belongs to the uploader
 and to the channel it was made for, it can be claimed exactly once, and one that
 is never posted is swept after `uploads.pending_ttl_minutes`.
+
+Avatars and banners are recorded apart from attachments. They belong to a user
+rather than to a message, so the sweep that reclaims abandoned uploads would
+otherwise take every one of them; keeping them in their own table is also what
+lets a restart count their bytes against `uploads.max_total_bytes`.
+
+At startup, before the listener opens, the server walks the upload directory and
+deletes files that neither table names — what a crash between writing the bytes
+and writing the row leaves behind. Files written in the last minute are spared,
+and files the server could not have written itself are never touched.
 
 ### `GET /attachments/{key}/{filename}`
 

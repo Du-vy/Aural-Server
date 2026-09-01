@@ -10,7 +10,6 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -43,24 +42,33 @@ const (
 	// than the message limiter because each one costs disk rather than a row.
 	uploadBurst      = 5
 	uploadsPerSecond = 0.5
+	// orphanGrace is how recently a file may have been written and still be
+	// spared by the startup sweep. Nothing should be in flight at that point,
+	// so this is a second line rather than the first: it is what keeps a sweep
+	// from ever being the thing that deletes a live upload.
+	orphanGrace = time.Minute
 )
 
-// uploadLimiters throttles per identity rather than per connection: an upload
-// arrives on its own HTTP request, so there is no session to hang a bucket off.
-type uploadLimiters struct {
+// userLimiters throttles per identity rather than per connection: an HTTP
+// request arrives on its own connection, so there is no session to hang a
+// bucket off. Every endpoint outside the WebSocket needs one, at its own rate.
+type userLimiters struct {
+	burst  int
+	perSec float64
+
 	mu sync.Mutex
 	by map[int64]*rateLimiter
 }
 
-func newUploadLimiters() *uploadLimiters {
-	return &uploadLimiters{by: map[int64]*rateLimiter{}}
+func newUserLimiters(burst int, perSec float64) *userLimiters {
+	return &userLimiters{burst: burst, perSec: perSec, by: map[int64]*rateLimiter{}}
 }
 
-func (u *uploadLimiters) allow(userID int64) bool {
+func (u *userLimiters) allow(userID int64) bool {
 	u.mu.Lock()
 	limiter, ok := u.by[userID]
 	if !ok {
-		limiter = newRateLimiter(uploadBurst, uploadsPerSecond)
+		limiter = newRateLimiter(u.burst, u.perSec)
 		u.by[userID] = limiter
 	}
 	u.mu.Unlock()
@@ -192,39 +200,32 @@ func isAllowedImageFormat(filename string) bool {
 	}
 }
 
-func (s *Server) removeStoredMedia(mediaURL string) {
-	files := s.hub.Files()
-	if files == nil || !strings.HasPrefix(mediaURL, uploadPrefix) {
-		return
-	}
-	trimmed := strings.TrimPrefix(mediaURL, uploadPrefix)
-	parts := strings.SplitN(trimmed, "/", 2)
-	if len(parts) == 0 {
-		return
-	}
-	key := parts[0]
-	path, err := files.Path(key)
-	if err != nil {
-		return
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return
-	}
-	files.Remove(key, info.Size())
-}
-
 type MediaUploadResult struct {
 	URL  string        `json:"url"`
 	User protocol.User `json:"user"`
 }
 
-// handleAvatarUpload uploads and sets the user's avatar.
+// handleAvatarUpload replaces the caller's avatar.
 //
 //	POST /upload/avatar
 //	Authorization: Bearer <session token>
 //	Content-Type: multipart/form-data, one part named "file"
 func (s *Server) handleAvatarUpload(w http.ResponseWriter, r *http.Request) {
+	s.uploadProfileMedia(w, r, store.KindAvatar)
+}
+
+// handleBannerUpload replaces the caller's profile banner.
+//
+//	POST /upload/banner
+func (s *Server) handleBannerUpload(w http.ResponseWriter, r *http.Request) {
+	s.uploadProfileMedia(w, r, store.KindBanner)
+}
+
+// uploadProfileMedia is both of the above. An avatar and a banner differ in one
+// size limit, one column and one word in an error message; everything else —
+// the auth, the format check, the quota, the row, the broadcast — is the same
+// sequence, and writing it twice is how the two drift apart.
+func (s *Server) uploadProfileMedia(w http.ResponseWriter, r *http.Request, kind string) {
 	s.applyCORS(w, r)
 
 	files := s.hub.Files()
@@ -260,6 +261,9 @@ func (s *Server) handleAvatarUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	maxBytes := s.cfg.Uploads.MaxAvatarBytes
+	if kind == store.KindBanner {
+		maxBytes = s.cfg.Uploads.MaxBannerBytes
+	}
 	if maxBytes <= 0 {
 		maxBytes = files.MaxFileBytes()
 	}
@@ -268,143 +272,85 @@ func (s *Server) handleAvatarUpload(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, uploads.ErrTooLarge):
 		writeAPIError(w, http.StatusRequestEntityTooLarge, protocol.ErrTooLarge,
-			fmt.Sprintf("avatars on this server may be at most %s", humanBytes(maxBytes)))
+			fmt.Sprintf("%ss on this server may be at most %s", kind, humanBytes(maxBytes)))
 		return
 	case errors.Is(err, uploads.ErrQuotaExceeded):
 		writeAPIError(w, http.StatusInsufficientStorage, protocol.ErrStorageFull,
 			"this server has no storage left for new files")
 		return
 	case err != nil:
-		s.log.Error("store avatar upload", slog.Any("error", err))
+		s.log.Error("store profile media", slog.String("kind", kind), slog.Any("error", err))
 		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the file could not be stored")
 		return
 	}
 
-	// Remove previous uploaded avatar if it was stored on the server
-	if user.Avatar != nil && strings.HasPrefix(*user.Avatar, uploadPrefix) {
-		s.removeStoredMedia(*user.Avatar)
-	}
-
-	avatarURL := uploadPrefix + saved.Key + "/" + url.PathEscape(filename)
-	if err := s.st.SetAvatar(r.Context(), user.ID, &avatarURL); err != nil {
+	// The row goes in before the user points at it: it is what accounts for the
+	// bytes, so a failure after this point can give them back, and a restart
+	// still knows the file is there.
+	_, displaced, err := s.st.ReplaceProfileMedia(r.Context(), store.ProfileMedia{
+		UserID:     user.ID,
+		Kind:       kind,
+		StorageKey: saved.Key,
+		Filename:   filename,
+		Size:       saved.Size,
+	})
+	if err != nil {
 		files.Remove(saved.Key, saved.Size)
-		s.log.Error("record avatar", slog.Any("error", err))
-		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the avatar could not be recorded")
+		s.log.Error("record profile media", slog.String("kind", kind), slog.Any("error", err))
+		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the file could not be recorded")
 		return
 	}
+
+	mediaURL := uploadPrefix + saved.Key + "/" + url.PathEscape(filename)
+	set := s.st.SetAvatar
+	if kind == store.KindBanner {
+		set = s.st.SetBanner
+	}
+	if err := set(r.Context(), user.ID, &mediaURL); err != nil {
+		// Nothing points at the picture, so the row and the bytes both go back.
+		if replaced, clearErr := s.st.ClearProfileMedia(r.Context(), user.ID, kind); clearErr == nil {
+			s.hub.RemoveProfileMedia(replaced)
+		}
+		s.log.Error("record profile media url", slog.String("kind", kind), slog.Any("error", err))
+		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the picture could not be recorded")
+		return
+	}
+
+	// Only once the new picture is the one in use does the old one go.
+	s.hub.RemoveProfileMedia(displaced)
 
 	updatedUser, err := s.st.UserByID(r.Context(), user.ID)
 	if err != nil {
 		updatedUser = user
-		updatedUser.Avatar = &avatarURL
+		if kind == store.KindBanner {
+			updatedUser.Banner = &mediaURL
+		} else {
+			updatedUser.Avatar = &mediaURL
+		}
 	}
 
 	if sess, ok := s.hub.SessionForUser(user.ID); ok {
 		sess.setUser(updatedUser)
 		view := sess.view()
 		s.hub.BroadcastUserUpdated(view)
-		writeJSON(w, http.StatusOK, MediaUploadResult{URL: avatarURL, User: view})
+		writeJSON(w, http.StatusOK, MediaUploadResult{URL: mediaURL, User: view})
 		return
 	}
 
-	base, roleIDs, _ := s.hub.UserPermissions(r.Context(), updatedUser)
-	_ = base
-	view := userView(updatedUser, roleIDs, nil, false)
-	writeJSON(w, http.StatusOK, MediaUploadResult{URL: avatarURL, User: view})
+	_, roleIDs, _ := s.hub.UserPermissions(r.Context(), updatedUser)
+	writeJSON(w, http.StatusOK, MediaUploadResult{URL: mediaURL, User: userView(updatedUser, roleIDs, nil, false)})
 }
 
-// handleBannerUpload uploads and sets the user's profile banner.
-//
-//	POST /upload/banner
-//	Authorization: Bearer <session token>
-//	Content-Type: multipart/form-data, one part named "file"
-func (s *Server) handleBannerUpload(w http.ResponseWriter, r *http.Request) {
-	s.applyCORS(w, r)
-
-	files := s.hub.Files()
-	if files == nil {
-		writeAPIError(w, http.StatusForbidden, protocol.ErrUploadsDisabled,
-			"this server does not accept file uploads")
+// RemoveProfileMedia unlinks pictures whose rows are already gone and returns
+// their room to the quota. The recorded size is used rather than the one on
+// disk: it is what the quota was charged, so it is what has to be refunded.
+func (h *Hub) RemoveProfileMedia(media []store.ProfileMedia) {
+	if h.files == nil {
 		return
 	}
-
-	user, failure := s.authenticateRequest(r)
-	if failure != nil {
-		writeProtocolError(w, failure)
-		return
+	for _, m := range media {
+		h.files.Remove(m.StorageKey, m.Size)
 	}
-
-	if !s.uploads.allow(user.ID) {
-		writeAPIError(w, http.StatusTooManyRequests, protocol.ErrRateLimited,
-			"you are uploading files too quickly")
-		return
-	}
-
-	part, filename, failure := openUploadPart(r)
-	if failure != nil {
-		writeProtocolError(w, failure)
-		return
-	}
-	defer part.Close()
-
-	if !isAllowedImageFormat(filename) {
-		writeAPIError(w, http.StatusBadRequest, protocol.ErrBadRequest,
-			"unsupported image format; allowed formats are JPG, PNG, WebP, GIF, AVIF, BMP")
-		return
-	}
-
-	maxBytes := s.cfg.Uploads.MaxBannerBytes
-	if maxBytes <= 0 {
-		maxBytes = files.MaxFileBytes()
-	}
-
-	saved, err := files.SaveWithLimit(part, r.ContentLength, maxBytes)
-	switch {
-	case errors.Is(err, uploads.ErrTooLarge):
-		writeAPIError(w, http.StatusRequestEntityTooLarge, protocol.ErrTooLarge,
-			fmt.Sprintf("banners on this server may be at most %s", humanBytes(maxBytes)))
-		return
-	case errors.Is(err, uploads.ErrQuotaExceeded):
-		writeAPIError(w, http.StatusInsufficientStorage, protocol.ErrStorageFull,
-			"this server has no storage left for new files")
-		return
-	case err != nil:
-		s.log.Error("store banner upload", slog.Any("error", err))
-		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the file could not be stored")
-		return
-	}
-
-	// Remove previous uploaded banner if it was stored on the server
-	if user.Banner != nil && strings.HasPrefix(*user.Banner, uploadPrefix) {
-		s.removeStoredMedia(*user.Banner)
-	}
-
-	bannerURL := uploadPrefix + saved.Key + "/" + url.PathEscape(filename)
-	if err := s.st.SetBanner(r.Context(), user.ID, &bannerURL); err != nil {
-		files.Remove(saved.Key, saved.Size)
-		s.log.Error("record banner", slog.Any("error", err))
-		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the banner could not be recorded")
-		return
-	}
-
-	updatedUser, err := s.st.UserByID(r.Context(), user.ID)
-	if err != nil {
-		updatedUser = user
-		updatedUser.Banner = &bannerURL
-	}
-
-	if sess, ok := s.hub.SessionForUser(user.ID); ok {
-		sess.setUser(updatedUser)
-		view := sess.view()
-		s.hub.BroadcastUserUpdated(view)
-		writeJSON(w, http.StatusOK, MediaUploadResult{URL: bannerURL, User: view})
-		return
-	}
-
-	base, roleIDs, _ := s.hub.UserPermissions(r.Context(), updatedUser)
-	_ = base
-	view := userView(updatedUser, roleIDs, nil, false)
-	writeJSON(w, http.StatusOK, MediaUploadResult{URL: bannerURL, User: view})
 }
 
 // openUploadPart finds the file part of a multipart body and returns it
@@ -506,13 +452,22 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 	var modTime time.Time
 
 	attachment, err := s.st.AttachmentByStorageKey(r.Context(), key)
-	if err == nil {
+	switch {
+	case err == nil:
 		filename = attachment.Filename
 		contentType = attachment.ContentType
 		modTime = time.Unix(attachment.CreatedAt, 0)
-	} else if errors.Is(err, store.ErrNotFound) {
-		contentType = uploads.ContentType(filename)
-	} else {
+	case errors.Is(err, store.ErrNotFound):
+		// Avatars and banners are recorded elsewhere, so the name and type come
+		// from that table rather than from the URL, which anybody may write.
+		if picture, pErr := s.st.ProfileMediaByStorageKey(r.Context(), key); pErr == nil {
+			filename = picture.Filename
+			contentType = uploads.ContentType(picture.Filename)
+			modTime = time.Unix(picture.CreatedAt, 0)
+		} else {
+			contentType = uploads.ContentType(filename)
+		}
+	default:
 		s.log.Error("read attachment", slog.Any("error", err))
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -660,6 +615,52 @@ func humanBytes(n int64) string {
 }
 
 // --- housekeeping -----------------------------------------------------------
+
+// sweepOrphanedFiles deletes files in the upload directory that no row names.
+//
+// A row is written after the bytes it names, so a crash in between leaves a
+// file nothing can reach: not served, not deletable, and not counted against
+// the quota that a restart recomputes from the tables. Only a walk of the
+// directory finds those, and startup is when it is safe to do — nothing is
+// serving yet, so nothing is half-written.
+//
+// The keep set has to be every key in both tables. A partial set does not sweep
+// less, it deletes more, so a query that fails cancels the sweep rather than
+// narrowing it.
+func (s *Server) sweepOrphanedFiles(ctx context.Context) {
+	files := s.hub.Files()
+	if files == nil {
+		return
+	}
+
+	attachments, err := s.st.AttachmentKeys(ctx)
+	if err != nil {
+		s.log.Warn("skipping orphan sweep: could not read attachment keys", slog.Any("error", err))
+		return
+	}
+	pictures, err := s.st.ProfileMediaKeys(ctx)
+	if err != nil {
+		s.log.Warn("skipping orphan sweep: could not read profile media keys", slog.Any("error", err))
+		return
+	}
+
+	keep := make(map[string]struct{}, len(attachments)+len(pictures))
+	for _, key := range attachments {
+		keep[key] = struct{}{}
+	}
+	for _, key := range pictures {
+		keep[key] = struct{}{}
+	}
+
+	removed, err := files.Sweep(keep, orphanGrace)
+	if err != nil {
+		s.log.Warn("orphan sweep", slog.Any("error", err))
+		return
+	}
+	if removed > 0 {
+		s.log.Info("removed unreferenced files", slog.Int("files", removed), slog.Int("kept", len(keep)))
+	}
+}
 
 // sweepPending runs until ctx ends, deleting uploads that were never posted.
 //

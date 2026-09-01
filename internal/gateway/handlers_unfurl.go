@@ -19,8 +19,15 @@ import (
 	"github.com/aural-chat/aural-server/internal/protocol"
 )
 
-// maxUnfurlBodyBytes is the max HTML read to find OpenGraph meta tags.
-const maxUnfurlBodyBytes = 512 * 1024
+const (
+	// maxUnfurlBodyBytes is the max HTML read to find OpenGraph meta tags.
+	maxUnfurlBodyBytes = 512 * 1024
+	// unfurlBurst and unfurlsPerSecond throttle one member. Unfurling is an
+	// outbound fetch made in this server's name, so the rate is what decides
+	// how much of somebody else's bandwidth one member can spend.
+	unfurlBurst      = 10
+	unfurlsPerSecond = 1
+)
 
 // UnfurlResult is the OpenGraph / meta data returned to the client.
 type UnfurlResult struct {
@@ -63,10 +70,19 @@ func isPrivateIP(ip net.IP) bool {
 			return true
 		case ip4[0] == 0:
 			return true
+		case ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127:
+			// Carrier-grade NAT: not private, but not the public internet
+			// either, and reachable from a great many hosted servers.
+			return true
 		}
 	} else if len(ip) == 16 {
 		if ip[0]&0xfe == 0xfc { // fc00::/7
 			return true
+		}
+		// NAT64 (64:ff9b::/96) carries an IPv4 address in its low 32 bits, so
+		// it is a way to reach a blocked v4 range through a v6 address.
+		if ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b {
+			return isPrivateIP(net.IPv4(ip[12], ip[13], ip[14], ip[15]))
 		}
 	}
 	return false
@@ -111,6 +127,15 @@ func (s *Server) handleUnfurl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fetching a URL somebody names, from this server's address, is a
+	// capability that belongs to members. Left open it is an anonymous fetcher
+	// pointed at the public internet from an address that is not the caller's.
+	user, failure := s.authenticateRequest(r)
+	if failure != nil {
+		writeProtocolError(w, failure)
+		return
+	}
+
 	target := strings.TrimSpace(r.URL.Query().Get("url"))
 	if target == "" {
 		writeAPIError(w, http.StatusBadRequest, protocol.ErrBadRequest, "the url parameter is required")
@@ -137,6 +162,12 @@ func (s *Server) handleUnfurl(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		_, _ = w.Write([]byte(cachedJSON))
+		return
+	}
+
+	if !s.unfurls.allow(user.ID) {
+		writeAPIError(w, http.StatusTooManyRequests, protocol.ErrRateLimited,
+			"you are unfurling links too quickly")
 		return
 	}
 

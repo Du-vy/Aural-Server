@@ -199,7 +199,7 @@ func handleAuthRegister(ctx context.Context, s *Session, raw json.RawMessage) (a
 	}
 
 	view := s.view()
-	s.hub.Broadcast(protocol.Event(protocol.EvUserUpdated, protocol.UserEvent{User: view}))
+	s.hub.BroadcastUserUpdated(view)
 	s.log.Info("identity claimed", slog.Int64("user", user.ID), slog.String("username", username))
 
 	return protocol.AuthRegisterResult{User: view}, nil
@@ -272,10 +272,14 @@ func (s *Session) finishAuth(ctx context.Context, user store.User, tokenHash, ra
 
 	ready := h.buildReady(s, rawToken)
 	view := s.view()
-	for _, other := range h.Sessions() {
-		if other != s {
-			masked := h.MaskUser(other, view)
-			other.Send(protocol.Event(protocol.EvUserConnected, protocol.UserEvent{User: masked}))
+	// Connecting while hidden is announced to nobody: an arrival the rest of
+	// the server cannot see is one it must not hear about either.
+	if !HidesPresence(view.Status) {
+		for _, other := range h.Sessions() {
+			if other != s {
+				masked := h.MaskUser(other, view)
+				other.Send(protocol.Event(protocol.EvUserConnected, protocol.UserEvent{User: masked}))
+			}
 		}
 	}
 
@@ -308,7 +312,14 @@ func (h *Hub) buildReady(s *Session, sessionToken string) protocol.Ready {
 	sessions := h.Sessions()
 	users := make([]protocol.User, 0, len(sessions))
 	for _, other := range sessions {
-		users = append(users, h.MaskUser(s, other.view()))
+		view := other.view()
+		// A hidden user is left out rather than listed as offline: this list
+		// holds only connected users, so an entry for one who looks offline
+		// could only ever mean somebody hiding.
+		if other.UserID() != s.UserID() && HidesPresence(view.Status) {
+			continue
+		}
+		users = append(users, h.MaskUser(s, view))
 	}
 
 	return protocol.Ready{
