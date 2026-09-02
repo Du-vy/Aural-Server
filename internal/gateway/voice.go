@@ -1,8 +1,11 @@
 package gateway
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"slices"
+	"time"
 
 	"github.com/aural-chat/aural-server/internal/config"
 	"github.com/aural-chat/aural-server/internal/permissions"
@@ -86,8 +89,121 @@ func (h *Hub) iceServers() []protocol.ICEServer {
 	return out
 }
 
+// --- the advertised address -------------------------------------------------
+
+// PublicIP is the address the relay is currently advertising, or empty when it
+// is advertising the addresses of its own interfaces.
+func (h *Hub) PublicIP() string {
+	if held := h.publicIP.Load(); held != nil {
+		return *held
+	}
+	return ""
+}
+
+func (h *Hub) storePublicIP(addr string) {
+	h.publicIP.Store(&addr)
+}
+
+// resolvePublicIP asks the resolver, under a timeout of its own so that a DNS
+// server which has stopped answering cannot hold up a startup or a watch tick.
+func (h *Hub) resolvePublicIP(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, publicIPTimeout)
+	defer cancel()
+
+	addr, err := h.publicAddr.Resolve(ctx)
+	if err != nil {
+		return "", err
+	}
+	return addr.String(), nil
+}
+
+// WatchPublicIP keeps the relay's advertised address current until ctx ends.
+//
+// This is what makes a home server usable. The address a residential
+// connection holds is not the operator's to keep: it changes when the provider
+// renews the lease, when the router reboots, when the line drops for a minute
+// at four in the morning. Everything else survives that — a dynamic DNS record
+// is updated by something, clients reconnect, the WebSocket comes back — but
+// the relay has already baked the old address into the candidates it offers,
+// so voice, and only voice, stays broken until somebody notices and restarts
+// the server.
+//
+// A change costs every live call a renegotiation, which is a second of
+// silence. That is the correct price: the alternative is that the calls do not
+// work at all.
+func (h *Hub) WatchPublicIP(ctx context.Context) {
+	if h.publicAddr == nil || h.publicAddr.Static() {
+		// A literal cannot change, and a server with no source has nothing to
+		// look up. Neither is worth a goroutine and a timer.
+		return
+	}
+
+	timer := time.NewTimer(publicIPInterval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+
+		next := publicIPInterval
+		resolved, err := h.resolvePublicIP(ctx)
+		switch {
+		case errors.Is(err, context.Canceled):
+			return
+		case err != nil:
+			h.log.Debug("could not resolve the address to advertise for voice",
+				slog.Any("error", err))
+			next = publicIPRetry
+		case resolved != h.PublicIP():
+			h.applyPublicIP(resolved)
+		}
+		timer.Reset(next)
+	}
+}
+
+// applyPublicIP records a new address and rebuilds the relay around it.
+//
+// Reconfigure tears the rooms down, which is the only way to change what ICE
+// candidates say: they were negotiated with the old address and cannot be
+// edited afterwards. Clients are told to open a new media session, which is a
+// path they exercise every time somebody joins a call.
+func (h *Hub) applyPublicIP(resolved string) {
+	previous := h.PublicIP()
+	h.storePublicIP(resolved)
+	h.log.Info("the address advertised for voice changed",
+		slog.String("from", previous),
+		slog.String("to", resolved),
+		slog.String("source", h.publicAddr.Describe()))
+
+	if h.relay == nil {
+		return
+	}
+	if err := h.relay.Reconfigure(relaySettings(h.voiceConfig(), resolved)); err != nil {
+		h.log.Error("could not rebuild the audio plane for the new address", slog.Any("error", err))
+	}
+}
+
+// iceURLs flattens the configured ICE servers down to their URLs, which is all
+// the address resolver needs from them.
+func iceURLs(servers []config.ICEServer) []string {
+	var out []string
+	for _, srv := range servers {
+		out = append(out, srv.URLs...)
+	}
+	return out
+}
+
 // relaySettings converts the configuration into what the relay needs.
-func relaySettings(cfg config.Voice) voice.Settings {
+//
+// publicIP is the resolved address rather than the configured one. The two
+// differ whenever the operator named a hostname or left the field empty for
+// STUN to answer, which is the whole of the dynamic-address case: the relay
+// substitutes a literal into its candidates and has nothing to resolve one
+// with.
+func relaySettings(cfg config.Voice, publicIP string) voice.Settings {
 	return voice.Settings{
 		SampleRate: cfg.SampleRate,
 		Bitrate:    cfg.Bitrate,
@@ -96,7 +212,7 @@ func relaySettings(cfg config.Voice) voice.Settings {
 		FEC:        cfg.FEC,
 		DTX:        cfg.DTX,
 		Stereo:     cfg.Stereo,
-		PublicIP:   cfg.PublicIP,
+		PublicIP:   publicIP,
 		UDPPortMin: cfg.UDPPortMin,
 		UDPPortMax: cfg.UDPPortMax,
 	}

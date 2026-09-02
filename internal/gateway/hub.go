@@ -2,16 +2,33 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/aural-chat/aural-server/internal/config"
 	"github.com/aural-chat/aural-server/internal/permissions"
 	"github.com/aural-chat/aural-server/internal/protocol"
+	"github.com/aural-chat/aural-server/internal/publicip"
 	"github.com/aural-chat/aural-server/internal/store"
 	"github.com/aural-chat/aural-server/internal/uploads"
 	"github.com/aural-chat/aural-server/internal/voice"
+)
+
+// The window in which the relay's advertised address is re-resolved.
+//
+// publicIPInterval is the ordinary cadence: a provider-forced address change
+// is a thing that happens every few days at most, so checking every few
+// minutes is already generous. publicIPRetry is used after a failure, because
+// a lookup that failed at startup — a resolver not up yet, a network not up
+// yet — is one worth trying again shortly rather than in five minutes.
+const (
+	publicIPInterval = 5 * time.Minute
+	publicIPRetry    = 30 * time.Second
+	publicIPTimeout  = 10 * time.Second
 )
 
 // maxChannelDepth bounds the ancestor walk so a cycle introduced by a bad write
@@ -57,6 +74,13 @@ type Hub struct {
 	voiceRooms  map[int64]*voiceRoom
 	voiceEpochs map[int64]int64
 	relay       *voice.Relay
+
+	// publicIP is the address the relay currently advertises, which is not
+	// necessarily the one in the configuration file: an operator on a home
+	// connection names a hostname, or nothing at all, and this is what that
+	// resolved to the last time it was looked up.
+	publicIP   atomic.Pointer[string]
+	publicAddr *publicip.Resolver
 }
 
 // NewHub builds a hub and primes its caches from the database. cfgPath is where
@@ -73,10 +97,34 @@ func NewHub(ctx context.Context, cfg *config.Config, cfgPath string, st *store.S
 		voiceEpochs: map[int64]int64{},
 	}
 
+	// The address the relay advertises is resolved before it is built, so a
+	// server whose voice.public_ip is a hostname starts with the right one
+	// rather than with none until the first watch tick.
+	h.publicAddr = publicip.New(cfg.Voice.PublicIP, iceURLs(cfg.Voice.ICEServers))
+	h.storePublicIP("")
+	if resolved, err := h.resolvePublicIP(ctx); err != nil {
+		if !errors.Is(err, publicip.ErrNoSource) {
+			// Not fatal. The relay advertises the addresses of its own
+			// interfaces, which is what an unconfigured server does anyway,
+			// and the watcher will correct it as soon as the lookup works.
+			log.Warn("could not resolve the address to advertise for voice",
+				slog.String("source", h.publicAddr.Describe()), slog.Any("error", err))
+		}
+	} else {
+		h.storePublicIP(resolved)
+		// Said out loud at startup, because it is the first thing to check
+		// when voice does not work and the only thing that is otherwise
+		// invisible: everything else about a call is negotiated over a socket
+		// that is plainly working.
+		log.Info("advertising an address for voice",
+			slog.String("address", resolved),
+			slog.String("source", h.publicAddr.Describe()))
+	}
+
 	// The relay is built whatever the mode, so that switching to server_host
 	// at runtime needs nothing but a reconfiguration. It binds no port and
 	// starts no goroutine until somebody actually calls.
-	relay, err := voice.NewRelay(relaySettings(cfg.Voice), log, h.onRelayGone)
+	relay, err := voice.NewRelay(relaySettings(cfg.Voice, h.PublicIP()), log, h.onRelayGone)
 	if err != nil {
 		// A server that cannot relay audio is still a server. Voice reports
 		// itself as unavailable and everything else carries on.
@@ -195,7 +243,7 @@ func (h *Hub) updateServerIdentity(
 	h.cfgMu.Unlock()
 
 	if voiceChanged && h.relay != nil {
-		if err := h.relay.Reconfigure(relaySettings(snapshot.Voice)); err != nil {
+		if err := h.relay.Reconfigure(relaySettings(snapshot.Voice, h.PublicIP())); err != nil {
 			h.log.Error("reconfigure the audio plane", slog.Any("error", err))
 		}
 	}
@@ -423,20 +471,32 @@ func (h *Hub) HighestRolePosition(roleIDs []int64) int {
 
 // --- session registry -------------------------------------------------------
 
-// Add registers an authenticated session. When the same identity is already
-// connected the previous session is returned so the caller can close it: one
-// connection per identity keeps presence unambiguous.
-func (h *Hub) Add(s *Session) (displaced *Session) {
+// Add registers an authenticated session, unless the server is at capacity.
+//
+// When the same identity is already connected the previous session is returned
+// so the caller can close it: one connection per identity keeps presence
+// unambiguous. Somebody reconnecting therefore takes no new place and is never
+// refused for want of one.
+//
+// The capacity check lives in here rather than at the call site because it has
+// to happen under the same lock as the insert. Asking whether there is room
+// and then taking it are two moments, and several authentications landing
+// between them is exactly how a server ends up over its own limit.
+func (h *Hub) Add(s *Session) (displaced *Session, full bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if prev, ok := h.byUser[s.UserID()]; ok && prev != s {
+	prev, held := h.byUser[s.UserID()]
+	if !held && len(h.sessions) >= h.cfg.Server.MaxUsers {
+		return nil, true
+	}
+	if held && prev != s {
 		delete(h.sessions, prev.ID)
 		displaced = prev
 	}
 	h.sessions[s.ID] = s
 	h.byUser[s.UserID()] = s
-	return displaced
+	return displaced, false
 }
 
 // Remove deregisters a session. It is safe to call for a session that was never

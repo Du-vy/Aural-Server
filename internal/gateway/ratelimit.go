@@ -45,3 +45,17 @@ func (r *rateLimiter) allow() bool {
 	r.tokens--
 	return true
 }
+
+// spent reports whether the bucket has been idle for at least idle and has
+// refilled completely, which together mean it is holding no decision. Such a
+// bucket answers every question exactly as a fresh one would, so discarding it
+// is free.
+func (r *rateLimiter) spent(idle time.Duration) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if time.Since(r.last) < idle {
+		return false
+	}
+	return r.tokens+time.Since(r.last).Seconds()*r.perSec >= r.capacity
+}

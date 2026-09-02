@@ -253,6 +253,43 @@ func (s *Store) DeleteTokensForUser(ctx context.Context, userID int64) error {
 	return nil
 }
 
+// PruneStaleTokens revokes every token unused since cutoff (UNIX seconds).
+//
+// A session token is a credential, and one nobody has presented for months is
+// a credential that has outlived whatever device it was minted for. Losing it
+// costs a registered user one sign-in; keeping it costs whoever finds it
+// nothing at all.
+func (s *Store) PruneStaleTokens(ctx context.Context, cutoff int64) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM tokens WHERE last_used_at < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("store: prune tokens: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// PruneStaleGuests deletes unclaimed identities last seen before cutoff that
+// hold no token, and reports how many went.
+//
+// Every guest connection that arrives without a usable token mints a new
+// identity, so on a server that has run for years most rows in this table are
+// people who visited once. A guest with no token cannot come back as
+// themselves whatever happens, which is what makes the row safe to drop.
+//
+// History is not affected: an author is captured on the message itself and the
+// foreign key is ON DELETE SET NULL, so the conversation reads exactly as it
+// did before. Registered accounts are never touched.
+func (s *Store) PruneStaleGuests(ctx context.Context, cutoff int64) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM users
+		WHERE username IS NULL
+		  AND last_seen_at < ?
+		  AND id NOT IN (SELECT user_id FROM tokens)`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("store: prune guests: %w", err)
+	}
+	return res.RowsAffected()
+}
+
 // UsersByID loads a batch of users, in the order the ids were given. Missing
 // ids are skipped rather than reported.
 func (s *Store) UsersByID(ctx context.Context, ids []int64) ([]User, error) {

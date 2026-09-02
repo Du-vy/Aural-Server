@@ -2,12 +2,14 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +24,15 @@ import (
 // shutdownGrace is how long in-flight HTTP requests get to finish on stop.
 const shutdownGrace = 5 * time.Second
 
+// pendingHeadroom is how many connections may be open beyond the user limit.
+//
+// max_users counts identities, and a connection has none until it
+// authenticates, so without a ceiling here an exposed server can be kept busy
+// by sockets that never say who they are. The headroom is sized to let
+// everybody on a full server be reconnecting at once — which happens every
+// time the server restarts — without leaving room for much else.
+const pendingHeadroom = 256
+
 // Server ties the HTTP listener to the hub.
 type Server struct {
 	cfg  *config.Config
@@ -30,6 +41,10 @@ type Server struct {
 	hub  *Hub
 	http *http.Server
 	seq  atomic.Int64
+	// live counts open WebSocket connections, authenticated or not. The hub
+	// counts identities, which is a different number and the one max_users is
+	// about; this one is what bounds the sockets underneath them.
+	live atomic.Int64
 	// uploads, unfurls and klipy throttle the HTTP endpoints, which have no
 	// session of their own to hang a limiter off. Each costs something
 	// different — disk, an outbound fetch, somebody else's quota — so each
@@ -37,6 +52,10 @@ type Server struct {
 	uploads *userLimiters
 	unfurls *userLimiters
 	klipy   *userLimiters
+	// trustedProxies is server.trusted_proxies, parsed. Empty means no
+	// forwarding header is believed, which is right for a server reached
+	// directly.
+	trustedProxies []netip.Prefix
 }
 
 // New builds the gateway. cfgPath is where runtime configuration edits are
@@ -47,11 +66,17 @@ func New(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Stor
 		return nil, err
 	}
 
+	trusted, err := parseTrustedProxies(cfg.Server.TrustedProxies)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: server.trusted_proxies: %w", err)
+	}
+
 	s := &Server{
 		cfg: cfg, st: st, log: log, hub: hub,
-		uploads: newUserLimiters(uploadBurst, uploadsPerSecond),
-		unfurls: newUserLimiters(unfurlBurst, unfurlsPerSecond),
-		klipy:   newUserLimiters(klipyBurst, klipyPerSecond),
+		uploads:        newUserLimiters(uploadBurst, uploadsPerSecond),
+		unfurls:        newUserLimiters(unfurlBurst, unfurlsPerSecond),
+		klipy:          newUserLimiters(klipyBurst, klipyPerSecond),
+		trustedProxies: trusted,
 	}
 
 	mux := http.NewServeMux()
@@ -97,14 +122,46 @@ func (s *Server) Run(ctx context.Context) error {
 		// Before the listener, deliberately: the sweep is only unambiguous
 		// while nothing is uploading.
 		s.sweepOrphanedFiles(ctx)
-		go s.sweepPending(ctx)
+	}
+	go s.sweepMaintenance(ctx)
+	// Keeps the address the relay advertises current on a connection whose own
+	// address is not. It returns immediately on a server configured with a
+	// literal, which has nothing to watch.
+	go s.hub.WatchPublicIP(ctx)
+	// Publishes this server's address to a dynamic DNS provider. It returns
+	// immediately unless the ddns block is switched on.
+	go s.watchDDNS(ctx)
+
+	if s.cfg.TLS.Enabled {
+		// A certificate this server obtains for itself has to exist before the
+		// listener asks for it, so the first order runs here, in the open,
+		// where its failure is reported rather than logged into a goroutine.
+		if s.cfg.TLS.ACME.Enabled {
+			if err := s.startACME(ctx); err != nil {
+				return err
+			}
+		}
+
+		// Loaded here rather than left to ListenAndServeTLS, so that a renewal
+		// is picked up by the running server instead of waiting for a restart
+		// nobody schedules. It is also what makes the renewals below take
+		// effect: they write the files, and this notices.
+		reloader, err := newCertReloader(s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile, s.log)
+		if err != nil {
+			return err
+		}
+		s.http.TLSConfig = &tls.Config{
+			MinVersion:     tls.VersionTLS12,
+			GetCertificate: reloader.GetCertificate,
+		}
 	}
 
 	go func() {
 		var err error
 		if s.cfg.TLS.Enabled {
 			s.log.Info("listening", slog.String("address", s.cfg.Address()), slog.String("scheme", "wss"))
-			err = s.http.ListenAndServeTLS(s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
+			// Both empty: the certificate comes from TLSConfig.GetCertificate.
+			err = s.http.ListenAndServeTLS("", "")
 		} else {
 			s.log.Info("listening", slog.String("address", s.cfg.Address()), slog.String("scheme", "ws"))
 			err = s.http.ListenAndServe()
@@ -158,10 +215,27 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 // handleWebSocket upgrades a request and runs the session on it.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Where the connection came from, as far as this server can honestly tell.
+	// It is the one thing an operator of an exposed server wants in the log
+	// and, until now, the one thing that was not in it.
+	peer := clientIP(r, s.trustedProxies)
+
 	origin := r.Header.Get("Origin")
 	if !s.cfg.OriginAllowed(origin) {
-		s.log.Warn("rejected websocket origin", slog.String("origin", origin))
+		s.log.Warn("rejected websocket origin",
+			slog.String("origin", origin), slog.String("peer", peer))
 		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+
+	// Counted before the upgrade, so a flood is refused with an HTTP status a
+	// client can read rather than with a socket that is opened and then shut.
+	live := s.live.Add(1)
+	defer s.live.Add(-1)
+	if limit := int64(s.cfg.Server.MaxUsers) + pendingHeadroom; live > limit {
+		s.log.Warn("refused a connection: too many are already open",
+			slog.Int64("open", live), slog.Int64("limit", limit), slog.String("peer", peer))
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -176,7 +250,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session := newSession(s.seq.Add(1), s.hub, conn, s.log)
+	// The peer travels with every line this session logs, so an authentication
+	// that fails, a rate limit that trips or a client that falls behind can be
+	// traced back to where it came from.
+	session := newSession(s.seq.Add(1), s.hub, conn, s.log.With(slog.String("peer", peer)))
 	defer s.finishSession(session)
 
 	session.Send(protocol.Event(protocol.EvHello, protocol.Hello{
@@ -196,17 +273,37 @@ func (s *Server) finishSession(session *Session) {
 	}
 	userID := session.UserID()
 	status := session.User().Status
-	// The audio plane first: it has a room to repair and, in client_host mode,
-	// possibly an election to run, and both need the session still findable.
-	if channelID := session.voiceChannel(); channelID != 0 {
-		s.hub.leaveVoice(session, channelID, false)
-	}
-	if s.hub.relay != nil {
-		s.hub.relay.LeaveAll(userID)
+
+	// Whether this session still holds the identity, or a newer connection has
+	// taken it over. It decides everything below, because the audio plane is
+	// keyed by user rather than by session: tearing it down on behalf of a
+	// displaced connection would cut off the call the new one has already
+	// opened. Somebody who drops and comes straight back is exactly the person
+	// this happens to, so it is not a rare ordering.
+	current, stillOnline := s.hub.SessionForUser(userID)
+	displaced := stillOnline && current != session
+
+	if !displaced {
+		// The audio plane first: it has a room to repair and, in client_host
+		// mode, possibly an election to run, and both need the session still
+		// findable.
+		if channelID := session.voiceChannel(); channelID != 0 {
+			s.hub.leaveVoice(session, channelID, false)
+		}
+		if s.hub.relay != nil {
+			s.hub.relay.LeaveAll(userID)
+		}
+	} else {
+		// The identity's audio belongs to the connection that now holds it.
+		// This session only has to stop believing it is in a channel.
+		session.clearVoiceSession(0)
 	}
 	s.hub.Remove(session)
 
-	if _, stillOnline := s.hub.SessionForUser(userID); stillOnline {
+	// Read again rather than reusing the check above: a new connection may have
+	// arrived in between, and presence is the one thing that must not announce
+	// a departure for somebody who is still here.
+	if _, taken := s.hub.SessionForUser(userID); taken {
 		// A newer connection took the identity over; presence never dropped.
 		return
 	}

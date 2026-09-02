@@ -8,7 +8,8 @@
     "max_users": 64,
     "allowed_origins": [
       "*"
-    ]
+    ],
+    "trusted_proxies": []
   },
   "registration": {
     "enabled": true,
@@ -50,10 +51,35 @@
   "integrations": {
     "klipy_api_key": ""
   },
+  "ddns": {
+    "enabled": false,
+    "provider": "",
+    "domain": "",
+    "token": "",
+    "zone_id": "",
+    "proxied": false,
+    "interval_minutes": 5,
+    "stun_servers": [
+      "stun:stun.cloudflare.com:3478",
+      "stun:stun.l.google.com:19302"
+    ]
+  },
+  "retention": {
+    "token_idle_days": 90,
+    "guest_idle_days": 30
+  },
   "tls": {
     "enabled": false,
     "cert_file": "",
-    "key_file": ""
+    "key_file": "",
+    "acme": {
+      "enabled": false,
+      "domains": [],
+      "email": "",
+      "staging": false,
+      "directory_url": "",
+      "cache_dir": "acme"
+    }
   },
   "database": {
     "path": "aural.db"

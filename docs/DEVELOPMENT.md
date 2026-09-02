@@ -36,13 +36,14 @@ CGO_ENABLED=0 go build ./...   # builds clean
 
 - `go build` alone produces a static binary. No DLLs, no shared libraries.
 - Cross-compiling is just two environment variables (see below).
-- **`go test -race` does not work.** The race detector is ThreadSanitizer, a
-  native C++ runtime, so it needs cgo and a **gcc-compatible** compiler. MSVC
-  does not satisfy it: `go env CC` says `gcc`.
+- **`go test -race` needs a toolchain the rest of the build does not.** The race
+  detector is ThreadSanitizer, a native C++ runtime, so it needs cgo and a
+  **gcc-compatible** compiler. MSVC does not satisfy it: `go env CC` says `gcc`.
 
-That last point is a real gap, not a shrug. The fix is to run the race detector
-in CI on Linux rather than installing a second C toolchain on a Windows dev
-machine — see [CI](#ci) below.
+That last point is the one exception to the no-C rule, and it is worth
+satisfying locally rather than leaving to CI — see
+[the race detector](#the-race-detector) below. Nothing that ships is built with
+cgo; it is only ever switched on to instrument a test run.
 
 ---
 
@@ -114,14 +115,53 @@ voice presence and connection displacement.
 
 ### The race detector
 
+The gateway is the concurrent part of this codebase — the hub, the read and
+write pumps, the slow reads dispatched off the read loop, the certificate
+reloader, and the watchers that follow a changing public address — so this
+check has real value.
+
+It needs cgo and a gcc-compatible compiler, which the rest of the build does
+not. On Linux and macOS that is already there:
+
 ```sh
-go test -race ./...     # fails on Windows without a gcc toolchain
+go test -race ./...
 ```
 
-The gateway hub is the concurrent part of this codebase, so this check has real
-value. On Windows it needs mingw-w64 (via [w64devkit](https://github.com/skeeto/w64devkit)
-or [MSYS2](https://www.msys2.org)) — but preferring CI is the recommendation, so
-that it runs on every push rather than when someone remembers.
+On Windows, install [MSYS2](https://www.msys2.org) and its UCRT64 toolchain:
+
+```sh
+pacman -S mingw-w64-ucrt-x86_64-gcc
+```
+
+Then put it on `PATH` for the run:
+
+```sh
+PATH="/c/msys64/ucrt64/bin:$PATH" CGO_ENABLED=1 go test -race ./...
+```
+
+```powershell
+# PowerShell
+$env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"; $env:CGO_ENABLED = "1"
+go test -race ./...
+```
+
+Leaving the toolchain on the global `PATH` is fine, and does not compromise the
+static build. It does flip the default — `go env CGO_ENABLED` reads `1` once gcc
+is visible — but nothing in this dependency tree imports `C`, so the binary
+comes out byte-for-byte equivalent and with no DLL imports either way.
+Cross-compiling is unaffected too, since Go turns cgo off by itself whenever
+`GOOS`/`GOARCH` differ from the host. Setting it explicitly per command, as
+above, is simply a way of not having to remember any of that.
+
+A clean run only means something for code the tests actually execute
+concurrently, which is why `internal/gateway/concurrency_test.go` exists: it
+drives the shared state that nothing else exercises in parallel. If you add
+concurrent machinery, add a test that runs it from several goroutines at once,
+or the detector will have nothing to say about it.
+
+To satisfy yourself the detector is armed rather than merely compiling, write a
+throwaway test with an obvious race in it — two goroutines incrementing the
+same `int` — and watch it report `WARNING: DATA RACE`.
 
 ---
 
@@ -266,10 +306,10 @@ go vet ./...
 go test -race ./...
 ```
 
-Linux runners have gcc already, which is what makes `-race` free there and
-awkward on Windows. It matters more since the audio plane landed: the relay is
-the most concurrent thing in this repository, with a goroutine per publisher
-writing to a set of subscribers that changes underneath it.
+Linux runners have gcc already, which is what makes `-race` free there and a
+one-time setup on Windows. It matters more since the audio plane landed: the
+relay is the most concurrent thing in this repository, with a goroutine per
+publisher writing to a set of subscribers that changes underneath it.
 
 ---
 

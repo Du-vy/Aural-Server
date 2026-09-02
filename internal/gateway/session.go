@@ -24,9 +24,28 @@ const (
 	// heartbeatInterval is how often the server pings an idle connection.
 	heartbeatInterval = 30 * time.Second
 	// heartbeatTimeout is how long a pong may take before the peer is dropped.
-	heartbeatTimeout = 10 * time.Second
+	//
+	// It bounds the read loop as much as the network: a pong is a control
+	// frame, and control frames are only processed by a call to Read, so a
+	// request being handled on the read loop is time the heartbeat cannot be
+	// answered in. The slow reads are dispatched off that loop for exactly
+	// this reason, and the margin here covers what is left.
+	heartbeatTimeout = 15 * time.Second
+	// authDeadline is how long a connection may stay unauthenticated. Such a
+	// connection has no identity, so it counts against nothing that max_users
+	// bounds, and it will keep answering pings for as long as it is left to.
+	authDeadline = 30 * time.Second
 	// maxAuthAttempts limits credential guessing on a single connection.
 	maxAuthAttempts = 6
+	// maxSlowInFlight bounds the reads one session may have running off the
+	// read loop at once.
+	//
+	// It is a ceiling, not a rate: the token buckets are what pace these, and
+	// this only exists so that one connection cannot start goroutines without
+	// bound. So it is set well above anything a client does on purpose —
+	// opening a channel, searching, and jumping into a result all at once is
+	// three or four — and a session that reaches it is not one to keep waiting.
+	maxSlowInFlight = 16
 	// writeTimeout bounds a single frame write to a stalled peer.
 	writeTimeout = 10 * time.Second
 	// messageBurst and messagesPerSecond throttle posting. The burst is what a
@@ -94,6 +113,11 @@ type Session struct {
 	signals  *rateLimiter
 	speaking *rateLimiter
 
+	// slowSlots bounds the reads running off the read loop. It is a channel
+	// rather than a counter so that taking a slot is a non-blocking try: a
+	// session that has filled it is told so rather than made to queue.
+	slowSlots chan struct{}
+
 	closeOnce sync.Once
 	closed    chan struct{}
 
@@ -110,16 +134,17 @@ type Session struct {
 
 func newSession(id int64, hub *Hub, conn *websocket.Conn, log *slog.Logger) *Session {
 	return &Session{
-		ID:       id,
-		hub:      hub,
-		log:      log.With(slog.Int64("session", id)),
-		conn:     conn,
-		out:      make(chan protocol.Envelope, outboundBuffer),
-		closed:   make(chan struct{}),
-		messages: newRateLimiter(messageBurst, messagesPerSecond),
-		searches: newRateLimiter(searchBurst, searchesPerSecond),
-		signals:  newRateLimiter(signalBurst, signalsPerSecond),
-		speaking: newRateLimiter(speakingBurst, speakingPerSecond),
+		ID:        id,
+		hub:       hub,
+		log:       log.With(slog.Int64("session", id)),
+		conn:      conn,
+		out:       make(chan protocol.Envelope, outboundBuffer),
+		slowSlots: make(chan struct{}, maxSlowInFlight),
+		closed:    make(chan struct{}),
+		messages:  newRateLimiter(messageBurst, messagesPerSecond),
+		searches:  newRateLimiter(searchBurst, searchesPerSecond),
+		signals:   newRateLimiter(signalBurst, signalsPerSecond),
+		speaking:  newRateLimiter(speakingBurst, speakingPerSecond),
 	}
 }
 
@@ -289,6 +314,20 @@ func (s *Session) applyIdentity(u store.User, roleIDs []int64, base permissions.
 	s.mu.Unlock()
 }
 
+// clearIdentity withdraws an identity that was applied but could not be
+// registered, which happens when the server turns out to be full. The session
+// goes back to being unauthenticated and may try again — as a different
+// account, or once somebody leaves.
+func (s *Session) clearIdentity() {
+	s.mu.Lock()
+	s.authed = false
+	s.user = store.User{}
+	s.roleIDs = nil
+	s.base = permissions.None
+	s.tokenHash = ""
+	s.mu.Unlock()
+}
+
 // refreshPermissions recomputes the cached role set and mask from the database.
 // It is called after anything that could change them: a role edit, a grant, a
 // registration.
@@ -350,15 +389,40 @@ func (s *Session) serve(ctx context.Context) {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	wg.Add(1)
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		s.writePump(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		s.watchAuthDeadline(ctx)
 	}()
 
 	s.readPump(ctx)
 	cancel()
 	wg.Wait()
+}
+
+// watchAuthDeadline drops a connection that never says who it is.
+//
+// Until a session authenticates it holds no identity, so it is counted by
+// nothing max_users bounds while still holding a buffer, four rate limiters
+// and a goroutine. Left alone it would keep all of that for as long as it kept
+// answering pings, which is indefinitely.
+func (s *Session) watchAuthDeadline(ctx context.Context) {
+	timer := time.NewTimer(authDeadline)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+	case <-s.closed:
+	case <-timer.C:
+		if !s.Authed() {
+			s.log.Debug("closing a connection that never authenticated")
+			s.Close(websocket.StatusPolicyViolation, "authentication timed out")
+		}
+	}
 }
 
 // writePump owns the connection for writing. Every outbound frame goes through
@@ -426,6 +490,16 @@ func (s *Session) readPump(ctx context.Context) {
 }
 
 // dispatch routes one request to its handler and replies with the result.
+//
+// A slow route runs in a goroutine of its own. The reason is the heartbeat: a
+// pong is a control frame, and this library only processes control frames
+// inside a call to Read, so anything handled on the read loop is time in which
+// the connection cannot answer a ping. A history walk that outlasts
+// heartbeatTimeout would be dropped as an unresponsive peer, which is the
+// worst possible answer to a server that is merely busy.
+//
+// Only side-effect-free reads qualify. Everything that writes stays on the
+// read loop, in the order the client sent it.
 func (s *Session) dispatch(ctx context.Context, env protocol.Envelope) {
 	route, known := routes[env.Op]
 	if !known {
@@ -437,6 +511,26 @@ func (s *Session) dispatch(ctx context.Context, env protocol.Envelope) {
 		return
 	}
 
+	if !route.slow {
+		s.reply(ctx, route, env)
+		return
+	}
+
+	select {
+	case s.slowSlots <- struct{}{}:
+	default:
+		s.Send(protocol.Failure(env.ID, protocol.Errorf(protocol.ErrRateLimited,
+			"too many reads are already running on this connection")))
+		return
+	}
+	go func() {
+		defer func() { <-s.slowSlots }()
+		s.reply(ctx, route, env)
+	}()
+}
+
+// reply runs one handler and sends whatever it produced.
+func (s *Session) reply(ctx context.Context, route route, env protocol.Envelope) {
 	payload, failure := route.fn(ctx, s, env.Data)
 	if failure != nil {
 		s.Send(protocol.Failure(env.ID, failure))
@@ -462,7 +556,11 @@ func decode[T any](raw json.RawMessage) (T, *protocol.Error) {
 // route is one entry of the dispatch table.
 type route struct {
 	needsAuth bool
-	fn        func(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error)
+	// slow marks a read that may take longer than the heartbeat allows and is
+	// therefore run off the read loop. Only ops with no side effects may set
+	// it: running them out of order with the rest is what it costs.
+	slow bool
+	fn   func(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error)
 }
 
 // routes is the whole client-facing surface of the protocol.
@@ -484,9 +582,11 @@ var routes = map[string]route{
 	protocol.OpChannelUpdate: {needsAuth: true, fn: handleChannelUpdate},
 	protocol.OpChannelDelete: {needsAuth: true, fn: handleChannelDelete},
 
-	protocol.OpMessageSend:    {needsAuth: true, fn: handleMessageSend},
-	protocol.OpMessageHistory: {needsAuth: true, fn: handleMessageHistory},
-	protocol.OpMessageSearch:  {needsAuth: true, fn: handleMessageSearch},
+	protocol.OpMessageSend: {needsAuth: true, fn: handleMessageSend},
+	// The two reads that walk history rather than an index of it, and the only
+	// requests here that can outlast a heartbeat.
+	protocol.OpMessageHistory: {needsAuth: true, slow: true, fn: handleMessageHistory},
+	protocol.OpMessageSearch:  {needsAuth: true, slow: true, fn: handleMessageSearch},
 	protocol.OpMessageEdit:    {needsAuth: true, fn: handleMessageEdit},
 	protocol.OpMessageDelete:  {needsAuth: true, fn: handleMessageDelete},
 

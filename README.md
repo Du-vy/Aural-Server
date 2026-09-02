@@ -59,7 +59,8 @@ leave out falls back to its default. See `config.example.json` for the full file
     "port": 9871,
     "password": "",            // gates the whole server; empty means no gate
     "max_users": 64,
-    "allowed_origins": ["*"]   // browser Origin filter on the WebSocket upgrade
+    "allowed_origins": ["*"],  // browser Origin filter on the WebSocket upgrade
+    "trusted_proxies": []      // whose X-Forwarded-For to believe; empty = nobody
   },
   "registration": {
     "enabled": true,           // may guests claim an account?
@@ -77,7 +78,7 @@ leave out falls back to its default. See `config.example.json` for the full file
     "dtx": false,              // stop sending during silence
     "stereo": false,
     "max_participants": 0,     // 0 leaves the ceiling to the channel
-    "public_ip": "",           // set when the server is behind a 1:1 NAT
+    "public_ip": "",           // an IP, or a hostname to re-resolve; see below
     "udp_port_min": 0,         // 0 lets the OS choose the media ports
     "udp_port_max": 0,
     "ice_servers": []          // STUN and TURN, needed by client_host
@@ -90,7 +91,28 @@ leave out falls back to its default. See `config.example.json` for the full file
     "max_per_message": 10,
     "pending_ttl_minutes": 60       // how long an unposted upload is kept
   },
-  "tls": { "enabled": false, "cert_file": "", "key_file": "" },
+  "ddns": {
+    "enabled": false,          // keep a dynamic DNS record pointing here
+    "provider": "",            // duckdns | cloudflare
+    "domain": "",
+    "token": "",
+    "interval_minutes": 5
+  },
+  "retention": {
+    "token_idle_days": 90,     // revoke a session token nobody has used since
+    "guest_idle_days": 30      // drop guest identities that cannot return; 0 = keep
+  },
+  "tls": {
+    "enabled": false,
+    "cert_file": "",           // filled in for you when acme is on
+    "key_file": "",
+    "acme": {
+      "enabled": false,        // get a certificate over the DNS-01 challenge
+      "domains": [],           // defaults to ddns.domain
+      "email": "",
+      "staging": false         // work a deployment out against this first
+    }
+  },
   "database": { "path": "aural.db" },
   "log": { "level": "info", "format": "text" }
 }
@@ -138,6 +160,20 @@ Set `public_ip` to the address clients actually reach the server on. The
 trade-off is that clients on the same LAN then have to hairpin through the
 router to reach it, which not every router does.
 
+`public_ip` takes any of three things, and on a home connection the literal is
+the one you do **not** want:
+
+| Value | What happens |
+| --- | --- |
+| `"203.0.113.5"` | Advertised as written. Correct until your provider changes it. |
+| `"aural.duckdns.org"` | Re-resolved every five minutes. Follows a dynamic DNS record. |
+| `""` with a `stun:` entry in `ice_servers` | Discovered by asking a STUN server. No setting to maintain. |
+
+When the answer changes, the relay is rebuilt and everybody in a call
+renegotiates — about a second of silence, once, instead of voice that stays
+broken until somebody restarts the server. Nothing is watched at all when the
+value is a literal, since it cannot change.
+
 **Bitrate.** `min_bitrate` and `max_bitrate` bound what a member may choose and
 `bitrate` is where they start. The defaults — 16 to 128 kb/s, starting at 64 —
 put transparent speech in the middle and leave room either side.
@@ -147,6 +183,97 @@ values are the rates Opus actually encodes at: 8000, 12000, 16000, 24000 and
 48000. **44100 is not one of them**, and is rejected rather than accepted and
 quietly rounded: Opus always runs on a 48 kHz clock and resamples internally, so
 naming 44100 would ask for something the codec would not do.
+
+### Home servers, dynamic addresses and TLS
+
+This is the deployment Aural is mostly aimed at: one machine, on a domestic
+connection, whose address is not the operator's to keep. Three things follow
+from that, and the server handles each of them.
+
+**A name that follows the address.** Set the `ddns` block and the server keeps
+the record current itself, so there is no `ddclient` to install and no router
+firmware to trust:
+
+```jsonc
+"ddns": {
+  "enabled": true,
+  "provider": "duckdns",        // or "cloudflare"
+  "domain": "aural.duckdns.org",
+  "token": "…",
+  "interval_minutes": 5
+}
+```
+
+It finds the address by asking a STUN server, because the machine's own
+interface holds a private one. On Cloudflare, use a scoped API token with
+**DNS:Edit** on the zone — never a global key. Add `"zone_id"` if the token is
+too narrow to list zones; otherwise the zone is found from the name. The record
+is created if it does not exist yet, and written only when the address has
+actually moved.
+
+If something else already updates your record, leave this off and just name it
+in `voice.public_ip`.
+
+**A certificate that renews itself.** Turn on `tls.acme` and the server obtains
+one from Let's Encrypt over the DNS-01 challenge, using the same DNS
+credentials:
+
+```jsonc
+"tls": {
+  "enabled": true,
+  "acme": { "enabled": true, "email": "you@example.com" }
+}
+```
+
+DNS-01 rather than HTTP-01 deliberately: HTTP-01 needs port 80 reachable from
+the internet, which residential providers frequently block and the operator
+cannot do anything about. DNS-01 needs nothing inbound at all.
+
+The `ddns` block must carry `provider`, `domain` and `token` for this, whether
+or not `ddns.enabled` is on — turning publishing off does not mean forgetting
+how to reach your DNS. Work a new deployment out with `"staging": true` first:
+its certificates are trusted by nothing, and its rate limits will forgive the
+mistakes the real ones will not.
+
+The certificate is renewed thirty days before it expires and re-read off disk
+without a restart — which is also true of a certificate you obtained yourself
+and dropped into `cert_file` and `key_file`.
+
+**A word about Cloudflare.** If you put the orange cloud in front of this
+server, voice will not work through it, and no configuration fixes that:
+
+- The proxy carries **no UDP at all**, so WebRTC media cannot pass through it.
+- It only proxies WebSocket traffic on the ports it terminates — 443, 2053,
+  2083, 2087, 2096, 8443 — so the default 9871 does not reach you either.
+
+A proxied deployment therefore needs a second, **grey-clouded** record pointing
+straight at your address for the audio plane, with `voice.public_ip` set to it,
+or a TURN server in `ice_servers` that the media can go through instead. Keep
+`"proxied": false` (the default) on any record voice arrives on.
+
+**Behind a reverse proxy.** Caddy, nginx or a tunnel in front of the server
+means every request arrives from it, and the client's address survives only in
+`X-Forwarded-For` — a header written by whoever spoke to the proxy, and worth
+nothing on its own. List the proxy in `server.trusted_proxies` and it is
+believed, one hop at a time, as far back as the hops you named:
+
+```jsonc
+"trusted_proxies": ["127.0.0.1", "172.18.0.0/16"]
+```
+
+Empty, the default, ignores the header entirely, which is right for a server
+reached directly.
+
+**Keeping the database from growing forever.** A server that runs for years
+mints a fresh identity for every guest who ever visits, and a token that never
+expires. The `retention` block sweeps both: tokens nobody has presented in
+`token_idle_days`, and then guest identities last seen `guest_idle_days` ago
+that hold no token — which is to say, ones that could never come back as
+themselves anyway. Set either to `0` to keep them forever.
+
+Nothing anybody said is affected. A message records its author's name on itself
+and the link back to the account is nullable, so history reads exactly as it did
+before. Registered accounts are never touched.
 
 ### File uploads
 
@@ -232,6 +359,9 @@ internal/auth         Argon2id passwords and opaque session tokens
 internal/permissions  the bitmask and the resolution rules
 internal/uploads      attachment storage on disk, quota and content types
 internal/voice        the Opus parameters, and the WebRTC relay
+internal/publicip     the address the relay advertises: literal, DNS or STUN
+internal/ddns         DuckDNS and Cloudflare: address records and DNS-01
+internal/acme         obtaining and renewing a certificate over DNS-01
 internal/protocol     the wire format, shared with the client
 internal/gateway      HTTP and WebSocket, the hub, and every op handler
 internal/logging      structured logger setup
@@ -286,6 +416,12 @@ per-channel rooms, host election and handover, self and moderated mute and
 deafen, speaking indicators, and a bitrate range an administrator sets and a
 member chooses within. Signalling is six ops on the existing socket; the media
 is RTP the server forwards without looking inside.
+
+Also everything a server on a domestic connection needs to survive one: an
+advertised address that follows a dynamic DNS record or is discovered by STUN,
+built-in DuckDNS and Cloudflare updating, a certificate obtained and renewed
+over the DNS-01 challenge, reverse-proxy awareness, and retention windows for
+the rows a long-running server would otherwise keep forever.
 
 **Later** — bans, per-user permission overwrites, screen sharing, and Aural
 Hub, a directory for finding public servers.

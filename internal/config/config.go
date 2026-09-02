@@ -27,6 +27,8 @@ type Config struct {
 	Uploads      Uploads      `json:"uploads"`
 	Unfurl       Unfurl       `json:"unfurl"`
 	Integrations Integrations `json:"integrations"`
+	DDNS         DDNS         `json:"ddns"`
+	Retention    Retention    `json:"retention"`
 	TLS          TLS          `json:"tls"`
 	Database     Database     `json:"database"`
 	Log          Log          `json:"log"`
@@ -45,6 +47,18 @@ type Server struct {
 	// upgrade. ["*"] accepts every origin, which is the sane default for a
 	// self-hosted server reached by address rather than by domain.
 	AllowedOrigins []string `json:"allowed_origins"`
+	// TrustedProxies are the addresses or CIDR ranges whose X-Forwarded-For
+	// header this server believes.
+	//
+	// Behind a reverse proxy every request arrives from the proxy, and the
+	// address it came from survives only in that header. The header is written
+	// by whoever spoke to the proxy, so it is worth nothing unless the
+	// immediate peer is known to be one: an empty list, the default, means the
+	// header is ignored entirely and the peer is taken at face value.
+	//
+	// A proxy on the same machine is "127.0.0.1"; one in a container network
+	// is that network's range.
+	TrustedProxies []string `json:"trusted_proxies"`
 }
 
 // Registration controls how identities become accounts.
@@ -103,6 +117,18 @@ type Voice struct {
 	// address clients reach it on; set it when the server sits behind a
 	// one-to-one NAT, where the interface holds a private address that no
 	// client outside could ever connect to.
+	//
+	// A hostname is accepted as well as a literal, and is what a home server
+	// wants: the name of the dynamic DNS record — a DuckDNS subdomain, a
+	// Cloudflare A record — is stable while the address behind it is not, and
+	// the server re-resolves it while it runs. A literal written into this
+	// file on a connection whose address rotates is correct only until the
+	// next time the provider changes it, and the symptom is voice that stops
+	// working while everything else carries on.
+	//
+	// Left empty on a server that lists a STUN server in ICEServers, the
+	// address is discovered from that instead, which needs no setting here at
+	// all.
 	PublicIP string `json:"public_ip"`
 	// UDPPortMin and UDPPortMax bound the ports the relay binds media to.
 	// Both zero lets the operating system choose, which is convenient on a
@@ -165,12 +191,128 @@ type Integrations struct {
 	KlipyAPIKey string `json:"klipy_api_key"`
 }
 
+// DDNS keeps a dynamic DNS record pointing at this server.
+//
+// It is for the deployment this project is mostly aimed at: a machine on a
+// home connection, reachable only for as long as some name resolves to an
+// address the provider is free to change. Something has to keep that record
+// current, and the server already has to know its own public address in order
+// to advertise it for voice.
+//
+// Setting this is not required to use a dynamic DNS name. A server whose
+// record is updated by the router or by ddclient just names it in
+// voice.public_ip and leaves this off.
+type DDNS struct {
+	Enabled bool `json:"enabled"`
+	// Provider is "duckdns" or "cloudflare".
+	Provider string `json:"provider"`
+	// Domain is the record to keep current. For DuckDNS it is the subdomain,
+	// with or without the .duckdns.org suffix; for Cloudflare it is the fully
+	// qualified name.
+	Domain string `json:"domain"`
+	// Token authenticates to the provider. On Cloudflare it is a scoped API
+	// token with DNS edit permission on the zone, never a global key.
+	Token string `json:"token"`
+	// ZoneID names the Cloudflare zone directly, for a token too narrow to
+	// list zones. Empty looks the zone up by name.
+	ZoneID string `json:"zone_id"`
+	// Proxied puts a Cloudflare record behind the orange cloud.
+	//
+	// Leave it off for any record voice reaches this server by. Cloudflare's
+	// proxy does not carry UDP, so WebRTC media cannot pass through it at all,
+	// and it only carries WebSocket traffic on the ports it terminates. A
+	// proxied deployment needs a second, unproxied name for the audio plane,
+	// which is what voice.public_ip is then set to.
+	Proxied bool `json:"proxied"`
+	// IntervalMinutes is how often the address is checked. The check is a STUN
+	// request; the record is only written when the answer has changed.
+	IntervalMinutes int `json:"interval_minutes"`
+	// STUNServers are asked what this server's public address is. The default
+	// list is used when this is empty. They must be reachable from the server,
+	// and are contacted whether or not voice is enabled, because this is how
+	// the address being published is discovered.
+	STUNServers []string `json:"stun_servers"`
+}
+
+// DefaultDDNSInterval is how often a dynamic DNS record is checked, in
+// minutes. Five is frequent enough that an address change costs minutes of
+// unreachability rather than hours, and rare enough that no provider minds.
+const DefaultDDNSInterval = 5
+
+// DefaultSTUNServers are asked what address the world sees this server at.
+// They are the well-known public ones; an operator who would rather not talk
+// to them names their own in ddns.stun_servers.
+var DefaultSTUNServers = []string{
+	"stun:stun.cloudflare.com:3478",
+	"stun:stun.l.google.com:19302",
+}
+
+// Retention bounds what the database keeps forever.
+//
+// Neither of these throws away a conversation. A message records its author's
+// name on itself and the foreign key back to the account is nullable, so
+// history survives the identity that wrote it; what is swept here is the
+// wreckage of people passing through — one-visit guest rows, and credentials
+// for devices nobody has used in months.
+type Retention struct {
+	// TokenIdleDays revokes a session token nobody has presented in that long.
+	// A registered user pays one sign-in for it. Zero keeps them forever.
+	TokenIdleDays int `json:"token_idle_days"`
+	// GuestIdleDays deletes an unclaimed identity last seen that long ago and
+	// holding no token — which is to say, one that could never come back as
+	// itself in any case. Zero keeps them forever.
+	GuestIdleDays int `json:"guest_idle_days"`
+}
+
 // TLS serves the WebSocket over wss:// with a certificate you provide.
+//
+// The pair is re-read whenever it changes on disk, so a renewal — which for
+// anything issued by an ACME certificate authority happens every couple of
+// months — is picked up without restarting the server.
 type TLS struct {
 	Enabled  bool   `json:"enabled"`
 	CertFile string `json:"cert_file"`
 	KeyFile  string `json:"key_file"`
+	// ACME obtains that certificate automatically instead of being handed one.
+	ACME ACME `json:"acme"`
 }
+
+// ACME gets a certificate from Let's Encrypt, or another certificate
+// authority, over the DNS-01 challenge.
+//
+// DNS-01 is the only challenge offered here, and deliberately so. HTTP-01
+// needs port 80 reachable from the internet, which a residential connection
+// often will not give you: providers block it and there is nothing the
+// operator can do about that. DNS-01 needs nothing inbound at all — the
+// certificate authority looks up a TXT record, which this server publishes
+// through the credentials already in the ddns block.
+//
+// So this needs ddns.provider and ddns.token filled in, whether or not
+// ddns.enabled is on. Turning ddns off means "do not publish my address",
+// not "forget how to reach my DNS".
+type ACME struct {
+	Enabled bool `json:"enabled"`
+	// Domains are the names the certificate covers. Empty falls back to
+	// ddns.domain, which is the name the server is reached by anyway.
+	Domains []string `json:"domains"`
+	// Email is where the certificate authority sends expiry warnings. It is
+	// optional, and is the only notice anybody gets that renewal has been
+	// failing for a month.
+	Email string `json:"email"`
+	// Staging uses Let's Encrypt's staging environment, whose certificates
+	// nothing trusts and whose rate limits are generous. It is what to work
+	// out a deployment against before spending a real one.
+	Staging bool `json:"staging"`
+	// DirectoryURL points at some other certificate authority. Empty means
+	// Let's Encrypt, or its staging environment when Staging is set.
+	DirectoryURL string `json:"directory_url"`
+	// CacheDir is where the certificate, its key and the account key are
+	// written when tls.cert_file and tls.key_file do not say otherwise.
+	CacheDir string `json:"cache_dir"`
+}
+
+// DefaultACMECacheDir is where an obtained certificate is kept.
+const DefaultACMECacheDir = "acme"
 
 // Database points at the SQLite file.
 type Database struct {
@@ -242,6 +384,7 @@ func Default() Config {
 			Password:       "",
 			MaxUsers:       64,
 			AllowedOrigins: []string{"*"},
+			TrustedProxies: []string{},
 		},
 		Registration: Registration{
 			Enabled:           true,
@@ -285,7 +428,30 @@ func Default() Config {
 		Integrations: Integrations{
 			KlipyAPIKey: "",
 		},
-		TLS:      TLS{Enabled: false},
+		DDNS: DDNS{
+			Enabled:         false,
+			IntervalMinutes: DefaultDDNSInterval,
+			// Listed rather than left empty so that the file a fresh install
+			// writes says which servers it would talk to, instead of naming
+			// them only once somebody has switched the block on.
+			STUNServers: slices.Clone(DefaultSTUNServers),
+		},
+		// Generous on purpose. The point is that a server left running for
+		// years does not accumulate an unbounded pile of one-visit identities
+		// and forever-valid credentials, not to expire anybody who is actually
+		// using it.
+		Retention: Retention{
+			TokenIdleDays: 90,
+			GuestIdleDays: 30,
+		},
+		TLS: TLS{
+			Enabled: false,
+			ACME: ACME{
+				Enabled:  false,
+				Domains:  []string{},
+				CacheDir: DefaultACMECacheDir,
+			},
+		},
 		Database: Database{Path: "aural.db"},
 		Log: Log{
 			Level:      "info",
@@ -412,8 +578,19 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.TLS.Enabled && (c.TLS.CertFile == "" || c.TLS.KeyFile == "") {
-		return errors.New("tls.enabled requires tls.cert_file and tls.key_file")
+	if err := c.DDNS.validate(); err != nil {
+		return err
+	}
+
+	if c.Retention.TokenIdleDays < 0 {
+		return errors.New("retention.token_idle_days must not be negative")
+	}
+	if c.Retention.GuestIdleDays < 0 {
+		return errors.New("retention.guest_idle_days must not be negative")
+	}
+
+	if err := c.validateTLS(); err != nil {
+		return err
 	}
 
 	if strings.TrimSpace(c.Database.Path) == "" {
@@ -515,8 +692,8 @@ func (v *Voice) validate() error {
 	}
 
 	v.PublicIP = strings.TrimSpace(v.PublicIP)
-	if v.PublicIP != "" && net.ParseIP(v.PublicIP) == nil {
-		return fmt.Errorf("voice.public_ip %q is not an IP address", v.PublicIP)
+	if v.PublicIP != "" && net.ParseIP(v.PublicIP) == nil && !isHostname(v.PublicIP) {
+		return fmt.Errorf("voice.public_ip %q is neither an IP address nor a hostname", v.PublicIP)
 	}
 
 	switch {
@@ -555,6 +732,166 @@ func (v *Voice) validate() error {
 		v.ICEServers[i].URLs = urls
 	}
 	return nil
+}
+
+// validateTLS checks the certificate half of the configuration.
+//
+// With ACME on, the two file paths stop being something the operator has to
+// provide and become somewhere for the obtained certificate to live, so they
+// are filled in rather than demanded. Without it, they are the certificate
+// itself and there is nothing to serve without them.
+func (c *Config) validateTLS() error {
+	c.TLS.CertFile = strings.TrimSpace(c.TLS.CertFile)
+	c.TLS.KeyFile = strings.TrimSpace(c.TLS.KeyFile)
+	c.TLS.ACME.Email = strings.TrimSpace(c.TLS.ACME.Email)
+	c.TLS.ACME.DirectoryURL = strings.TrimSpace(c.TLS.ACME.DirectoryURL)
+	c.TLS.ACME.CacheDir = strings.TrimSpace(c.TLS.ACME.CacheDir)
+
+	if !c.TLS.Enabled || !c.TLS.ACME.Enabled {
+		if c.TLS.Enabled && (c.TLS.CertFile == "" || c.TLS.KeyFile == "") {
+			return errors.New("tls.enabled requires tls.cert_file and tls.key_file, or tls.acme.enabled")
+		}
+		return nil
+	}
+
+	// The name being certified defaults to the one being published, because on
+	// the deployment this is for they are the same name.
+	if len(c.TLS.ACME.Domains) == 0 && c.DDNS.Domain != "" {
+		c.TLS.ACME.Domains = []string{qualify(c.DDNS.Domain, c.DDNS.Provider)}
+	}
+	if len(c.TLS.ACME.Domains) == 0 {
+		return errors.New("tls.acme.enabled requires tls.acme.domains, or a ddns.domain to take them from")
+	}
+	for i, domain := range c.TLS.ACME.Domains {
+		domain = strings.TrimSpace(domain)
+		if !isHostname(domain) {
+			return fmt.Errorf("tls.acme.domains[%d] %q is not a hostname", i, domain)
+		}
+		c.TLS.ACME.Domains[i] = domain
+	}
+
+	// The challenge is answered through the DNS provider, so its credentials
+	// have to be there even on a server that is not publishing its address.
+	switch c.DDNS.Provider {
+	case "duckdns", "cloudflare":
+	default:
+		return errors.New("tls.acme.enabled needs ddns.provider set to \"duckdns\" or \"cloudflare\": " +
+			"the DNS-01 challenge is answered through it")
+	}
+	if c.DDNS.Token == "" {
+		return errors.New("tls.acme.enabled needs ddns.token, which is what answers the DNS-01 challenge")
+	}
+	if c.DDNS.Domain == "" {
+		return errors.New("tls.acme.enabled needs ddns.domain, which names the zone the challenge is written to")
+	}
+
+	if c.TLS.ACME.CacheDir == "" {
+		c.TLS.ACME.CacheDir = DefaultACMECacheDir
+	}
+	if c.TLS.CertFile == "" {
+		c.TLS.CertFile = filepath.Join(c.TLS.ACME.CacheDir, "cert.pem")
+	}
+	if c.TLS.KeyFile == "" {
+		c.TLS.KeyFile = filepath.Join(c.TLS.ACME.CacheDir, "key.pem")
+	}
+	return nil
+}
+
+// qualify expands a provider's shorthand into the name a certificate is
+// actually issued for. DuckDNS is configured with a bare subdomain, and a
+// certificate for "myserver" would be a certificate for nothing.
+func qualify(domain, provider string) string {
+	if provider == "duckdns" && !strings.Contains(domain, ".") {
+		return domain + ".duckdns.org"
+	}
+	return domain
+}
+
+// ACMEAccountKeyFile is where the account key lives, beside the certificate it
+// was used to obtain.
+func (c *Config) ACMEAccountKeyFile() string {
+	dir := c.TLS.ACME.CacheDir
+	if dir == "" {
+		dir = DefaultACMECacheDir
+	}
+	return filepath.Join(dir, "account.key")
+}
+
+// validate checks the dynamic DNS block and fills in what it leaves out. A
+// disabled block is not checked at all, so a half-written one can be left in
+// the file while it is being set up.
+func (d *DDNS) validate() error {
+	d.Provider = strings.ToLower(strings.TrimSpace(d.Provider))
+	d.Domain = strings.TrimSpace(d.Domain)
+	d.Token = strings.TrimSpace(d.Token)
+	d.ZoneID = strings.TrimSpace(d.ZoneID)
+
+	if d.IntervalMinutes < 1 {
+		d.IntervalMinutes = DefaultDDNSInterval
+	}
+	if len(d.STUNServers) == 0 {
+		d.STUNServers = slices.Clone(DefaultSTUNServers)
+	}
+	if !d.Enabled {
+		return nil
+	}
+
+	switch d.Provider {
+	case "duckdns", "cloudflare":
+	default:
+		return fmt.Errorf("ddns.provider %q must be \"duckdns\" or \"cloudflare\"", d.Provider)
+	}
+	if d.Domain == "" {
+		return errors.New("ddns.domain must not be empty while ddns.enabled is true")
+	}
+	if !isHostname(d.Domain) {
+		return fmt.Errorf("ddns.domain %q is not a hostname", d.Domain)
+	}
+	if d.Token == "" {
+		return errors.New("ddns.token must not be empty while ddns.enabled is true")
+	}
+	if d.Proxied && d.Provider != "cloudflare" {
+		return errors.New("ddns.proxied only means anything on cloudflare")
+	}
+	for i, raw := range d.STUNServers {
+		u := strings.TrimSpace(raw)
+		if scheme, _, ok := strings.Cut(u, ":"); !ok || !strings.EqualFold(scheme, "stun") {
+			return fmt.Errorf("ddns.stun_servers[%d] %q must be a stun: url", i, raw)
+		}
+		d.STUNServers[i] = u
+	}
+	return nil
+}
+
+// isHostname reports whether s looks like a DNS name.
+//
+// The check is deliberately loose. Its job is to catch a typo — a URL pasted
+// in whole, an address with a port stuck on the end — rather than to enforce
+// the letter of the DNS specification on a name the resolver is about to have
+// the final word on anyway.
+func isHostname(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	// A trailing dot is a legal fully qualified name.
+	s = strings.TrimSuffix(s, ".")
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // SameAs reports whether two audio planes are identical. Voice holds a slice,

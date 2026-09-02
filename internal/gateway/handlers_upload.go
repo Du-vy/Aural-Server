@@ -75,6 +75,25 @@ func (u *userLimiters) allow(userID int64) bool {
 	return limiter.allow()
 }
 
+// limiterIdle is how long a bucket must have gone unused before it is dropped.
+// It is far longer than any of these buckets take to refill, so a sweep never
+// forgives a limit that is still being enforced.
+const limiterIdle = time.Hour
+
+// sweep discards the buckets that have refilled and gone quiet. Without it the
+// map holds one entry per identity that ever touched the endpoint, for as long
+// as the process runs — which on a self-hosted server is measured in months.
+func (u *userLimiters) sweep(idle time.Duration) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	for userID, limiter := range u.by {
+		if limiter.spent(idle) {
+			delete(u.by, userID)
+		}
+	}
+}
+
 // handleUpload accepts one file and records it as pending: it belongs to
 // nobody's message until the client sends message.send naming its id.
 //
@@ -662,14 +681,23 @@ func (s *Server) sweepOrphanedFiles(ctx context.Context) {
 	}
 }
 
-// sweepPending runs until ctx ends, deleting uploads that were never posted.
+// sweepMaintenance runs until ctx ends, doing the periodic housekeeping.
 //
-// A writer who picks a file and then closes the client leaves one behind. The
-// row is what makes it reachable, so the row goes first and the file after it:
-// the reverse order would leave a message able to name a file that is gone.
-func (s *Server) sweepPending(ctx context.Context) {
-	ttl := time.Duration(s.cfg.Uploads.PendingTTLMinutes) * time.Minute
-	ticker := time.NewTicker(min(ttl, 15*time.Minute))
+// It runs whatever the server is configured for. Abandoned uploads are only
+// one of the things that accumulate, and the rest — cached previews, spent
+// rate limiters, credentials and identities nobody will use again — pile up
+// just as happily on a server with attachments switched off.
+func (s *Server) sweepMaintenance(ctx context.Context) {
+	interval := 15 * time.Minute
+	if s.cfg.Uploads.Enabled {
+		// An abandoned upload is swept within its own TTL, so the tick cannot
+		// be longer than one.
+		if ttl := time.Duration(s.cfg.Uploads.PendingTTLMinutes) * time.Minute; ttl > 0 && ttl < interval {
+			interval = ttl
+		}
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -677,30 +705,39 @@ func (s *Server) sweepPending(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.sweepPendingOnce(ctx, time.Now().Add(-ttl).Unix())
+			s.sweepOnce(ctx)
 		}
 	}
 }
 
-// sweepPendingOnce removes one batch of abandoned uploads.
-func (s *Server) sweepPendingOnce(ctx context.Context, cutoff int64) {
+// sweepOnce does one round of housekeeping.
+//
+// A writer who picks a file and then closes the client leaves one behind. The
+// row is what makes it reachable, so the row goes first and the file after it:
+// the reverse order would leave a message able to name a file that is gone.
+func (s *Server) sweepOnce(ctx context.Context) {
 	const batch = 200
 
-	stale, err := s.st.PendingAttachmentsBefore(ctx, cutoff, batch)
-	if err != nil {
-		s.log.Warn("sweep pending uploads", slog.Any("error", err))
-		return
-	}
-	removed := 0
-	for _, a := range stale {
-		if err := s.st.DeleteAttachment(ctx, a.ID); err != nil {
-			continue
+	if s.hub.Files() != nil {
+		ttl := time.Duration(s.cfg.Uploads.PendingTTLMinutes) * time.Minute
+		cutoff := time.Now().Add(-ttl).Unix()
+
+		stale, err := s.st.PendingAttachmentsBefore(ctx, cutoff, batch)
+		if err != nil {
+			s.log.Warn("sweep pending uploads", slog.Any("error", err))
+		} else {
+			removed := 0
+			for _, a := range stale {
+				if err := s.st.DeleteAttachment(ctx, a.ID); err != nil {
+					continue
+				}
+				s.hub.RemoveFiles([]store.Attachment{a})
+				removed++
+			}
+			if removed > 0 {
+				s.log.Info("removed abandoned uploads", slog.Int("files", removed))
+			}
 		}
-		s.hub.RemoveFiles([]store.Attachment{a})
-		removed++
-	}
-	if removed > 0 {
-		s.log.Info("removed abandoned uploads", slog.Int("files", removed))
 	}
 
 	ttlDays := s.cfg.Unfurl.CacheTTLDays
@@ -710,5 +747,46 @@ func (s *Server) sweepPendingOnce(ctx context.Context, cutoff int64) {
 	pruneCutoff := time.Now().Add(-time.Duration(ttlDays) * 24 * time.Hour).Unix()
 	if pruned, err := s.st.PruneLinkPreviews(ctx, pruneCutoff); err == nil && pruned > 0 {
 		s.log.Info("pruned expired link previews", slog.Int64("count", pruned))
+	}
+
+	s.sweepRetention(ctx)
+
+	// The HTTP limiters keep one bucket per identity that ever used the
+	// endpoint. A full bucket is one that has forgotten everything it knew, so
+	// dropping it changes no decision — it is only the memory of somebody who
+	// has stopped asking.
+	s.uploads.sweep(limiterIdle)
+	s.unfurls.sweep(limiterIdle)
+	s.klipy.sweep(limiterIdle)
+}
+
+// sweepRetention drops the rows a long-running server would otherwise keep
+// forever: credentials nobody presents any more, and the one-visit guest
+// identities behind them. Both are governed by the retention block, and both
+// are off when it is zeroed.
+//
+// Tokens go first. A guest is only swept once nothing can sign in as them
+// again, so revoking the token is what makes the identity eligible in the
+// first place — doing it in the other order would mean waiting a whole cycle
+// for the two halves to agree.
+func (s *Server) sweepRetention(ctx context.Context) {
+	now := time.Now()
+
+	if days := s.cfg.Retention.TokenIdleDays; days > 0 {
+		cutoff := now.Add(-time.Duration(days) * 24 * time.Hour).Unix()
+		if revoked, err := s.st.PruneStaleTokens(ctx, cutoff); err != nil {
+			s.log.Warn("prune stale tokens", slog.Any("error", err))
+		} else if revoked > 0 {
+			s.log.Info("revoked idle session tokens", slog.Int64("count", revoked))
+		}
+	}
+
+	if days := s.cfg.Retention.GuestIdleDays; days > 0 {
+		cutoff := now.Add(-time.Duration(days) * 24 * time.Hour).Unix()
+		if removed, err := s.st.PruneStaleGuests(ctx, cutoff); err != nil {
+			s.log.Warn("prune stale guests", slog.Any("error", err))
+		} else if removed > 0 {
+			s.log.Info("removed guest identities that cannot return", slog.Int64("count", removed))
+		}
 	}
 }

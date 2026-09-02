@@ -250,12 +250,6 @@ func (s *Session) beginAuthAttempt() *protocol.Error {
 func (s *Session) finishAuth(ctx context.Context, user store.User, tokenHash, rawToken string) (any, *protocol.Error) {
 	h := s.hub
 
-	// Capacity is checked against the identities already connected. Somebody
-	// reconnecting displaces their own session rather than being turned away.
-	if _, alreadyOn := h.SessionForUser(user.ID); !alreadyOn && h.Full() {
-		return nil, protocol.Errorf(protocol.ErrServerFull, "the server is full")
-	}
-
 	explicit, err := h.st.RoleIDsForUser(ctx, user.ID)
 	if err != nil {
 		return nil, internalError(s, "load roles", err)
@@ -263,7 +257,17 @@ func (s *Session) finishAuth(ctx context.Context, user store.User, tokenHash, ra
 	roleIDs := h.EffectiveRoleIDs(user, explicit)
 	s.applyIdentity(user, roleIDs, h.BasePermissions(roleIDs), tokenHash)
 
-	if displaced := h.Add(s); displaced != nil {
+	// Capacity is checked against the identities already connected, inside the
+	// hub's own lock: somebody reconnecting displaces their own session rather
+	// than being turned away, and nobody slips past a full server by arriving
+	// at the same moment as somebody else. The identity is applied first
+	// because taking a place needs one, and withdrawn again if there is none.
+	displaced, full := h.Add(s)
+	if full {
+		s.clearIdentity()
+		return nil, protocol.Errorf(protocol.ErrServerFull, "the server is full")
+	}
+	if displaced != nil {
 		displaced.Close(websocket.StatusPolicyViolation, "signed in from another connection")
 	}
 	if err := h.st.TouchUser(ctx, user.ID); err != nil {
