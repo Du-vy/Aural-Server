@@ -17,19 +17,19 @@ import (
 
 // ANSI color codes.
 const (
-	ansiReset        = "\x1b[0m"
-	ansiBold         = "\x1b[1m"
-	ansiDim          = "\x1b[2m"
-	ansiGray         = "\x1b[90m"
-	ansiRed          = "\x1b[31m"
-	ansiBoldRed      = "\x1b[1;31m"
-	ansiGreen        = "\x1b[32m"
-	ansiYellow       = "\x1b[33m"
-	ansiBlue         = "\x1b[34m"
-	ansiMagenta      = "\x1b[35m"
-	ansiCyan         = "\x1b[36m"
-	ansiBrightBlue   = "\x1b[94m"
-	ansiBrightCyan   = "\x1b[96m"
+	ansiReset      = "\x1b[0m"
+	ansiBold       = "\x1b[1m"
+	ansiDim        = "\x1b[2m"
+	ansiGray       = "\x1b[90m"
+	ansiRed        = "\x1b[31m"
+	ansiBoldRed    = "\x1b[1;31m"
+	ansiGreen      = "\x1b[32m"
+	ansiYellow     = "\x1b[33m"
+	ansiBlue       = "\x1b[34m"
+	ansiMagenta    = "\x1b[35m"
+	ansiCyan       = "\x1b[36m"
+	ansiBrightBlue = "\x1b[94m"
+	ansiBrightCyan = "\x1b[96m"
 )
 
 // ConsoleHandler is a slog.Handler designed for human-readable terminal output

@@ -12,6 +12,12 @@ for any target Go supports.
 
 ## Quick start
 
+### 1. Traditional standalone binary
+
+You can download ready-to-run precompiled binaries for Linux (x86_64, ARM64, ARMv7), Windows (x86_64, ARM64), macOS (Apple Silicon and Intel), and FreeBSD directly from the [GitHub Releases](https://github.com/Du-vy/Aural-Server/releases) page.
+
+Or compile from source:
+
 ```sh
 go build ./cmd/aural-server
 ./aural-server
@@ -35,6 +41,37 @@ administrator. Check the server is up with:
 
 ```sh
 curl http://localhost:9871/info
+```
+
+### 2. Docker & Docker Compose
+
+A multi-architecture image (`linux/amd64`, `linux/arm64`, `linux/arm/v7`) is published to GitHub Container Registry (`ghcr.io/du-vy/aural-server:latest`).
+
+Run with Docker Compose:
+
+```sh
+# Fetch docker-compose.yml and start
+curl -O https://raw.githubusercontent.com/Du-vy/Aural-Server/main/docker-compose.yml
+docker compose up -d
+docker compose logs -f
+```
+
+Or run with plain Docker:
+
+```sh
+docker run -d \
+  --name aural-server \
+  --restart unless-stopped \
+  -p 9871:9871 \
+  -p 40000-40100:40000-40100/udp \
+  -v $(pwd)/data:/data \
+  ghcr.io/du-vy/aural-server:latest
+```
+
+All persistent data (`config.json`, `aural.db`, `uploads/`, `acme/`) is stored inside the `/data` volume. To issue a new owner token via Docker:
+
+```sh
+docker compose exec aural aural-server -new-owner-token -config /data/config.json
 ```
 
 ### Flags

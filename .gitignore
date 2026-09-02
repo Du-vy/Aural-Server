@@ -5,6 +5,7 @@
 
 # Runtime state, never committed
 /config.json
+/data/
 *.db
 *.db-shm
 *.db-wal

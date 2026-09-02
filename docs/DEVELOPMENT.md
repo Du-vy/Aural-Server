@@ -296,20 +296,12 @@ the same machine as the server work with no network at all.
 
 ---
 
-## CI
+## CI & Releases
+ 
+GitHub Actions workflows are set up under `.github/workflows`:
 
-Not set up yet. When it is, it should run on Linux:
-
-```sh
-gofmt -l .
-go vet ./...
-go test -race ./...
-```
-
-Linux runners have gcc already, which is what makes `-race` free there and a
-one-time setup on Windows. It matters more since the audio plane landed: the
-relay is the most concurrent thing in this repository, with a goroutine per
-publisher writing to a set of subscribers that changes underneath it.
+- **`ci.yml`**: Runs on pull requests and pushes to `main`. Checks `gofmt`, `go vet`, and runs `go test -race ./...` on Linux, plus a Dockerfile build check.
+- **`release.yml`**: Manual release pipeline (`workflow_dispatch`). Validates version from `internal/buildinfo/buildinfo.go`, compiles standalone binaries for all platforms (Linux, Windows, macOS, FreeBSD), computes SHA-256 checksums, and publishes multi-architecture Docker images (`linux/amd64`, `linux/arm64`, `linux/arm/v7`) to GitHub Container Registry (`ghcr.io`).
 
 ---
 

@@ -1,0 +1,39 @@
+# Aural Server Docker Compose
+#
+# Quick start:
+#   docker compose up -d
+#   docker compose logs -f
+#
+# On first run, a default config.json, database, and one-time owner token are
+# generated inside the `./data` directory. Check the logs to copy the owner token.
+#
+# To issue a replacement owner token:
+#   docker compose exec aural aural-server -new-owner-token -config /data/config.json
+
+services:
+  aural:
+    # Use the published multi-arch image from GitHub Container Registry:
+    image: ghcr.io/du-vy/aural-server:latest
+    # Or build locally from source if preferred:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    container_name: aural-server
+    restart: unless-stopped
+    ports:
+      # HTTP and WebSocket API / Signalling
+      - "9871:9871"
+      # WebRTC Voice Media (UDP). Matches default or configured range in config.json:
+      # "voice": { "udp_port_min": 40000, "udp_port_max": 40100 }
+      - "40000-40100:40000-40100/udp"
+    volumes:
+      # Stores config.json, aural.db, uploads/, and acme/
+      - ./data:/data
+    environment:
+      - TZ=UTC
+
+    # WebRTC Note for Linux Hosts:
+    # If running on a dedicated Linux host or VPS, you may prefer host networking
+    # to avoid Docker NAT overhead for WebRTC traffic. If using host networking,
+    # comment out the `ports:` section above and uncomment `network_mode: host`:
+    # network_mode: host

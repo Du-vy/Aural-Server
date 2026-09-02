@@ -1,0 +1,30 @@
+# Git and CI
+.git
+.github
+.gitignore
+.dockerignore
+
+# Documentation and scripts
+*.md
+docs/
+run.bat
+LICENSE
+
+# Build outputs
+/aural-server
+/aural-server.exe
+/dist/
+
+# Runtime state and persistent data
+/config.json
+/data/
+/uploads/
+*.db
+*.db-shm
+*.db-wal
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -108,4 +108,3 @@ func TestValidateLogConfiguration(t *testing.T) {
 		t.Fatalf("valid file log config should pass: %v", err)
 	}
 }
-
