@@ -1,6 +1,6 @@
 # Builds the Aural server for every supported platform/architecture, builds and
-# publishes the multi-architecture Docker image, and attaches standalone archives
-# to a GitHub release.
+# publishes the multi-architecture Docker image, and creates the GitHub Release
+# with all standalone archives and checksums.
 #
 # Manual only, on purpose. This is the production pipeline: it tags the repo,
 # publishes containers to GHCR, and puts binaries in front of people. It runs
@@ -21,11 +21,11 @@ on:
       release_type:
         description: "How to leave the release when builds finish"
         type: choice
-        default: draft
+        default: published
         options:
+          - published   # public, marked as the latest release
           - draft       # created, visible only to maintainers until published by hand
           - prerelease  # public, flagged as a prerelease
-          - published   # public, marked as the latest release
       dry_run:
         description: "Build only - attach archives to this workflow run, create no tag, release or public image"
         type: boolean
@@ -41,7 +41,7 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Nothing is built, tagged, or published until checks pass.
+  # 1. Checks: Lint, test, and version resolution
   # ---------------------------------------------------------------------------
   checks:
     name: Checks
@@ -86,95 +86,24 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
         run: node .github/scripts/resolve-version.mjs >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------------
-  # The release is created up front as a draft. Standalone binaries and Docker
-  # builds have a concrete release to upload to, and nothing is public until
-  # `finalise` decides what to do with it.
-  # ---------------------------------------------------------------------------
-  prepare:
-    name: Prepare release
-    needs: checks
-    runs-on: ubuntu-22.04
-    outputs:
-      release_id: ${{ steps.create.outputs.release_id }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Refuse a tag that already exists
         if: ${{ !inputs.dry_run }}
         env:
-          TAG: ${{ needs.checks.outputs.tag }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
             echo "::error::$TAG is already tagged. Bump the version in internal/buildinfo/buildinfo.go and commit before releasing."
             exit 1
           fi
-          echo "$TAG is free."
-
-      - name: Create draft release
-        id: create
-        if: ${{ !inputs.dry_run }}
-        uses: actions/github-script@v7
-        env:
-          TAG: ${{ needs.checks.outputs.tag }}
-          VERSION: ${{ needs.checks.outputs.version }}
-        with:
-          script: |
-            const { TAG, VERSION } = process.env;
-            const repoOwner = context.repo.owner.toLowerCase();
-            const { data } = await github.rest.repos.createRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag_name: TAG,
-              target_commitish: context.sha,
-              name: `Aural Server ${VERSION}`,
-              body: [
-                `Self-hosted server for Aural ${VERSION}.`,
-                "",
-                "### Traditional Standalone Binaries",
-                "",
-                "Download the archive for your operating system and architecture. Each archive contains the static `aural-server` executable, documentation, and `config.example.json`.",
-                "",
-                "| OS | Architecture | Package |",
-                "| --- | --- | --- |",
-                `| Linux | x86_64 (amd64) | \`aural-server-${VERSION}-linux-amd64.tar.gz\` |`,
-                `| Linux | ARM64 (aarch64 / Raspberry Pi 4+) | \`aural-server-${VERSION}-linux-arm64.tar.gz\` |`,
-                `| Linux | ARMv7 (32-bit / Raspberry Pi 2/3) | \`aural-server-${VERSION}-linux-armv7.tar.gz\` |`,
-                `| Windows | x86_64 (amd64) | \`aural-server-${VERSION}-windows-amd64.zip\` |`,
-                `| Windows | ARM64 | \`aural-server-${VERSION}-windows-arm64.zip\` |`,
-                `| macOS | Apple Silicon (M-series) | \`aural-server-${VERSION}-darwin-arm64.tar.gz\` |`,
-                `| macOS | Intel (x86_64) | \`aural-server-${VERSION}-darwin-amd64.tar.gz\` |`,
-                `| FreeBSD | x86_64 (amd64) | \`aural-server-${VERSION}-freebsd-amd64.tar.gz\` |`,
-                "",
-                "Verify file integrity using `checksums.txt` (SHA-256).",
-                "",
-                "### Docker Container",
-                "",
-                "Multi-architecture container image (`linux/amd64`, `linux/arm64`, `linux/arm/v7`):",
-                "```sh",
-                `docker pull ghcr.io/${repoOwner}/aural-server:${VERSION}`,
-                "```",
-                "Or run directly with Docker Compose:",
-                "```sh",
-                "curl -O https://raw.githubusercontent.com/Du-vy/Aural-Server/main/docker-compose.yml",
-                "docker compose up -d",
-                "docker compose logs -f",
-                "```",
-              ].join("\n"),
-              draft: true,
-              generate_release_notes: true,
-            });
-            core.setOutput("release_id", data.id);
-            core.notice(`Draft release ready: ${data.html_url}`);
+          echo "$TAG is available."
 
   # ---------------------------------------------------------------------------
-  # Traditional standalone binary matrix compilation.
-  # Pure Go with no cgo compiles cleanly and deterministically for all targets.
+  # 2. Build binaries matrix across all supported OS and architectures.
+  # Compiles statically and packages into .tar.gz / .zip archives.
   # ---------------------------------------------------------------------------
   build-binaries:
     name: Build ${{ matrix.target.name }}
-    needs: [checks, prepare]
+    needs: checks
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -231,6 +160,10 @@ jobs:
           go-version-file: "go.mod"
           cache: true
 
+      - name: Install zip tool (if needed)
+        if: matrix.target.format == 'zip'
+        run: sudo apt-get update && sudo apt-get install -y zip
+
       - name: Build static binary
         env:
           CGO_ENABLED: "0"
@@ -252,7 +185,6 @@ jobs:
           TARGET_NAME: ${{ matrix.target.name }}
           FORMAT: ${{ matrix.target.format }}
         run: |
-          # Copy accompanying files
           cp config.example.json dist/staging/
           cp README.md dist/staging/
           cp LICENSE dist/staging/
@@ -269,68 +201,21 @@ jobs:
           fi
           cd ../..
 
-          echo "archive_name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
           echo "archive_path=dist/${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload to draft release
-        if: ${{ !inputs.dry_run }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.checks.outputs.tag }}
-          ARCHIVE_PATH: ${{ steps.pack.outputs.archive_path }}
-        run: |
-          gh release upload "$TAG" "$ARCHIVE_PATH" --repo "${{ github.repository }}"
 
       - name: Save archive as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.target.name }}
+          name: package-${{ matrix.target.name }}
           path: ${{ steps.pack.outputs.archive_path }}
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Collects all binary archives and calculates SHA-256 checksums.
-  # ---------------------------------------------------------------------------
-  checksums:
-    name: Checksums
-    needs: [checks, prepare, build-binaries]
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Download all binary artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: binary-*
-          merge-multiple: true
-          path: dist/checksums
-
-      - name: Generate SHA-256 checksums
-        run: |
-          cd dist/checksums
-          sha256sum aural-server-* > checksums.txt
-          cat checksums.txt
-
-      - name: Upload checksums to draft release
-        if: ${{ !inputs.dry_run }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.checks.outputs.tag }}
-        run: |
-          gh release upload "$TAG" dist/checksums/checksums.txt --repo "${{ github.repository }}"
-
-      - name: Attach checksums to workflow run
-        uses: actions/upload-artifact@v4
-        with:
-          name: checksums
-          path: dist/checksums/checksums.txt
-          retention-days: 14
-
-  # ---------------------------------------------------------------------------
-  # Builds and pushes multi-architecture Docker image to GHCR (and Docker Hub).
-  # Supports linux/amd64, linux/arm64, linux/arm/v7.
+  # 3. Build & Publish multi-architecture Docker image to GHCR
   # ---------------------------------------------------------------------------
   build-docker:
     name: Build & Publish Docker Image
-    needs: [checks, prepare]
+    needs: checks
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
@@ -385,55 +270,99 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ---------------------------------------------------------------------------
-  # Finalise release: publishes or marks as prerelease if all builds succeeded.
+  # 4. Publish Release: Downloads all archives, calculates checksums, and creates
+  # the release in one atomic step (no API race conditions or tag lookup failures).
   # ---------------------------------------------------------------------------
-  finalise:
-    name: Finalise release
-    needs: [checks, prepare, build-binaries, checksums, build-docker]
-    if: ${{ !inputs.dry_run }}
+  publish-release:
+    name: Publish Release
+    needs: [checks, build-binaries, build-docker]
     runs-on: ubuntu-22.04
     steps:
-      - name: Set release visibility
-        uses: actions/github-script@v7
-        env:
-          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
-          RELEASE_TYPE: ${{ inputs.release_type }}
-        with:
-          script: |
-            const { RELEASE_ID, RELEASE_TYPE } = process.env;
-            const { data } = await github.rest.repos.updateRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: Number(RELEASE_ID),
-              draft: RELEASE_TYPE === "draft",
-              prerelease: RELEASE_TYPE === "prerelease",
-              make_latest: RELEASE_TYPE === "published" ? "true" : "false",
-            });
-            core.notice(
-              RELEASE_TYPE === "draft"
-                ? `Draft ready to review and publish: ${data.html_url}`
-                : `Released: ${data.html_url}`
-            );
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  # ---------------------------------------------------------------------------
-  # Cleanup: Discard the draft release if any build job failed, preventing
-  # half-completed releases from remaining in the repository.
-  # ---------------------------------------------------------------------------
-  cleanup:
-    name: Discard failed release
-    needs: [prepare, build-binaries, checksums, build-docker]
-    if: ${{ always() && !inputs.dry_run && needs.prepare.result == 'success' && (needs.build-binaries.result != 'success' || needs.checksums.result != 'success' || needs.build-docker.result != 'success') }}
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Delete draft release
-        uses: actions/github-script@v7
-        env:
-          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+      - name: Download all packages
+        uses: actions/download-artifact@v4
         with:
-          script: |
-            await github.rest.repos.deleteRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: Number(process.env.RELEASE_ID),
-            });
-            core.warning("A build job failed, so the draft release was automatically discarded.");
+          pattern: package-*
+          merge-multiple: true
+          path: dist/packages
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist/packages
+          sha256sum aural-server-* > checksums.txt
+          cat checksums.txt
+
+      - name: Prepare release notes
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+        run: |
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          cat <<EOF > release_notes.md
+          Self-hosted server for Aural ${VERSION}.
+
+          ### Traditional Standalone Binaries
+
+          Download the package matching your OS and architecture. Each archive contains the static \`aural-server\` binary, documentation, and \`config.example.json\`.
+
+          | Platform | Architecture | Archive |
+          | --- | --- | --- |
+          | Linux | x86_64 (amd64) | \`aural-server-${VERSION}-linux-amd64.tar.gz\` |
+          | Linux | ARM64 (aarch64 / Raspberry Pi 4+) | \`aural-server-${VERSION}-linux-arm64.tar.gz\` |
+          | Linux | ARMv7 (32-bit / Raspberry Pi 2/3) | \`aural-server-${VERSION}-linux-armv7.tar.gz\` |
+          | Windows | x86_64 (amd64) | \`aural-server-${VERSION}-windows-amd64.zip\` |
+          | Windows | ARM64 | \`aural-server-${VERSION}-windows-arm64.zip\` |
+          | macOS | Apple Silicon (M-series) | \`aural-server-${VERSION}-darwin-arm64.tar.gz\` |
+          | macOS | Intel (x86_64) | \`aural-server-${VERSION}-darwin-amd64.tar.gz\` |
+          | FreeBSD | x86_64 (amd64) | \`aural-server-${VERSION}-freebsd-amd64.tar.gz\` |
+
+          Verify file integrity with \`checksums.txt\` (SHA-256).
+
+          ### Docker Container
+
+          Multi-architecture image (\`linux/amd64\`, \`linux/arm64\`, \`linux/arm/v7\`):
+          \`\`\`sh
+          docker pull ghcr.io/${REPO_OWNER}/aural-server:${VERSION}
+          \`\`\`
+
+          Quick start with Docker Compose:
+          \`\`\`sh
+          curl -O https://raw.githubusercontent.com/Du-vy/Aural-Server/main/docker-compose.yml
+          docker compose up -d
+          docker compose logs -f
+          \`\`\`
+          EOF
+
+      - name: Create GitHub Release with all assets
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.checks.outputs.tag }}
+          VERSION: ${{ needs.checks.outputs.version }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+        run: |
+          FLAGS=""
+          if [ "$RELEASE_TYPE" = "draft" ]; then
+            FLAGS="--draft"
+          elif [ "$RELEASE_TYPE" = "prerelease" ]; then
+            FLAGS="--prerelease"
+          else
+            FLAGS="--latest"
+          fi
+
+          echo "Creating release $TAG with flags: $FLAGS"
+          gh release create "$TAG" dist/packages/* \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Aural Server ${VERSION}" \
+            --notes-file release_notes.md \
+            $FLAGS
+
+      - name: Attach all assets to workflow run (dry run)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/packages/*
+          retention-days: 14
