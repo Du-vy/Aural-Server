@@ -249,17 +249,44 @@ func (s *Session) changeRoleMembership(ctx context.Context, raw json.RawMessage,
 
 	target, online := s.hub.SessionForUser(req.UserID)
 	if !online {
-		// The grant is stored and takes effect on the next connection.
-		return struct{}{}, nil
+		// The grant takes effect on the next connection, but the roles it
+		// paints the member with are on show in everybody's list right now, so
+		// the change still has to be announced.
+		user, err := s.hub.st.UserByID(ctx, req.UserID)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, protocol.Errorf(protocol.ErrNotFound, "no such user")
+		}
+		if err != nil {
+			return nil, internalError(s, "load that user", err)
+		}
+		view, err := s.hub.offlineMemberView(ctx, user)
+		if err != nil {
+			return nil, internalError(s, "load that user", err)
+		}
+		s.hub.BroadcastMemberUpdated(view)
+
+		s.log.Info("role membership changed",
+			slog.Int64("role", req.RoleID),
+			slog.Int64("user", req.UserID),
+			slog.Bool("granted", grant))
+
+		return protocol.UserEvent{User: view}, nil
 	}
 	if err := target.refreshPermissions(ctx); err != nil {
 		return nil, internalError(s, "refresh permissions", err)
 	}
 
 	view := target.view()
-	s.hub.BroadcastUserUpdated(view)
+	// A role change is somebody else's doing, so it goes out even when the
+	// target is hiding: masking turns it into an update to the offline entry
+	// they already sit in, which is the frame an absent member's grant makes.
+	s.hub.BroadcastMemberUpdated(view)
 	// The target may now see, or stop seeing, whole parts of the tree.
-	target.Send(protocol.Event(protocol.EvReady, s.hub.buildReady(target, "")))
+	ready, err := s.hub.buildReady(ctx, target, "")
+	if err != nil {
+		return nil, internalError(s, "build the state snapshot", err)
+	}
+	target.Send(protocol.Event(protocol.EvReady, ready))
 	s.hub.evictFromUnreachableChannels()
 
 	s.log.Info("role membership changed",
@@ -267,7 +294,10 @@ func (s *Session) changeRoleMembership(ctx context.Context, raw json.RawMessage,
 		slog.Int64("user", req.UserID),
 		slog.Bool("granted", grant))
 
-	return protocol.UserEvent{User: view}, nil
+	// The caller is not the subject, so their copy is masked like anybody
+	// else's: granting a role must not report back where a hidden member is
+	// sitting.
+	return protocol.UserEvent{User: s.hub.MaskUser(s, view)}, nil
 }
 
 // --- helpers ----------------------------------------------------------------

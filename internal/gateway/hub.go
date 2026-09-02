@@ -587,21 +587,74 @@ func (h *Hub) VisibleChannels(s *Session) []store.Channel {
 	return out
 }
 
+// Members is the member list one session sees: everybody who holds an account,
+// plus the guests who are connected right now.
+//
+// A member who is not connected is listed as offline rather than left out,
+// which is what gives hiding somewhere to hide: an invisible member sits in
+// the list exactly as somebody genuinely away does, and the two are the same
+// entry. A guest has no such entry to disappear into — the identity itself
+// only exists while its connection does — so a hidden guest is still left out
+// of the list altogether.
+func (h *Hub) Members(ctx context.Context, viewer *Session) ([]protocol.User, error) {
+	members, err := h.st.ListMembers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	sessions := h.Sessions()
+	users := make([]protocol.User, 0, len(members)+len(sessions))
+	connected := make(map[int64]bool, len(sessions))
+	for _, other := range sessions {
+		view := other.view()
+		if other.UserID() != viewer.UserID() && HidesPresence(view.Status) && !view.Registered {
+			continue
+		}
+		connected[other.UserID()] = true
+		users = append(users, h.MaskUser(viewer, view))
+	}
+
+	// Whoever is left is away, hidden members included: they were masked into
+	// the same shape above, so the entry they already took is the one that
+	// stands.
+	for _, m := range members {
+		if connected[m.ID] {
+			continue
+		}
+		users = append(users, offlineView(m.User, m.RoleIDs))
+	}
+	return users, nil
+}
+
+// offlineMemberView is the view of one member who has no session, which is what
+// a change made to somebody absent has to carry.
+func (h *Hub) offlineMemberView(ctx context.Context, u store.User) (protocol.User, error) {
+	roleIDs, err := h.st.RoleIDsForUser(ctx, u.ID)
+	if err != nil {
+		return protocol.User{}, err
+	}
+	return offlineView(u, roleIDs), nil
+}
+
 // HidesPresence reports whether a status is one that makes a connected user
 // look offline to everyone but themselves.
 //
-// The promise invisible mode makes is not "shown as offline" but "not shown":
-// a presence list that carries only connected users would give an invisible
-// one away by carrying them at all, however they were labelled.
+// Now that the list carries absent members too, looking offline is a place to
+// hide rather than the tell it used to be: a hidden user is one more name in
+// the crowd of people who are away. What the status still decides is traffic.
+// Somebody absent generates no events at all, so a hidden user may not either.
 func HidesPresence(status string) bool {
 	return status == "invisible" || status == "offline"
 }
 
-// MaskUser is the last line of defence over a user view that reaches somebody
-// else: it drops a channel the viewer may not see, and flattens a hidden user
-// to a plain offline one. Callers are expected to leave a hidden user out of
-// the list entirely rather than rely on this; it is what keeps a view safe if
-// one forgets.
+// MaskUser is what stands between a user view and somebody who is not its
+// subject: it drops a channel the viewer may not see, and flattens a hidden
+// user into the same offline entry the list already holds for everybody away.
+//
+// Flattening is the whole of hiding for a member, rather than a fallback
+// behind leaving them out. A guest is the exception: an unclaimed identity has
+// no offline entry to be flattened into, so callers building a list have to
+// leave a hidden guest out of it.
 func (h *Hub) MaskUser(viewer *Session, view protocol.User) protocol.User {
 	if viewer.UserID() != view.ID && HidesPresence(view.Status) {
 		view.Online = false
@@ -623,6 +676,30 @@ func (h *Hub) BroadcastUserUpdated(view protocol.User) {
 	h.BroadcastUserPresence(view.Status, view)
 }
 
+// BroadcastMemberUpdated announces a change somebody else made to a member: a
+// rename by a moderator, a role granted or revoked. These are the only changes
+// that reach a member who is not here, so this is the one path that speaks
+// about them at all.
+//
+// It says nothing about presence, and so has nothing to keep quiet about: the
+// masked view a hidden member goes out as is the offline entry every viewer
+// already holds for them, which is the same frame an absent member's rename
+// produces. What must not come through here is a change a hidden user makes to
+// their own profile — only they could have made it, so it would say they are
+// here. BroadcastUserPresence is where those go, and it stays silent.
+func (h *Hub) BroadcastMemberUpdated(view protocol.User) {
+	// The subject always sees themselves whole; masking is for everybody else.
+	if own, ok := h.SessionForUser(view.ID); ok {
+		own.Send(protocol.Event(protocol.EvUserUpdated, protocol.UserEvent{User: view}))
+	}
+	for _, s := range h.Sessions() {
+		if s.UserID() == view.ID {
+			continue
+		}
+		s.Send(protocol.Event(protocol.EvUserUpdated, protocol.UserEvent{User: h.MaskUser(s, view)}))
+	}
+}
+
 // BroadcastUserPresence announces a change to a connected user. was is the
 // status the rest of the server last saw them with, which is what decides how
 // the change has to read to everybody else.
@@ -631,6 +708,10 @@ func (h *Hub) BroadcastUserUpdated(view protocol.User) {
 // one: becoming hidden is announced as a departure, staying hidden is announced
 // to nobody, and becoming visible again arrives as an ordinary update, which is
 // the same frame a client already treats as an arrival.
+//
+// The departure is not a removal. A member stays in every list, in the offline
+// part of it, which is where hiding puts somebody and where the connection
+// ending would have put them anyway.
 func (h *Hub) BroadcastUserPresence(was string, view protocol.User) {
 	// The subject always sees themselves whole; masking is for everybody else.
 	if own, ok := h.SessionForUser(view.ID); ok {

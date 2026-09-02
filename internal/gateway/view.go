@@ -128,6 +128,21 @@ func userView(u store.User, roleIDs []int64, channelID *int64, online bool) prot
 	}
 }
 
+// offlineView is how a member who is not connected reaches everybody else.
+//
+// The stored status is dropped rather than shown: it is what the user picked
+// for the next time they are here, not something anyone may act on now. The
+// custom status goes with it, because it is the one field a hidden user can
+// keep changing while the rest of the server believes they are gone — showing
+// the stored value would let a watcher time the change and tell hiding apart
+// from being away.
+func offlineView(u store.User, roleIDs []int64) protocol.User {
+	view := userView(u, roleIDs, nil, false)
+	view.Status = "offline"
+	view.CustomStatus = ""
+	return view
+}
+
 // serverInfo is the public description handed to clients and to GET /info.
 func (h *Hub) serverInfo() protocol.ServerInfo {
 	cfg := h.cfg

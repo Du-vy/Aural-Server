@@ -274,7 +274,16 @@ func (s *Session) finishAuth(ctx context.Context, user store.User, tokenHash, ra
 		s.log.Warn("touch user", slog.Any("error", err))
 	}
 
-	ready := h.buildReady(s, rawToken)
+	ready, err := h.buildReady(ctx, s, rawToken)
+	if err != nil {
+		// The identity is already in the hub, so it has to come back out. A
+		// session that could not be handed a snapshot is not connected in any
+		// sense the rest of the server should go on believing, and nobody has
+		// been told about it yet.
+		h.Remove(s)
+		s.clearIdentity()
+		return nil, internalError(s, "build the state snapshot", err)
+	}
 	view := s.view()
 	// Connecting while hidden is announced to nobody: an arrival the rest of
 	// the server cannot see is one it must not hear about either.
@@ -298,7 +307,7 @@ func (s *Session) finishAuth(ctx context.Context, user store.User, tokenHash, ra
 // buildReady assembles the state snapshot for one session. Channels are already
 // filtered to what the session may see, and the channel a user sits in is
 // hidden from viewers who cannot see that channel.
-func (h *Hub) buildReady(s *Session, sessionToken string) protocol.Ready {
+func (h *Hub) buildReady(ctx context.Context, s *Session, sessionToken string) (protocol.Ready, error) {
 	base, _ := s.Permissions()
 
 	visible := h.VisibleChannels(s)
@@ -313,17 +322,11 @@ func (h *Hub) buildReady(s *Session, sessionToken string) protocol.Ready {
 		roleViews = append(roleViews, roleView(r))
 	}
 
-	sessions := h.Sessions()
-	users := make([]protocol.User, 0, len(sessions))
-	for _, other := range sessions {
-		view := other.view()
-		// A hidden user is left out rather than listed as offline: this list
-		// holds only connected users, so an entry for one who looks offline
-		// could only ever mean somebody hiding.
-		if other.UserID() != s.UserID() && HidesPresence(view.Status) {
-			continue
-		}
-		users = append(users, h.MaskUser(s, view))
+	// Everybody with an account is listed, connected or not: the member list
+	// is the server's roster rather than a list of who is here right now.
+	users, err := h.Members(ctx, s)
+	if err != nil {
+		return protocol.Ready{}, err
 	}
 
 	return protocol.Ready{
@@ -336,7 +339,7 @@ func (h *Hub) buildReady(s *Session, sessionToken string) protocol.Ready {
 		Server:       h.serverInfo(),
 		ICEServers:   h.iceServers(),
 		VoiceStates:  h.voiceStatesFor(s),
-	}
+	}, nil
 }
 
 // internalError logs the cause and returns the opaque error the client sees.

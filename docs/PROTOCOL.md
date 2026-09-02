@@ -224,7 +224,7 @@ client's view of the tree stale.
 {
   "sessionToken": "...",   // only on auth.guest and auth.login
   "user":        User,     // the caller
-  "users":      [User],    // everyone currently connected
+  "users":      [User],    // every member, plus the guests connected now
   "channels":   [Channel], // only the channels the caller may see
   "roles":      [Role],    // the whole role table
   "permissions": "1234",   // the caller's resolved server-wide mask
@@ -235,6 +235,13 @@ client's view of the tree stale.
 `channels` is filtered to what the caller may see, and the `channelId` of a user
 sitting somewhere the caller cannot see is reported as `null`. A restricted
 channel never leaks through the presence list.
+
+`users` is the roster rather than a list of who is here: every registered
+identity is in it, `online: false` and `status: "offline"` when they are not
+connected, plus the guests connected right now. A guest is never listed while
+away — the identity lasts no longer than the connection that made it — so a
+client should drop a guest from its list when one goes offline, and keep a
+member.
 
 ## Objects
 
@@ -391,9 +398,9 @@ Every op below needs an authenticated session.
 | --- | --- | --- |
 | `server.claimAdmin` | — | Redeems the one-time owner token. |
 | `server.update` | `ManageServer` | `{ name?, description?, klipyApiKey?, voice? }`. Persisted to the configuration file. `voice` replaces the audio plane whole and restarts every call. |
-| `user.update` | `ChangeNickname`, or `ManageNicknames` for others | `{ userId?, nickname }`. |
-| `user.move` | `Connect` on the destination; `MoveUsers` for others | `{ userId?, channelId }`. `channelId: null` leaves. |
-| `user.kick` | `KickUsers` | `{ userId, reason? }`. Disconnects; there are no bans in v0.1. |
+| `user.update` | `ChangeNickname`, or `ManageNicknames` for others | `{ userId?, nickname }`. Renaming somebody else works while they are offline; the rest of the fields are your own and need a connection. |
+| `user.move` | `Connect` on the destination; `MoveUsers` for others | `{ userId?, channelId }`. `channelId: null` leaves. The target must be connected. |
+| `user.kick` | `KickUsers` | `{ userId, reason? }`. Disconnects, so the target must be connected; there are no bans in v0.1. |
 | `channel.create` | `ManageChannels` on the parent | `{ name, type, parentId?, topic?, position?, userLimit? }`. |
 | `channel.update` | `ManageChannels` on the channel; `ManageRoles` to touch `overwrites` | `{ channelId, name?, topic?, parentId?, position?, userLimit?, overwrites? }`. |
 | `channel.delete` | `ManageChannels` on the channel | `{ channelId }`. Cascades to descendants. |
@@ -722,7 +729,7 @@ They default to 50 MiB and 5 GiB.
 | `hello` | `{ server, heartbeatMs }` | The connecting client, before auth. |
 | `ready` | Full snapshot | A client whose visible state went stale. |
 | `user.connected` | `{ user }` | Everyone but the arriving client. |
-| `user.disconnected` | `{ userId }` | Everyone. Not sent when a new connection displaced the old one. |
+| `user.disconnected` | `{ userId }` | Everyone. The connection ended: a member becomes offline, a guest leaves the list. Not sent when a new connection displaced the old one. |
 | `user.updated` | `{ user }` | Everyone. |
 | `user.moved` | `{ userId, from, to }` | Everyone who may see either end. The other end is reported as `null`. |
 | `channel.created` | `{ channel }` | Everyone who may see it. |
@@ -748,9 +755,22 @@ refresh is worth.
 - **Channel membership is not persisted.** A user is in a voice channel for as
   long as the connection lasts, exactly as in TeamSpeak.
 - A user whose permission to be somewhere is revoked is moved out immediately.
-- **Messages outlive presence.** `ready.users` lists only who is connected, so
-  the author of an older message is usually somebody the client has never seen.
-  That is why every message carries `author` as well as `userId`.
+- **Messages outlive presence.** `ready.users` carries the members, but a guest
+  who has been pruned is gone from it altogether, so the author of an older
+  message is not always somebody the client can look up. That is why every
+  message carries `author` as well as `userId`.
+- **Invisible is offline.** A member who sets `invisible` is reported to
+  everybody else exactly as a member who is away: `online: false`,
+  `status: "offline"`, no channel and no custom status. Going invisible reaches
+  other clients as `user.disconnected` and coming back as `user.updated`, which
+  are the frames a real disconnect and a real arrival send. While hidden they
+  generate no events of their own, because somebody away generates none either.
+  A guest has no offline entry to hide in, so a hidden guest is left out of the
+  list entirely instead.
+- **A change made to somebody who is away is still announced.** Renaming a
+  member or granting them a role sends `user.updated` carrying their offline
+  entry, whether they are absent or hiding: these are the only things that
+  happen to a member who is not connected.
 
 ## Not in version 1
 

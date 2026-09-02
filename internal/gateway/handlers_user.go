@@ -108,7 +108,10 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 			if !base.Has(permissions.ManageNicknames) {
 				return nil, protocol.Errorf(protocol.ErrForbidden, "you are not allowed to change other nicknames")
 			}
-			if failure := s.hub.requireOutranks(s, targetID); failure != nil {
+			// The offline-capable check: a member who is not connected is on
+			// show in the list like everybody else, and renaming somebody is
+			// one of the few things worth doing to them while they are away.
+			if failure := s.hub.requireOutranksUser(ctx, s, targetID); failure != nil {
 				return nil, failure
 			}
 		}
@@ -178,7 +181,15 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 
 	target, ok := s.hub.SessionForUser(targetID)
 	if !ok {
-		return struct{}{}, nil
+		// Only a moderator gets here — the fields a user may set on themselves
+		// all need a connection — and what they changed is on show against the
+		// member's offline entry, so everybody is told.
+		view, err := s.hub.offlineMemberView(ctx, updatedUser)
+		if err != nil {
+			return nil, internalError(s, "load that user", err)
+		}
+		s.hub.BroadcastMemberUpdated(view)
+		return protocol.UserEvent{User: view}, nil
 	}
 
 	// The status the rest of the server last saw, read before the session is

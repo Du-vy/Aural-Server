@@ -328,6 +328,76 @@ func (s *Store) UsersByID(ctx context.Context, ids []int64) ([]User, error) {
 	return out, nil
 }
 
+// Member is a claimed identity together with the roles granted to it: what a
+// member list needs to render somebody, which is the same whether or not they
+// happen to be connected.
+type Member struct {
+	User
+	RoleIDs []int64
+}
+
+// ListMembers loads every claimed identity with its roles, ordered by nickname.
+//
+// Guests are left out on purpose. An unclaimed identity lives only as long as
+// the connection that made it — it is pruned once it goes stale — so a guest
+// who is not connected is not a member of anything and has nothing to be
+// listed under.
+func (s *Store) ListMembers(ctx context.Context) ([]Member, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+userColumns+` FROM users
+		 WHERE username IS NOT NULL
+		 ORDER BY nickname COLLATE NOCASE ASC, id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list members: %w", err)
+	}
+	defer rows.Close()
+
+	var members []Member
+	index := make(map[int64]int)
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		index[u.ID] = len(members)
+		members = append(members, Member{User: u, RoleIDs: []int64{}})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list members: %w", err)
+	}
+	if len(members) == 0 {
+		return nil, nil
+	}
+
+	// One pass over every grant rather than a query per member: the join is
+	// what keeps a list of a few thousand people to two round trips.
+	grants, err := s.db.QueryContext(ctx,
+		`SELECT ur.user_id, r.id
+		 FROM user_roles ur
+		 JOIN roles r ON r.id = ur.role_id
+		 JOIN users u ON u.id = ur.user_id
+		 WHERE u.username IS NOT NULL
+		 ORDER BY r.position ASC, r.id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list member roles: %w", err)
+	}
+	defer grants.Close()
+
+	for grants.Next() {
+		var userID, roleID int64
+		if err := grants.Scan(&userID, &roleID); err != nil {
+			return nil, fmt.Errorf("store: list member roles: %w", err)
+		}
+		if at, ok := index[userID]; ok {
+			members[at].RoleIDs = append(members[at].RoleIDs, roleID)
+		}
+	}
+	if err := grants.Err(); err != nil {
+		return nil, fmt.Errorf("store: list member roles: %w", err)
+	}
+	return members, nil
+}
+
 // requireOneRow turns an UPDATE that matched nothing into ErrNotFound.
 func requireOneRow(res sql.Result, what string) error {
 	affected, err := res.RowsAffected()

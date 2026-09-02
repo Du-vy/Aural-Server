@@ -343,6 +343,11 @@ func (h *Hub) resyncAll(ctx context.Context) {
 			s.log.Error("refresh permissions", slog.Any("error", err))
 			continue
 		}
-		s.Send(protocol.Event(protocol.EvReady, h.buildReady(s, "")))
+		ready, err := h.buildReady(ctx, s, "")
+		if err != nil {
+			s.log.Error("build state snapshot", slog.Any("error", err))
+			continue
+		}
+		s.Send(protocol.Event(protocol.EvReady, ready))
 	}
 }

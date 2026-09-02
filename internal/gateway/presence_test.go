@@ -3,6 +3,7 @@ package gateway_test
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"testing"
 	"time"
 
@@ -64,7 +65,49 @@ func userOf(t *testing.T, env protocol.Envelope) protocol.User {
 	return event.User
 }
 
-func TestInvisibleUserIsAbsentFromTheSnapshot(t *testing.T) {
+// member authenticates a fresh connection and claims an account on it, which
+// is what makes the identity outlast the connection that made it.
+func (h *harness) member(nickname, username string) (*client, protocol.Ready) {
+	h.t.Helper()
+
+	c := h.dial()
+	ready := c.guest(nickname)
+	claimed := ok[protocol.AuthRegisterResult](c, protocol.OpAuthRegister,
+		protocol.AuthRegisterRequest{Username: username, Password: "correct-horse"})
+	ready.User = claimed.User
+	return c, ready
+}
+
+// userInList finds one user in a member list.
+func userInList(users []protocol.User, id int64) (protocol.User, bool) {
+	for _, u := range users {
+		if u.ID == id {
+			return u, true
+		}
+	}
+	return protocol.User{}, false
+}
+
+// requireOffline asserts the shape every entry for somebody who is not here
+// takes. It is the shape hiding disappears into, so a field that came through
+// it would be a field that tells the two apart.
+func requireOffline(t *testing.T, u protocol.User, what string) {
+	t.Helper()
+	if u.Online {
+		t.Fatalf("%s is listed as online", what)
+	}
+	if u.Status != "offline" {
+		t.Fatalf("%s has status %q, want offline", what, u.Status)
+	}
+	if u.ChannelID != nil {
+		t.Fatalf("%s is listed in channel %d", what, *u.ChannelID)
+	}
+	if u.CustomStatus != "" {
+		t.Fatalf("%s carries the custom status %q", what, u.CustomStatus)
+	}
+}
+
+func TestInvisibleGuestIsAbsentFromTheSnapshot(t *testing.T) {
 	h := newHarness(t, nil)
 
 	visible := h.dial()
@@ -81,14 +124,150 @@ func TestInvisibleUserIsAbsentFromTheSnapshot(t *testing.T) {
 
 	for _, u := range ready.Users {
 		if u.ID == hiddenReady.User.ID {
-			t.Fatalf("an invisible user was listed in the snapshot as %+v", u)
+			t.Fatalf("an invisible guest was listed in the snapshot as %+v", u)
 		}
 	}
-	// Listing only connected users is the whole point: an entry for somebody
-	// who looks offline could only ever be somebody hiding.
+	// A guest has no offline entry to hide in: the identity lasts no longer
+	// than the connection, so one who is not shown as connected is not shown
+	// at all.
 	if len(ready.Users) != 2 {
 		t.Fatalf("snapshot users: got %d, want 2 (the visible guest and the arrival)", len(ready.Users))
 	}
+}
+
+func TestAnAbsentMemberIsStillListed(t *testing.T) {
+	h := newHarness(t, nil)
+
+	watcher := h.dial()
+	watcher.guest("Ana")
+
+	absent, absentReady := h.member("Bruno", "bruno")
+	watcher.waitEvent(protocol.EvUserConnected)
+	absent.conn.Close(websocket.StatusNormalClosure, "")
+	// The departure is what says the server has finished letting go of the
+	// session, which the snapshot below has to be taken after.
+	watcher.waitEvent(protocol.EvUserDisconnected)
+
+	arriving := h.dial()
+	ready := arriving.guest("Carla")
+
+	listed, found := userInList(ready.Users, absentReady.User.ID)
+	if !found {
+		t.Fatal("a member who is not connected was left out of the snapshot")
+	}
+	requireOffline(t, listed, "an absent member")
+	if listed.Nickname != "Bruno" {
+		t.Fatalf("absent member nickname: got %q, want Bruno", listed.Nickname)
+	}
+	if !listed.Registered {
+		t.Fatal("the absent member is not marked as registered")
+	}
+}
+
+func TestAnInvisibleMemberIsListedAsOffline(t *testing.T) {
+	h := newHarness(t, nil)
+
+	hidden, hiddenReady := h.member("Bruno", "bruno")
+	custom := "in a meeting"
+	ok[protocol.UserEvent](hidden, protocol.OpUserUpdate,
+		protocol.UserUpdateRequest{CustomStatus: &custom})
+	hidden.setStatus("invisible")
+
+	// A second member who really is away is what the hidden one has to be
+	// indistinguishable from.
+	away, awayReady := h.member("Dora", "dora")
+	away.conn.Close(websocket.StatusNormalClosure, "")
+
+	arriving := h.dial()
+	ready := arriving.guest("Carla")
+
+	listed, found := userInList(ready.Users, hiddenReady.User.ID)
+	if !found {
+		t.Fatal("an invisible member was left out of the snapshot rather than shown as offline")
+	}
+	requireOffline(t, listed, "an invisible member")
+
+	// The hidden entry and the genuinely absent one have to agree on every
+	// field that is not the person: anything else is what would tell a watcher
+	// which of the two they are looking at.
+	gone, found := userInList(ready.Users, awayReady.User.ID)
+	if !found {
+		t.Fatal("a member who is not connected was left out of the snapshot")
+	}
+	if listed.Online != gone.Online || listed.Status != gone.Status ||
+		listed.CustomStatus != gone.CustomStatus || (listed.ChannelID == nil) != (gone.ChannelID == nil) {
+		t.Fatalf("hiding is visible: hidden %+v, absent %+v", listed, gone)
+	}
+}
+
+func TestRenamingAnAbsentMemberReachesEverybody(t *testing.T) {
+	h := newHarness(t, nil)
+
+	admin, _ := h.admin("Ana")
+
+	absent, absentReady := h.member("Bruno", "bruno")
+	admin.waitEvent(protocol.EvUserConnected)
+	absent.conn.Close(websocket.StatusNormalClosure, "")
+	admin.waitEvent(protocol.EvUserDisconnected)
+
+	watcher := h.dial()
+	watcher.guest("Carla")
+
+	// A rename is one of the few things that happens to somebody who is not
+	// here, and their entry is on show, so it has to be announced.
+	renamed := "Bruno the Absent"
+	ok[protocol.UserEvent](admin, protocol.OpUserUpdate,
+		protocol.UserUpdateRequest{UserID: &absentReady.User.ID, Nickname: &renamed})
+
+	env, arrived := watcher.eventWithin(protocol.EvUserUpdated, quietFor)
+	if !arrived {
+		t.Fatal("renaming an absent member was announced to nobody")
+	}
+	updated := userOf(t, env)
+	if updated.ID != absentReady.User.ID {
+		t.Fatalf("update was for user %d, want %d", updated.ID, absentReady.User.ID)
+	}
+	if updated.Nickname != renamed {
+		t.Fatalf("nickname: got %q, want %q", updated.Nickname, renamed)
+	}
+	requireOffline(t, updated, "a renamed absent member")
+}
+
+func TestGrantingARoleToAHiddenMemberReadsAsAnAbsentOne(t *testing.T) {
+	h := newHarness(t, nil)
+
+	admin, _ := h.admin("Ana")
+
+	hidden, hiddenReady := h.member("Bruno", "bruno")
+	admin.waitEvent(protocol.EvUserConnected)
+	hidden.setStatus("invisible")
+	admin.waitEvent(protocol.EvUserDisconnected)
+
+	watcher := h.dial()
+	watcher.guest("Carla")
+
+	created := ok[protocol.RoleEvent](admin, protocol.OpRoleCreate, protocol.RoleCreateRequest{Name: "Moderator"})
+	granted := ok[protocol.UserEvent](admin, protocol.OpRoleAssign,
+		protocol.RoleMembershipRequest{UserID: hiddenReady.User.ID, RoleID: created.Role.ID})
+
+	// Somebody else's doing, on a member every list holds an entry for: it goes
+	// out, but as the update an absent member's grant would make. The reply to
+	// the moderator who asked is masked the same way, because a role grant must
+	// not report back where a hidden member is sitting.
+	requireOffline(t, granted.User, "the reply about a hidden member")
+
+	env, arrived := watcher.eventWithin(protocol.EvUserUpdated, quietFor)
+	if !arrived {
+		t.Fatal("granting a role to a hidden member was announced to nobody")
+	}
+	updated := userOf(t, env)
+	if updated.ID != hiddenReady.User.ID {
+		t.Fatalf("update was for user %d, want %d", updated.ID, hiddenReady.User.ID)
+	}
+	if !slices.Contains(updated.Roles, created.Role.ID) {
+		t.Fatalf("roles after the grant: got %v, want one of them to be %d", updated.Roles, created.Role.ID)
+	}
+	requireOffline(t, updated, "a hidden member given a role")
 }
 
 func TestOwnInvisibleStatusSurvivesTheSnapshot(t *testing.T) {

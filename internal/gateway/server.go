@@ -308,9 +308,14 @@ func (s *Server) finishSession(session *Session) {
 		return
 	}
 	if !HidesPresence(status) {
-		// Nobody was told they were here, so nobody is told they have gone:
-		// a departure for a user the rest of the server believes is offline
-		// is what would give away that they were not.
+		// Nobody was told they were here, so nobody is told they have gone: a
+		// departure for somebody the rest of the server already believes is
+		// offline is what would give away that they were not.
+		//
+		// The frame says the connection ended, not that the person left. A
+		// member drops into the offline part of the list they were always in;
+		// a guest, whose identity lasts no longer than the connection, drops
+		// out of it entirely.
 		s.hub.Broadcast(protocol.Event(protocol.EvUserDisconnected, protocol.UserDisconnectedEvent{UserID: userID}))
 	}
 	s.log.Info("disconnected", slog.Int64("user", userID))
