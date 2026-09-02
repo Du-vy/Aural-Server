@@ -214,6 +214,15 @@ func handleChannelDelete(ctx context.Context, s *Session, raw json.RawMessage) (
 	}
 
 	removed := append([]int64{req.ChannelID}, cascaded...)
+	// The rooms go before the people: evicting somebody from a channel that no
+	// longer exists cannot resolve the voice state that would announce it.
+	for _, id := range removed {
+		s.hub.resetVoiceRoom(id, protocol.ResetDisabled)
+		if s.hub.relay != nil {
+			s.hub.relay.CloseChannel(id)
+		}
+		s.hub.forgetVoiceChannel(id)
+	}
 	s.hub.evictFromChannels(removed)
 
 	event := protocol.ChannelDeletedEvent{ChannelID: req.ChannelID, Cascaded: cascaded}
@@ -300,6 +309,7 @@ func (h *Hub) evictFromChannels(removed []int64) {
 		if _, hit := gone[*current]; !hit {
 			continue
 		}
+		h.leaveVoice(s, *current, false)
 		s.setChannel(nil)
 		h.broadcastUserMoved(s.UserID(), current, nil)
 	}
@@ -317,6 +327,7 @@ func (h *Hub) evictFromUnreachableChannels() {
 		if h.ChannelPermissions(base, roleIDs, *current).Has(permissions.Connect) {
 			continue
 		}
+		h.leaveVoice(s, *current, false)
 		s.setChannel(nil)
 		h.broadcastUserMoved(s.UserID(), current, nil)
 	}

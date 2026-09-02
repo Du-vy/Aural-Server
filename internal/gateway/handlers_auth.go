@@ -330,6 +330,8 @@ func (h *Hub) buildReady(s *Session, sessionToken string) protocol.Ready {
 		Roles:        roleViews,
 		Permissions:  base.String(),
 		Server:       h.serverInfo(),
+		ICEServers:   h.iceServers(),
+		VoiceStates:  h.voiceStatesFor(s),
 	}
 }
 

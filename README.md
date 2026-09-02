@@ -7,9 +7,8 @@ servers: you run your own, and people reach it by address.
 Written in Go with no cgo, so a plain `go build` produces a single static binary
 for any target Go supports.
 
-> **Status: v0.2.** Identity, channels, roles, permissions and text messaging
-> are complete and tested. The audio plane is not implemented yet — see
-> [Roadmap](#roadmap).
+> **Status: v0.5.** Identity, channels, roles, permissions, text messaging,
+> attachments, search and the audio plane are all implemented and tested.
 
 ## Quick start
 
@@ -67,7 +66,22 @@ leave out falls back to its default. See `config.example.json` for the full file
     "allow_guests": true,      // may unregistered users connect at all?
     "min_password_length": 8
   },
-  "voice": { "mode": "client_host" },  // client_host | server_host
+  "voice": {
+    "enabled": true,
+    "mode": "server_host",     // server_host | client_host
+    "sample_rate": 48000,      // 8000 | 12000 | 16000 | 24000 | 48000
+    "bitrate": 64000,          // bits per second, where a client starts
+    "min_bitrate": 16000,      // and the range it may move within
+    "max_bitrate": 128000,
+    "fec": true,               // recover a lost packet from the next one
+    "dtx": false,              // stop sending during silence
+    "stereo": false,
+    "max_participants": 0,     // 0 leaves the ceiling to the channel
+    "public_ip": "",           // set when the server is behind a 1:1 NAT
+    "udp_port_min": 0,         // 0 lets the OS choose the media ports
+    "udp_port_max": 0,
+    "ice_servers": []          // STUN and TURN, needed by client_host
+  },
   "uploads": {
     "enabled": true,
     "path": "uploads",              // where files are written
@@ -87,6 +101,52 @@ rejected at startup, since nobody could ever connect.
 
 `server.name` and `server.description` can also be changed at runtime by an
 administrator, and the change is written back to this file.
+
+### Voice
+
+Audio is Opus over WebRTC. The WebSocket carries only signalling; the media
+travels as RTP and nothing on this server decodes it, which is why relaying a
+call still needs no codec and no cgo.
+
+`voice.mode` chooses who relays:
+
+- **`server_host`** (the default) — the server relays. It works with no further
+  setup, because the server already holds an address every client can reach,
+  which is the one thing NAT traversal is otherwise short of. It costs upstream
+  bandwidth for every listener in every call.
+- **`client_host`** — the first person in a channel relays for the rest, and the
+  next one takes over when they leave. It costs the server nothing and needs at
+  least a STUN server in `ice_servers`, usually a TURN server too, because both
+  ends are behind somebody's router.
+
+Both modes are switchable at runtime by an administrator holding `ManageServer`,
+which rewrites this file and asks everybody in a call to reconnect.
+
+**Ports.** Media does not go through port 9871. With `udp_port_min` and
+`udp_port_max` at zero the operating system picks a port per call, which is fine
+on a host with nothing in front of it and useless behind a firewall that has to
+be told what to open. Set a range and open it:
+
+```jsonc
+"udp_port_min": 40000,
+"udp_port_max": 40100
+```
+
+**Behind NAT.** A server whose own interface holds a private address advertises
+that address in its ICE candidates, and no client outside could ever reach it.
+Set `public_ip` to the address clients actually reach the server on. The
+trade-off is that clients on the same LAN then have to hairpin through the
+router to reach it, which not every router does.
+
+**Bitrate.** `min_bitrate` and `max_bitrate` bound what a member may choose and
+`bitrate` is where they start. The defaults — 16 to 128 kb/s, starting at 64 —
+put transparent speech in the middle and leave room either side.
+
+`sample_rate` is the highest rate Opus is asked to encode at. Its permitted
+values are the rates Opus actually encodes at: 8000, 12000, 16000, 24000 and
+48000. **44100 is not one of them**, and is rejected rather than accepted and
+quietly rounded: Opus always runs on a 48 kHz clock and resamples internally, so
+naming 44100 would ask for something the codec would not do.
 
 ### File uploads
 
@@ -171,6 +231,7 @@ internal/store        SQLite schema, migrations and every query
 internal/auth         Argon2id passwords and opaque session tokens
 internal/permissions  the bitmask and the resolution rules
 internal/uploads      attachment storage on disk, quota and content types
+internal/voice        the Opus parameters, and the WebRTC relay
 internal/protocol     the wire format, shared with the client
 internal/gateway      HTTP and WebSocket, the hub, and every op handler
 internal/logging      structured logger setup
@@ -215,18 +276,16 @@ no server support beyond not mangling them, which the test suite pins.
 configurable per-file and server-wide storage ceilings, the `AttachFiles`
 permission, and files that are deleted along with their message.
 
-**v0.4 (here)** — search: `message.search` across every channel a caller may
+**v0.4** — search: `message.search` across every channel a caller may
 read, filtered by author, channel, date and the kind of content a message
 carries, with the conversation either side of each hit. History gained two more
 cursors, `after` and `around`, so a result can be opened where it was written.
 
-**v0.5** — the audio plane. The protocol already advertises which of the two
-hosting models a server runs:
-
-- `client_host` — the first user to enter a voice channel relays its audio for
-  everyone in it. The host can hand off to another member, and if it disconnects
-  the next user in the channel takes over.
-- `server_host` — the server relays all audio, the traditional model.
+**v0.5 (here)** — the audio plane: Opus over WebRTC, both hosting models,
+per-channel rooms, host election and handover, self and moderated mute and
+deafen, speaking indicators, and a bitrate range an administrator sets and a
+member chooses within. Signalling is six ops on the existing socket; the media
+is RTP the server forwards without looking inside.
 
 **Later** — bans, per-user permission overwrites, screen sharing, and Aural
 Hub, a directory for finding public servers.

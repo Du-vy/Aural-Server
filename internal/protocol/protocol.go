@@ -65,6 +65,16 @@ const (
 	OpRoleDelete   = "role.delete"
 	OpRoleAssign   = "role.assign"
 	OpRoleUnassign = "role.unassign"
+
+	// The audio plane. Sitting in a voice channel is user.move, exactly as it
+	// has always been; these carry the media session on top of it, so a client
+	// that cannot do audio is still a first-class member of the channel.
+	OpVoiceConnect  = "voice.connect"  // open a media session in the channel
+	OpVoiceLeave    = "voice.leave"    // close it without leaving the channel
+	OpVoiceSignal   = "voice.signal"   // one SDP or ICE frame
+	OpVoiceState    = "voice.state"    // set your own mute and deafen
+	OpVoiceModerate = "voice.moderate" // mute or deafen somebody else
+	OpVoiceSpeaking = "voice.speaking" // announce a speaking transition
 )
 
 // Event ops, pushed by the server.
@@ -90,6 +100,13 @@ const (
 	EvRoleDeleted = "role.deleted"
 
 	EvServerUpdated = "server.updated"
+
+	EvVoiceState    = "voice.state"    // somebody's voice state changed
+	EvVoiceSpeaking = "voice.speaking" // somebody started or stopped speaking
+	EvVoiceSignal   = "voice.signal"   // an SDP or ICE frame addressed to you
+	EvVoicePeer     = "voice.peer"     // client_host: dial this peer, or drop it
+	EvVoiceHost     = "voice.host"     // client_host: who relays a channel now
+	EvVoiceReset    = "voice.reset"    // your media session is gone; start over
 )
 
 // Error codes. Clients switch on Code, never on Message.
@@ -112,6 +129,8 @@ const (
 	ErrTooLarge           = "too_large"    // one upload exceeded the file ceiling
 	ErrStorageFull        = "storage_full" // the server-wide upload ceiling is reached
 	ErrUploadsDisabled    = "uploads_disabled"
+	ErrVoiceDisabled      = "voice_disabled" // this server runs no audio plane
+	ErrVoiceFailed        = "voice_failed"   // the media session could not be set up
 )
 
 // Error is the payload of an OpError reply.

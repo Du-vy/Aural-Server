@@ -123,6 +123,9 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	s.log.Info("shutting down")
+	if s.hub.relay != nil {
+		s.hub.relay.Close()
+	}
 	for _, session := range s.hub.Sessions() {
 		session.Close(websocket.StatusGoingAway, "server shutting down")
 	}
@@ -193,6 +196,14 @@ func (s *Server) finishSession(session *Session) {
 	}
 	userID := session.UserID()
 	status := session.User().Status
+	// The audio plane first: it has a room to repair and, in client_host mode,
+	// possibly an election to run, and both need the session still findable.
+	if channelID := session.voiceChannel(); channelID != 0 {
+		s.hub.leaveVoice(session, channelID, false)
+	}
+	if s.hub.relay != nil {
+		s.hub.relay.LeaveAll(userID)
+	}
 	s.hub.Remove(session)
 
 	if _, stillOnline := s.hub.SessionForUser(userID); stillOnline {

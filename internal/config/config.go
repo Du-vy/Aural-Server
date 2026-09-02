@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -58,11 +59,69 @@ type Registration struct {
 	MaxUsernameLength int  `json:"max_username_length"`
 }
 
-// Voice selects who relays audio. The media plane itself is not implemented in
-// v0.1; the mode is already advertised so clients can be built against it.
+// Voice governs the audio plane: who relays it, what the codec is told to do,
+// and how the server-hosted relay reaches the outside world.
+//
+// Every rate here is in bits per second and every frequency in hertz. The
+// bitrate triple is a range with a default inside it: a client picks a target
+// within [MinBitrate, MaxBitrate] and starts from Bitrate, so an operator sets
+// the ceiling their uplink can afford without having to dictate one number to
+// everybody on it.
 type Voice struct {
-	// Mode is "client_host" or "server_host".
+	// Enabled turns the audio plane off entirely. Voice channels remain in the
+	// tree and can still be joined, they simply carry no audio, which is what
+	// lets a text-only deployment keep the channels it already has.
+	Enabled bool `json:"enabled"`
+	// Mode is "server_host" or "client_host".
 	Mode string `json:"mode"`
+	// SampleRate is the highest rate Opus is asked to encode at, in hertz.
+	// Opus itself always runs on a 48 kHz clock; this is the "maxplaybackrate"
+	// hint, and lowering it is how an operator trades fidelity for bandwidth.
+	SampleRate int `json:"sample_rate"`
+	// Bitrate is what a client starts at, MinBitrate and MaxBitrate bound what
+	// it may move to.
+	Bitrate    int `json:"bitrate"`
+	MinBitrate int `json:"min_bitrate"`
+	MaxBitrate int `json:"max_bitrate"`
+	// FEC asks Opus for in-band forward error correction, which recovers a
+	// lost packet from the one after it. It costs a little bitrate and is
+	// worth it on nearly every real network.
+	FEC bool `json:"fec"`
+	// DTX stops sending during silence. It saves bandwidth on a channel where
+	// most people are listening, at the cost of a slightly harder job for the
+	// far end when speech resumes.
+	DTX bool `json:"dtx"`
+	// Stereo doubles the bitrate for something a microphone rarely produces.
+	Stereo bool `json:"stereo"`
+	// MaxParticipants caps how many people may hold a live audio session in one
+	// channel, on top of the channel's own user limit. Zero leaves it to the
+	// channel. It exists because relaying is quadratic: a channel that is fine
+	// to sit in is not necessarily one the relay can carry.
+	MaxParticipants int `json:"max_participants"`
+	// PublicIP is the address the server-hosted relay advertises in its ICE
+	// candidates. Leave it empty on a host whose own interface carries the
+	// address clients reach it on; set it when the server sits behind a
+	// one-to-one NAT, where the interface holds a private address that no
+	// client outside could ever connect to.
+	PublicIP string `json:"public_ip"`
+	// UDPPortMin and UDPPortMax bound the ports the relay binds media to.
+	// Both zero lets the operating system choose, which is convenient on a
+	// host with no firewall in front of it and useless on one with a firewall
+	// that has to be told what to open.
+	UDPPortMin int `json:"udp_port_min"`
+	UDPPortMax int `json:"udp_port_max"`
+	// ICEServers are handed to clients so peers behind NAT can find a path.
+	// They matter most in client_host mode, where the two ends are both behind
+	// somebody's router. Credentials here reach authenticated clients only:
+	// the public server preview deliberately leaves them out.
+	ICEServers []ICEServer `json:"ice_servers"`
+}
+
+// ICEServer is one STUN or TURN server, in the shape WebRTC expects.
+type ICEServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
 }
 
 // Uploads governs file attachments. Both limits are in bytes so a server
@@ -148,6 +207,30 @@ const (
 	DefaultMaxTotalBytes  int64 = 5 * 1024 * 1024 * 1024
 )
 
+// The audio plane a fresh install starts from. 48 kHz is Opus's own clock, so
+// it is the one rate that asks the codec for no resampling at all; 64 kb/s is
+// transparent for speech and is what a client starts at unless its operator or
+// its user says otherwise.
+const (
+	DefaultVoiceSampleRate = 48000
+	DefaultVoiceBitrate    = 64000
+	DefaultVoiceMinBitrate = 16000
+	DefaultVoiceMaxBitrate = 128000
+)
+
+// OpusSampleRates are the rates Opus actually encodes at. Anything else — 44100
+// above all, which is what a person reaches for out of habit — is not one of
+// them: Opus resamples internally to the nearest of these, so naming 44100
+// would ask for something the codec would silently not do.
+var OpusSampleRates = []int{8000, 12000, 16000, 24000, 48000}
+
+// The bitrate window Opus itself accepts, which bounds what an operator may
+// configure.
+const (
+	MinOpusBitrate = 6000
+	MaxOpusBitrate = 510000
+)
+
 // Default returns the configuration a fresh install starts from.
 func Default() Config {
 	return Config{
@@ -167,7 +250,24 @@ func Default() Config {
 			MinUsernameLength: 3,
 			MaxUsernameLength: 32,
 		},
-		Voice: Voice{Mode: protocol.VoiceModeClientHost},
+		// server_host is the default because it is the mode that works with no
+		// further setup: the server already holds an address every client can
+		// reach, which is the one thing NAT traversal is otherwise short of.
+		// client_host saves the operator that bandwidth and needs a STUN
+		// server, and usually a TURN server, to find a path between two people
+		// who are both behind somebody's router.
+		Voice: Voice{
+			Enabled:    true,
+			Mode:       protocol.VoiceModeServerHost,
+			SampleRate: DefaultVoiceSampleRate,
+			Bitrate:    DefaultVoiceBitrate,
+			MinBitrate: DefaultVoiceMinBitrate,
+			MaxBitrate: DefaultVoiceMaxBitrate,
+			FEC:        true,
+			DTX:        false,
+			Stereo:     false,
+			ICEServers: []ICEServer{},
+		},
 		Uploads: Uploads{
 			Enabled:           true,
 			Path:              "uploads",
@@ -280,11 +380,8 @@ func (c *Config) Validate() error {
 		return errors.New("registration.max_username_length is below min_username_length")
 	}
 
-	switch c.Voice.Mode {
-	case protocol.VoiceModeClientHost, protocol.VoiceModeServerHost:
-	default:
-		return fmt.Errorf("voice.mode %q must be %q or %q",
-			c.Voice.Mode, protocol.VoiceModeClientHost, protocol.VoiceModeServerHost)
+	if err := c.Voice.validate(); err != nil {
+		return err
 	}
 
 	if c.Uploads.Enabled {
@@ -368,3 +465,129 @@ func (c *Config) OriginAllowed(origin string) bool {
 	}
 	return false
 }
+
+// validate checks the audio plane and normalises the values that have a
+// canonical form. It is a method so that a runtime edit over the protocol runs
+// exactly the same rules the configuration file does.
+func (v *Voice) validate() error {
+	switch v.Mode {
+	case protocol.VoiceModeClientHost, protocol.VoiceModeServerHost:
+	default:
+		return fmt.Errorf("voice.mode %q must be %q or %q",
+			v.Mode, protocol.VoiceModeClientHost, protocol.VoiceModeServerHost)
+	}
+
+	if v.SampleRate == 0 {
+		v.SampleRate = DefaultVoiceSampleRate
+	}
+	if !slices.Contains(OpusSampleRates, v.SampleRate) {
+		return fmt.Errorf("voice.sample_rate %d is not one Opus encodes at; use one of %v",
+			v.SampleRate, OpusSampleRates)
+	}
+
+	if v.MinBitrate == 0 {
+		v.MinBitrate = DefaultVoiceMinBitrate
+	}
+	if v.MaxBitrate == 0 {
+		v.MaxBitrate = DefaultVoiceMaxBitrate
+	}
+	if v.Bitrate == 0 {
+		v.Bitrate = DefaultVoiceBitrate
+	}
+	if v.MinBitrate < MinOpusBitrate || v.MinBitrate > MaxOpusBitrate {
+		return fmt.Errorf("voice.min_bitrate %d is outside the %d-%d bit/s Opus accepts",
+			v.MinBitrate, MinOpusBitrate, MaxOpusBitrate)
+	}
+	if v.MaxBitrate < MinOpusBitrate || v.MaxBitrate > MaxOpusBitrate {
+		return fmt.Errorf("voice.max_bitrate %d is outside the %d-%d bit/s Opus accepts",
+			v.MaxBitrate, MinOpusBitrate, MaxOpusBitrate)
+	}
+	if v.MinBitrate > v.MaxBitrate {
+		return fmt.Errorf("voice.min_bitrate %d is above voice.max_bitrate %d",
+			v.MinBitrate, v.MaxBitrate)
+	}
+	// A default outside its own range is a typo rather than an intention, but
+	// it is one with an obvious reading, so it is clamped rather than refused.
+	v.Bitrate = min(max(v.Bitrate, v.MinBitrate), v.MaxBitrate)
+
+	if v.MaxParticipants < 0 {
+		return errors.New("voice.max_participants must not be negative")
+	}
+
+	v.PublicIP = strings.TrimSpace(v.PublicIP)
+	if v.PublicIP != "" && net.ParseIP(v.PublicIP) == nil {
+		return fmt.Errorf("voice.public_ip %q is not an IP address", v.PublicIP)
+	}
+
+	switch {
+	case v.UDPPortMin == 0 && v.UDPPortMax == 0:
+		// The operating system picks, which is what an unfirewalled host wants.
+	case v.UDPPortMin < 1 || v.UDPPortMin > 65535:
+		return fmt.Errorf("voice.udp_port_min %d is out of range", v.UDPPortMin)
+	case v.UDPPortMax < 1 || v.UDPPortMax > 65535:
+		return fmt.Errorf("voice.udp_port_max %d is out of range", v.UDPPortMax)
+	case v.UDPPortMin > v.UDPPortMax:
+		return fmt.Errorf("voice.udp_port_min %d is above voice.udp_port_max %d",
+			v.UDPPortMin, v.UDPPortMax)
+	}
+
+	for i, srv := range v.ICEServers {
+		urls := make([]string, 0, len(srv.URLs))
+		for _, raw := range srv.URLs {
+			u := strings.TrimSpace(raw)
+			if u == "" {
+				continue
+			}
+			scheme, _, ok := strings.Cut(u, ":")
+			if !ok {
+				return fmt.Errorf("voice.ice_servers[%d] url %q has no scheme", i, u)
+			}
+			switch strings.ToLower(scheme) {
+			case "stun", "stuns", "turn", "turns":
+			default:
+				return fmt.Errorf("voice.ice_servers[%d] url %q must be stun:, stuns:, turn: or turns:", i, u)
+			}
+			urls = append(urls, u)
+		}
+		if len(urls) == 0 {
+			return fmt.Errorf("voice.ice_servers[%d] lists no urls", i)
+		}
+		v.ICEServers[i].URLs = urls
+	}
+	return nil
+}
+
+// SameAs reports whether two audio planes are identical. Voice holds a slice,
+// so it cannot be compared with ==, and the comparison matters: it is what
+// keeps an administrator saving an unrelated setting from cutting off a call.
+func (v Voice) SameAs(other Voice) bool {
+	if v.Enabled != other.Enabled ||
+		v.Mode != other.Mode ||
+		v.SampleRate != other.SampleRate ||
+		v.Bitrate != other.Bitrate ||
+		v.MinBitrate != other.MinBitrate ||
+		v.MaxBitrate != other.MaxBitrate ||
+		v.FEC != other.FEC ||
+		v.DTX != other.DTX ||
+		v.Stereo != other.Stereo ||
+		v.MaxParticipants != other.MaxParticipants ||
+		v.PublicIP != other.PublicIP ||
+		v.UDPPortMin != other.UDPPortMin ||
+		v.UDPPortMax != other.UDPPortMax ||
+		len(v.ICEServers) != len(other.ICEServers) {
+		return false
+	}
+	for i, srv := range v.ICEServers {
+		peer := other.ICEServers[i]
+		if srv.Username != peer.Username ||
+			srv.Credential != peer.Credential ||
+			!slices.Equal(srv.URLs, peer.URLs) {
+			return false
+		}
+	}
+	return true
+}
+
+// Validate checks an audio plane on its own, which is what a runtime edit over
+// the protocol needs: the same rules as the file, without the rest of it.
+func (v *Voice) Validate() error { return v.validate() }

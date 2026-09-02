@@ -197,12 +197,62 @@ The fields most worth knowing while developing:
 | `server.allowed_origins` | `["*"]` in development. Tighten for a public server. |
 | `registration.enabled` | Whether guests may claim an account. |
 | `registration.allow_guests` | Whether unregistered users may connect at all. |
-| `voice.mode` | `client_host` or `server_host`. Advertised to the client. |
+| `voice.enabled` | Turns the audio plane off. Voice channels stay joinable and carry nothing. |
+| `voice.mode` | `server_host` or `client_host`. See [Voice](#voice) below. |
+| `voice.udp_port_min` / `voice.udp_port_max` | The media ports. Both `0` lets the OS pick. |
+| `voice.public_ip` | The address the relay advertises, for a server behind a 1:1 NAT. |
 | `tls.enabled` | Off by default; the client speaks `ws://` then. |
 
 Setting `allow_guests: false` **and** `enabled: false` is rejected at startup:
 it would be a server nobody can ever enter. `Validate()` catches it rather than
 letting you find out from the far side of a refused connection.
+
+---
+
+## Voice
+
+The audio plane is [`internal/voice`](../internal/voice), built on
+[pion/webrtc](https://github.com/pion/webrtc). It is pure Go, so it changes
+nothing about the toolchain: the binary is still static and still needs no C
+compiler.
+
+Nothing here encodes or decodes anything. A relay forwards RTP packets it does
+not look inside, which is why a server carrying a room full of people still
+needs no codec. What that costs is that the server cannot know who is speaking
+or enforce anything about the audio itself; what it buys is that the whole media
+path is about four hundred lines.
+
+### Testing it
+
+`go test ./internal/gateway -run TestServerHostedRelay` is the one that matters.
+It stands up two real peer connections against the real gateway, runs a real ICE
+handshake and checks that packets one client sends come out of the other, in
+both directions — the second by way of the renegotiation the relay does when a
+second participant arrives. If the media plane is wired up plausibly and does
+not work, that is the test that says so.
+
+Everything else about voice is frames, and `voice_test.go` covers it: election
+and handover, the mute pairs, the permissions on moderation, and the
+reconfiguration path.
+
+There is no test of `client_host` media, and there cannot usefully be one here:
+the relaying is done by a browser forwarding somebody else's track, which is not
+something this repository contains. The server's part of that mode — electing a
+host, relaying signalling between exactly the right two peers, and starting the
+room over when the host leaves — is covered.
+
+### Ports
+
+Media does not go over port 9871. With `udp_port_min` and `udp_port_max` at zero
+the operating system picks a port per call, which is fine on a development
+machine and useless behind a firewall. Set a range when testing through one.
+
+A server whose interface holds a private address advertises that address and no
+client outside can reach it. `public_ip` is the fix, and the trade is that
+clients on the same LAN then have to hairpin through the router.
+
+The loopback candidate is offered deliberately, which is what makes a client on
+the same machine as the server work with no network at all.
 
 ---
 
@@ -217,7 +267,9 @@ go test -race ./...
 ```
 
 Linux runners have gcc already, which is what makes `-race` free there and
-awkward on Windows.
+awkward on Windows. It matters more since the audio plane landed: the relay is
+the most concurrent thing in this repository, with a goroutine per publisher
+writing to a set of subscribers that changes underneath it.
 
 ---
 

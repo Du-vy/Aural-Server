@@ -11,6 +11,7 @@ import (
 	"github.com/aural-chat/aural-server/internal/protocol"
 	"github.com/aural-chat/aural-server/internal/store"
 	"github.com/aural-chat/aural-server/internal/uploads"
+	"github.com/aural-chat/aural-server/internal/voice"
 )
 
 // maxChannelDepth bounds the ancestor walk so a cycle introduced by a bad write
@@ -47,18 +48,41 @@ type Hub struct {
 	everyoneID   int64
 	registeredID int64
 	adminID      int64
+
+	// The audio plane. voiceRooms holds who has media up in each voice
+	// channel, voiceEpochs counts the elections that channel has seen, and
+	// relay is the server-hosted forwarder — nil on a server that could not
+	// build one, which is the one failure that has to leave the rest working.
+	voiceMu     sync.Mutex
+	voiceRooms  map[int64]*voiceRoom
+	voiceEpochs map[int64]int64
+	relay       *voice.Relay
 }
 
 // NewHub builds a hub and primes its caches from the database. cfgPath is where
 // runtime configuration changes are written back.
 func NewHub(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Store, log *slog.Logger) (*Hub, error) {
 	h := &Hub{
-		cfg:      cfg,
-		cfgPath:  cfgPath,
-		st:       st,
-		log:      log,
-		sessions: map[int64]*Session{},
-		byUser:   map[int64]*Session{},
+		cfg:         cfg,
+		cfgPath:     cfgPath,
+		st:          st,
+		log:         log,
+		sessions:    map[int64]*Session{},
+		byUser:      map[int64]*Session{},
+		voiceRooms:  map[int64]*voiceRoom{},
+		voiceEpochs: map[int64]int64{},
+	}
+
+	// The relay is built whatever the mode, so that switching to server_host
+	// at runtime needs nothing but a reconfiguration. It binds no port and
+	// starts no goroutine until somebody actually calls.
+	relay, err := voice.NewRelay(relaySettings(cfg.Voice), log, h.onRelayGone)
+	if err != nil {
+		// A server that cannot relay audio is still a server. Voice reports
+		// itself as unavailable and everything else carries on.
+		log.Error("the audio plane could not be started", slog.Any("error", err))
+	} else {
+		h.relay = relay
 	}
 	if err := h.ReloadRoles(ctx); err != nil {
 		return nil, err
@@ -136,7 +160,16 @@ func (h *Hub) KlipyAPIKey() string {
 }
 
 // updateServerIdentity applies configuration updates and persists them.
-func (h *Hub) updateServerIdentity(setName bool, name string, setDescription bool, description string, setKlipy bool, klipyApiKey string) error {
+//
+// A voice change is the one that reaches further than the file: the codec
+// parameters of a live session were negotiated before it, so voiceChanged tells
+// the caller to start every room over.
+func (h *Hub) updateServerIdentity(
+	setName bool, name string,
+	setDescription bool, description string,
+	setKlipy bool, klipyApiKey string,
+	newVoice *config.Voice,
+) (voiceChanged bool, err error) {
 	h.cfgMu.Lock()
 	if setName {
 		h.cfg.Server.Name = name
@@ -147,13 +180,29 @@ func (h *Hub) updateServerIdentity(setName bool, name string, setDescription boo
 	if setKlipy {
 		h.cfg.Integrations.KlipyAPIKey = klipyApiKey
 	}
+	if newVoice != nil {
+		// The deployment half of the configuration is the machine's, not the
+		// administrator's: it is carried across rather than taken from the
+		// request, which is why the request has no fields for it.
+		newVoice.PublicIP = h.cfg.Voice.PublicIP
+		newVoice.UDPPortMin = h.cfg.Voice.UDPPortMin
+		newVoice.UDPPortMax = h.cfg.Voice.UDPPortMax
+		newVoice.ICEServers = h.cfg.Voice.ICEServers
+		voiceChanged = !h.cfg.Voice.SameAs(*newVoice)
+		h.cfg.Voice = *newVoice
+	}
 	snapshot := *h.cfg
 	h.cfgMu.Unlock()
 
-	if h.cfgPath == "" {
-		return nil
+	if voiceChanged && h.relay != nil {
+		if err := h.relay.Reconfigure(relaySettings(snapshot.Voice)); err != nil {
+			h.log.Error("reconfigure the audio plane", slog.Any("error", err))
+		}
 	}
-	return config.Save(h.cfgPath, snapshot)
+	if h.cfgPath == "" {
+		return voiceChanged, nil
+	}
+	return voiceChanged, config.Save(h.cfgPath, snapshot)
 }
 
 // --- caches -----------------------------------------------------------------

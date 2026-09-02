@@ -143,6 +143,7 @@ func (h *Hub) serverInfo() protocol.ServerInfo {
 		RegistrationEnabled: cfg.Registration.Enabled,
 		GuestsAllowed:       cfg.Registration.AllowGuests,
 		VoiceMode:           cfg.Voice.Mode,
+		Voice:               h.voiceInfo(),
 		Uploads:             h.uploadInfo(),
 		KlipyEnabled:        h.KlipyAPIKey() != "",
 	}

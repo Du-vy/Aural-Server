@@ -11,6 +11,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/aural-chat/aural-server/internal/auth"
+	"github.com/aural-chat/aural-server/internal/config"
 	"github.com/aural-chat/aural-server/internal/permissions"
 	"github.com/aural-chat/aural-server/internal/protocol"
 	"github.com/aural-chat/aural-server/internal/store"
@@ -226,6 +227,9 @@ func handleUserMove(ctx context.Context, s *Session, raw json.RawMessage) (any, 
 		if from == nil {
 			return struct{}{}, nil
 		}
+		// Audio goes first, while the channel it belongs to is still set: the
+		// voice state that announces the departure is resolved from it.
+		s.hub.leaveVoice(target, *from, false)
 		target.setChannel(nil)
 		s.hub.broadcastUserMoved(target.UserID(), from, nil)
 		return struct{}{}, nil
@@ -265,6 +269,9 @@ func handleUserMove(ctx context.Context, s *Session, raw json.RawMessage) (any, 
 		}
 	}
 
+	if from != nil {
+		s.hub.leaveVoice(target, *from, false)
+	}
 	target.setChannel(&destID)
 	s.hub.broadcastUserMoved(target.UserID(), from, &destID)
 	return struct{}{}, nil
@@ -364,7 +371,7 @@ func handleServerUpdate(_ context.Context, s *Session, raw json.RawMessage) (any
 	if !base.Has(permissions.ManageServer) {
 		return nil, protocol.Errorf(protocol.ErrForbidden, "you are not allowed to manage this server")
 	}
-	if req.Name == nil && req.Description == nil && req.KlipyAPIKey == nil {
+	if req.Name == nil && req.Description == nil && req.KlipyAPIKey == nil && req.Voice == nil {
 		return nil, protocol.Errorf(protocol.ErrBadRequest, "nothing to update")
 	}
 
@@ -391,12 +398,47 @@ func handleServerUpdate(_ context.Context, s *Session, raw json.RawMessage) (any
 		}
 	}
 
-	if err := s.hub.updateServerIdentity(req.Name != nil, name, req.Description != nil, description, req.KlipyAPIKey != nil, klipyApiKey); err != nil {
+	var newVoice *config.Voice
+	if req.Voice != nil {
+		current := s.hub.voiceConfig()
+		current.Enabled = req.Voice.Enabled
+		current.Mode = req.Voice.Mode
+		current.SampleRate = req.Voice.SampleRate
+		current.Bitrate = req.Voice.Bitrate
+		current.MinBitrate = req.Voice.MinBitrate
+		current.MaxBitrate = req.Voice.MaxBitrate
+		current.FEC = req.Voice.FEC
+		current.DTX = req.Voice.DTX
+		current.Stereo = req.Voice.Stereo
+		current.MaxParticipants = req.Voice.MaxParticipants
+		// The same rules the configuration file goes through, so a setting that
+		// would not survive a restart cannot be reached from a client either.
+		if err := current.Validate(); err != nil {
+			return nil, protocol.Errorf(protocol.ErrBadRequest, err.Error())
+		}
+		newVoice = &current
+	}
+
+	voiceChanged, err := s.hub.updateServerIdentity(
+		req.Name != nil, name,
+		req.Description != nil, description,
+		req.KlipyAPIKey != nil, klipyApiKey,
+		newVoice,
+	)
+	if err != nil {
 		return nil, internalError(s, "save the configuration", err)
 	}
 
 	info := s.hub.serverInfo()
 	s.hub.Broadcast(protocol.Event(protocol.EvServerUpdated, protocol.ServerUpdatedEvent{Server: info}))
+
+	if voiceChanged {
+		// The Opus parameters live in SDP that was negotiated before this, and
+		// there is no way to edit that in place. Everybody starts over, which
+		// is a second of silence and the same path a host handover takes.
+		s.hub.resetAllVoice(protocol.ResetConfigChanged)
+		s.log.Info("audio plane reconfigured", slog.Int64("by", s.UserID()))
+	}
 	return protocol.ServerUpdatedEvent{Server: info}, nil
 }
 

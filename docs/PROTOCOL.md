@@ -390,7 +390,7 @@ Every op below needs an authenticated session.
 | Op | Permission | Notes |
 | --- | --- | --- |
 | `server.claimAdmin` | — | Redeems the one-time owner token. |
-| `server.update` | `ManageServer` | `{ name?, description? }`. Persisted to the configuration file. |
+| `server.update` | `ManageServer` | `{ name?, description?, klipyApiKey?, voice? }`. Persisted to the configuration file. `voice` replaces the audio plane whole and restarts every call. |
 | `user.update` | `ChangeNickname`, or `ManageNicknames` for others | `{ userId?, nickname }`. |
 | `user.move` | `Connect` on the destination; `MoveUsers` for others | `{ userId?, channelId }`. `channelId: null` leaves. |
 | `user.kick` | `KickUsers` | `{ userId, reason? }`. Disconnects; there are no bans in v0.1. |
@@ -406,6 +406,7 @@ Every op below needs an authenticated session.
 | `role.update` | `ManageRoles` | `{ roleId, name?, color?, permissions?, position?, hoist? }`. |
 | `role.delete` | `ManageRoles` | `{ roleId }`. Managed roles cannot be deleted. |
 | `role.assign` / `role.unassign` | `ManageRoles` | `{ userId, roleId }`. The target may be offline. |
+| `voice.*` | See [Voice](#voice) | The audio plane. |
 
 Three notes on messages:
 
@@ -431,8 +432,160 @@ Two notes on `user.move`:
 
 - Only **voice** channels can be joined. Text channels carry no presence and are
   selected client side.
+- Leaving a voice channel closes the media session in it, whether the caller
+  left or a moderator moved them. There is no way to keep audio open in a
+  channel you are not in.
 - `parentId` in `channel.update` is three-valued: absent leaves the parent alone,
   `null` detaches the channel to the root, and a number reparents it.
+
+## Voice
+
+Audio never travels on the WebSocket. That socket carries signalling — offers,
+answers and ICE candidates — and the audio itself goes over WebRTC as Opus,
+encoded by the sender and decoded by the receiver. Nothing in between decodes
+anything, which is why a server that relays a call still needs no codec.
+
+Sitting in a voice channel and holding a live audio session are two different
+things, and every op below depends on the distinction:
+
+- **Being in the channel** is presence. It is `user.move`, it has worked that
+  way since v0.1, and it is what `User.channelId` reports.
+- **Having audio** is a media session on top of it. It is `voice.connect`, and
+  somebody with no microphone, or whose media never came up, is a full member of
+  the channel with `connected: false`.
+
+### Hosting modes
+
+`ServerInfo.voice.mode` says which of the two a server runs. The signalling is
+the same either way; only the peer on the far end differs.
+
+**`server_host`** — the server relays. One peer connection carries the client's
+audio up and everybody else's back down, each on its own track. It needs nothing
+of the client beyond a working WebRTC stack, and no NAT traversal beyond
+reaching the server, which the client has already done. It costs the operator
+upstream bandwidth for every listener in every call.
+
+**`client_host`** — the first participant to open a media session relays. It
+holds one connection per other participant, plays what arrives and forwards each
+person's track on to the others. It costs the server nothing. It needs a STUN
+server, and usually a TURN server, in `voice.ice_servers`, because both ends are
+behind somebody's router. When the relaying client leaves, the room is emptied
+and everybody opens a new session; whoever gets there first hosts the next one.
+
+### Signalling
+
+| Op | Permission | Notes |
+| --- | --- | --- |
+| `voice.connect` | Already in the channel | `{ channelId, sdp? }`. `sdp` is the caller's offer in `server_host` and is absent in `client_host`. Rate limited. |
+| `voice.leave` | — | Closes the media session without leaving the channel. |
+| `voice.signal` | — | `{ targetId, kind, sdp?, candidate?, tracks? }`. Rate limited. |
+| `voice.state` | — | `{ selfMute?, selfDeaf? }`. Absent fields are left alone. |
+| `voice.moderate` | `MuteUsers` / `DeafenUsers`, and rank | `{ userId, mute?, deaf? }`. |
+| `voice.speaking` | — | `{ speaking }`. Transitions only. Rate limited. |
+
+`voice.connect` replies with `{ channelId, mode, sdp?, hostUserId?, hostEpoch?,
+iceServers, voice, participants }`. In `server_host` the `sdp` is the server's
+answer and the session is live. In `client_host` there is no answer: the reply
+names the host, and either this client is it — in which case it waits to be told
+who to dial — or it waits for that host's offer.
+
+`targetId` on `voice.signal` is `0` for the server's own relay, which is the
+only target `server_host` accepts. In `client_host` a frame may only travel
+between a participant and the channel's host: the topology is a star, and a
+client signalling a third party is trying to build something the server has not
+agreed to carry.
+
+`kind` is `offer`, `answer`, `candidate` or `end`. **Exactly one side of any
+link offers**: the relay in `server_host`, the elected host in `client_host`.
+There is no glare to resolve because there is never a second offerer.
+
+`tracks` maps an SDP media id to the user whose audio it carries, and travels
+with an offer in `client_host` only. The server-hosted relay needs none of it —
+it names each participant in the stream id, as `av-<userId>` — but a relaying
+browser cannot rename somebody else's track, so the host says which media id is
+whose. The server passes the map along without reading it.
+
+**A client must hold signalling it is not ready for rather than discard it.**
+The relay starts gathering candidates the moment it has an answer, so its first
+candidates can reach a client before the `voice.connect` reply does: both travel
+on the same socket and the reply is sent last. The same race exists between two
+peers in `client_host`.
+
+### Voice state
+
+`VoiceState` is `{ userId, channelId, connected, selfMute, selfDeaf, mute, deaf,
+host }`, and one arrives in `ready.voiceStates` for every participant of every
+voice channel the caller may see.
+
+The mute flags come in pairs because they have different owners. `selfMute` is
+the participant's own choice and theirs to undo; `mute` was imposed by a
+moderator, or by not holding `Speak`, and is not. Unmuting yourself must not
+undo somebody else's mute, which one flag could not express. Deafening implies
+muting in both pairs.
+
+In `server_host` a mute is enforced by the relay dropping what that participant
+sends, so it holds whatever the client does. In `client_host` there is no relay
+to enforce it: the host is told, through the same `voice.state` event everybody
+receives, and a host running modified code could ignore it. That is a real
+difference between the modes and is worth knowing before choosing one.
+
+### Events
+
+| Event | Payload | Sent to |
+| --- | --- | --- |
+| `voice.state` | `{ state }` | Everyone who may see the channel. |
+| `voice.speaking` | `{ userId, channelId, speaking }` | Everyone who may see the channel. |
+| `voice.signal` | `{ fromUserId, channelId, kind, sdp?, candidate?, tracks? }` | The addressed client. `fromUserId` is `0` for the relay. |
+| `voice.peer` | `{ channelId, userId, action, epoch }` | The host of a `client_host` channel, and nobody else. |
+| `voice.host` | `{ channelId, hostUserId, epoch }` | Everyone who may see the channel. |
+| `voice.reset` | `{ channelId, reason }` | Whoever must start over. |
+
+`voice.reset` is not an error. It is the single way back from everything: a host
+handover (`host_changed`), an audio plane an administrator reconfigured
+(`config_changed`), a transport that gave up (`failed`), and voice being
+switched off (`disabled`). A client receiving one tears its media down and calls
+`voice.connect` again. Making recovery the same path as an ordinary call is what
+makes it a path that works.
+
+`epoch` increments on every election, so a client can drop signalling that
+belongs to a host it has already moved past.
+
+### Codec
+
+Opus, always, at a 48 kHz clock. `ServerInfo.voice` carries what the server will
+accept before anything is negotiated:
+
+```jsonc
+{
+  "enabled": true,
+  "mode": "server_host",
+  "sampleRate": 48000,     // maxplaybackrate; Opus's clock is always 48 kHz
+  "bitrate": 64000,        // where a client starts
+  "minBitrate": 16000,     // and the range it may move within
+  "maxBitrate": 128000,
+  "fec": true,             // useinbandfec
+  "dtx": false,            // usedtx
+  "stereo": false,
+  "maxParticipants": 0     // 0 leaves the ceiling to the channel's user limit
+}
+```
+
+`sampleRate` is the `maxplaybackrate` hint, and its permitted values are the
+rates Opus actually encodes at: 8000, 12000, 16000, 24000 and 48000. **44100 is
+not one of them.** Opus resamples internally to the nearest of these, so naming
+44100 would ask for something the codec would silently not do; the server
+refuses it rather than accepting it and doing something else.
+
+`ServerInfo` carries no ICE servers, because `GET /info` is unauthenticated and
+a TURN credential has no business being public. They travel in `ready` and in
+the `voice.connect` reply, both of which are behind an identity.
+
+### Errors
+
+| Code | Meaning |
+| --- | --- |
+| `voice_disabled` | This server carries no audio. |
+| `voice_failed` | The media session could not be set up. |
 
 ## Search
 
@@ -580,6 +733,7 @@ They default to 50 MiB and 5 GiB.
 | `message.deleted` | `{ messageId, channelId }` | Everyone who may see the channel. |
 | `role.created` / `role.updated` / `role.deleted` | `{ role }` / `{ roleId }` | Everyone. |
 | `server.updated` | `{ server }` | Everyone. |
+| `voice.*` | See [Voice](#voice) | The audio plane. |
 
 When a permission change could add or remove channels from what somebody is
 allowed to see, the affected clients receive a fresh `ready` event rather than a
@@ -600,7 +754,10 @@ refresh is worth.
 
 ## Not in version 1
 
-The media plane. `server.voiceMode` already advertises which of the two hosting
-models a server uses — `client_host`, where the first user in a channel relays
-its audio, or `server_host`, where the server does — but no signalling op exists
-yet. Adding it will bump the protocol version.
+Bans, per-user permission overwrites, and screen sharing. Video would reuse the
+whole of [Voice](#voice) — the signalling is codec-agnostic — and needs a
+second track and a way to say which is which.
+
+Voice states are not persisted, for the same reason channel membership is not:
+a mute belongs to a session. An identity that reconnects arrives unmuted, and a
+moderator's mute has to be applied again.

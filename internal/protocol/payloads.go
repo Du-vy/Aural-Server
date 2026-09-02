@@ -7,8 +7,8 @@ const (
 	ChannelVoice    = "voice"
 )
 
-// Voice hosting modes a server can advertise. Only the mode is exchanged in
-// v1; the media plane itself lands in a later protocol revision.
+// Voice hosting modes a server can advertise. They differ only in who relays:
+// the wire format of the audio plane is the same either way.
 const (
 	VoiceModeClientHost = "client_host" // the first user in a channel relays its audio
 	VoiceModeServerHost = "server_host" // the server relays all audio
@@ -27,17 +27,20 @@ const (
 // WebSocket (in Hello) and over plain HTTP at GET /info, so a client can preview
 // a server before connecting to it.
 type ServerInfo struct {
-	Name                string  `json:"name"`
-	Description         string  `json:"description"`
-	ProtocolVersion     int     `json:"protocolVersion"`
-	SoftwareVersion     string  `json:"softwareVersion"`
-	MaxUsers            int     `json:"maxUsers"`
-	OnlineUsers         int     `json:"onlineUsers"`
-	PasswordProtected   bool    `json:"passwordProtected"`
-	RegistrationEnabled bool    `json:"registrationEnabled"`
-	GuestsAllowed       bool    `json:"guestsAllowed"`
-	VoiceMode           string  `json:"voiceMode"`
-	Uploads             Uploads `json:"uploads"`
+	Name                string `json:"name"`
+	Description         string `json:"description"`
+	ProtocolVersion     int    `json:"protocolVersion"`
+	SoftwareVersion     string `json:"softwareVersion"`
+	MaxUsers            int    `json:"maxUsers"`
+	OnlineUsers         int    `json:"onlineUsers"`
+	PasswordProtected   bool   `json:"passwordProtected"`
+	RegistrationEnabled bool   `json:"registrationEnabled"`
+	GuestsAllowed       bool   `json:"guestsAllowed"`
+	// VoiceMode is kept alongside Voice because it has been in this frame since
+	// v0.1 and a client older than the audio plane still reads it.
+	VoiceMode string  `json:"voiceMode"`
+	Voice     Voice   `json:"voice"`
+	Uploads   Uploads `json:"uploads"`
 	// KlipyEnabled reports that this server holds a Klipy credential and will
 	// proxy GIF and sticker lookups. The credential itself never leaves the
 	// server: it is the operator's, not the client's, and this preview is
@@ -64,6 +67,95 @@ type Uploads struct {
 	// MaxPerMessage caps how many files one message may carry.
 	MaxPerMessage int `json:"maxPerMessage"`
 }
+
+// Voice is what a client is told about the audio plane before it opens a
+// session, so it can configure its encoder once rather than discover the
+// server's limits by being refused.
+//
+// It carries no ICE servers. Those may hold TURN credentials, and this
+// structure travels in the unauthenticated server preview at GET /info; they
+// are handed out in the reply to voice.connect instead, which is behind an
+// identity.
+type Voice struct {
+	Enabled bool   `json:"enabled"`
+	Mode    string `json:"mode"`
+	// SampleRate is the highest rate the encoder is asked for, in hertz. Opus
+	// always runs on a 48 kHz clock, so this is a ceiling on quality rather
+	// than a change of clock.
+	SampleRate int `json:"sampleRate"`
+	// Bitrate is where a client starts; MinBitrate and MaxBitrate bound where
+	// it may go. All three are bits per second.
+	Bitrate    int  `json:"bitrate"`
+	MinBitrate int  `json:"minBitrate"`
+	MaxBitrate int  `json:"maxBitrate"`
+	FEC        bool `json:"fec"`
+	DTX        bool `json:"dtx"`
+	Stereo     bool `json:"stereo"`
+	// MaxParticipants caps live audio sessions in one channel. Zero leaves it
+	// to the channel's own user limit.
+	MaxParticipants int `json:"maxParticipants"`
+}
+
+// ICEServer is one STUN or TURN server, in the shape RTCConfiguration expects.
+type ICEServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
+// ICECandidate is one trickled ICE candidate, field for field as the browser
+// serialises RTCIceCandidate.
+type ICECandidate struct {
+	Candidate        string  `json:"candidate"`
+	SDPMid           *string `json:"sdpMid,omitempty"`
+	SDPMLineIndex    *uint16 `json:"sdpMLineIndex,omitempty"`
+	UsernameFragment *string `json:"usernameFragment,omitempty"`
+}
+
+// Signalling frame kinds carried by voice.signal.
+const (
+	SignalOffer     = "offer"
+	SignalAnswer    = "answer"
+	SignalCandidate = "candidate"
+	// SignalEnd says the sender has finished trickling candidates, which lets
+	// the far end stop waiting for a path that is not coming.
+	SignalEnd = "end"
+)
+
+// ServerPeer is the target id that addresses the server's own relay rather
+// than another client. It cannot collide with a user: identities start at 1.
+const ServerPeer int64 = 0
+
+// VoiceState is what everybody in a channel is told about one participant.
+//
+// Sitting in a voice channel and holding a live audio session are two different
+// things: a client with no microphone, or one whose media never came up, is a
+// member of the channel with Connected false. Presence is user.move; this is
+// the audio on top of it.
+type VoiceState struct {
+	UserID    int64 `json:"userId"`
+	ChannelID int64 `json:"channelId"`
+	Connected bool  `json:"connected"`
+	// SelfMute and SelfDeaf are the participant's own choices.
+	SelfMute bool `json:"selfMute"`
+	SelfDeaf bool `json:"selfDeaf"`
+	// Mute and Deaf are imposed by a moderator, or by lacking Speak. They are
+	// separate from the self flags because unmuting yourself must not undo
+	// being muted by somebody else.
+	Mute bool `json:"mute"`
+	Deaf bool `json:"deaf"`
+	// Host reports that this participant relays the channel, which only ever
+	// happens in client_host mode.
+	Host bool `json:"host"`
+}
+
+// Muted reports whether any reason to stop this participant transmitting
+// applies, which is the only question a renderer or a relay ever asks.
+func (v VoiceState) Muted() bool { return v.SelfMute || v.Mute }
+
+// Deafened reports the same for receiving. Deafening implies muting, exactly
+// as it does everywhere else, because listening is why you are in the channel.
+func (v VoiceState) Deafened() bool { return v.SelfDeaf || v.Deaf }
 
 // User is a member of the server. Guests are users too: they simply have no
 // username yet.
@@ -172,6 +264,20 @@ type Ready struct {
 	Roles        []Role     `json:"roles"`
 	Permissions  string     `json:"permissions"` // resolved server-wide mask of the caller
 	Server       ServerInfo `json:"server"`
+	// ICEServers are the STUN and TURN servers this client should use.
+	//
+	// They are here rather than only in the voice.connect reply because a
+	// server-hosted session has to build its peer connection in order to
+	// produce the offer that reply answers: the configuration is needed one
+	// step before the reply that would otherwise carry it. This snapshot is
+	// authenticated, which is the property that keeps a TURN credential out of
+	// the public preview.
+	ICEServers []ICEServer `json:"iceServers"`
+	// VoiceStates covers every participant of every voice channel the caller
+	// may see. It is a list rather than a field on User because a user has one
+	// identity and at most one voice state, and only while they are in a
+	// channel: folding it into User would put an empty object on everybody.
+	VoiceStates []VoiceState `json:"voiceStates"`
 }
 
 // --- requests ---------------------------------------------------------------
@@ -210,6 +316,28 @@ type ServerUpdateRequest struct {
 	Name        *string `json:"name,omitempty"`
 	Description *string `json:"description,omitempty"`
 	KlipyAPIKey *string `json:"klipyApiKey,omitempty"`
+	// Voice replaces the whole audio-plane configuration at once. It is not a
+	// per-field patch because the fields constrain one another - a bitrate
+	// range has to be read together to be checked - and a half-applied range
+	// is not a state worth being able to reach.
+	Voice *VoiceSettings `json:"voice,omitempty"`
+}
+
+// VoiceSettings is the part of the audio plane an administrator may change at
+// runtime. The deployment details - the public address, the port range, the
+// ICE servers - are deliberately absent: they belong to the machine, not to
+// whoever happens to hold ManageServer.
+type VoiceSettings struct {
+	Enabled         bool   `json:"enabled"`
+	Mode            string `json:"mode"`
+	SampleRate      int    `json:"sampleRate"`
+	Bitrate         int    `json:"bitrate"`
+	MinBitrate      int    `json:"minBitrate"`
+	MaxBitrate      int    `json:"maxBitrate"`
+	FEC             bool   `json:"fec"`
+	DTX             bool   `json:"dtx"`
+	Stereo          bool   `json:"stereo"`
+	MaxParticipants int    `json:"maxParticipants"`
 }
 
 type UserUpdateRequest struct {
@@ -452,4 +580,142 @@ type RoleDeletedEvent struct {
 
 type ServerUpdatedEvent struct {
 	Server ServerInfo `json:"server"`
+}
+
+// --- voice -------------------------------------------------------------------
+
+// VoiceConnectRequest opens a media session in the voice channel the caller is
+// already sitting in.
+//
+// In server_host mode SDP carries the caller's offer and the reply carries the
+// server's answer. In client_host mode it is empty: the channel's host peer is
+// the one that offers, and the reply only says who that is.
+type VoiceConnectRequest struct {
+	ChannelID int64  `json:"channelId"`
+	SDP       string `json:"sdp,omitempty"`
+}
+
+// VoiceConnectResult is everything a client needs to bring media up.
+type VoiceConnectResult struct {
+	ChannelID int64  `json:"channelId"`
+	Mode      string `json:"mode"`
+	// SDP is the server's answer in server_host mode, and empty otherwise.
+	SDP string `json:"sdp,omitempty"`
+	// HostUserID names the peer that relays this channel in client_host mode.
+	// It is the caller itself when the caller was elected, which is what tells
+	// a first arrival that it is the one everybody else will dial.
+	HostUserID *int64 `json:"hostUserId,omitempty"`
+	// HostEpoch increments on every election, so a client can drop signalling
+	// that belongs to a host that has already been replaced.
+	HostEpoch  int64       `json:"hostEpoch,omitempty"`
+	ICEServers []ICEServer `json:"iceServers"`
+	Voice      Voice       `json:"voice"`
+	// Participants is the voice state of everyone already in the channel,
+	// which saves a joining client from having to infer it from events that
+	// were sent before it was listening.
+	Participants []VoiceState `json:"participants"`
+}
+
+// VoiceSignalRequest carries one SDP or ICE frame towards a peer.
+type VoiceSignalRequest struct {
+	// TargetID is the peer this is for. ServerPeer addresses the server's own
+	// relay, which is the only target that exists in server_host mode.
+	TargetID  int64         `json:"targetId"`
+	Kind      string        `json:"kind"`
+	SDP       string        `json:"sdp,omitempty"`
+	Candidate *ICECandidate `json:"candidate,omitempty"`
+	// Tracks maps an SDP media id to the user whose audio it carries, and
+	// travels with an offer in client_host mode only.
+	//
+	// The server-hosted relay does not need it: it names each participant in
+	// the stream id it sends, and a receiver reads the identity straight off
+	// the track. A relaying client cannot do that — a browser forwarding
+	// somebody else's track has no way to rename it — so the host says which
+	// media id is whose, and the server passes it along without reading it.
+	Tracks map[string]int64 `json:"tracks,omitempty"`
+}
+
+// VoiceStateRequest sets the caller's own mute and deafen. Absent fields are
+// left alone, which is what lets a deafen toggle not disturb a mute.
+type VoiceStateRequest struct {
+	SelfMute *bool `json:"selfMute,omitempty"`
+	SelfDeaf *bool `json:"selfDeaf,omitempty"`
+}
+
+// VoiceModerateRequest mutes or deafens somebody else. It needs MuteUsers or
+// DeafenUsers, and the caller must outrank the target.
+type VoiceModerateRequest struct {
+	UserID int64 `json:"userId"`
+	Mute   *bool `json:"mute,omitempty"`
+	Deaf   *bool `json:"deaf,omitempty"`
+}
+
+// VoiceSpeakingRequest announces that the caller started or stopped speaking.
+// It is sent on transitions only: a frame per packet would be a second audio
+// stream over the control socket.
+type VoiceSpeakingRequest struct {
+	Speaking bool `json:"speaking"`
+}
+
+// VoiceStateEvent reports one participant's voice state to the channel.
+type VoiceStateEvent struct {
+	State VoiceState `json:"state"`
+}
+
+// VoiceSpeakingEvent is the same transition, fanned out to the channel.
+type VoiceSpeakingEvent struct {
+	UserID    int64 `json:"userId"`
+	ChannelID int64 `json:"channelId"`
+	Speaking  bool  `json:"speaking"`
+}
+
+// VoiceSignalEvent delivers a signalling frame. FromUserID is ServerPeer when
+// the server's own relay sent it.
+type VoiceSignalEvent struct {
+	FromUserID int64         `json:"fromUserId"`
+	ChannelID  int64         `json:"channelId"`
+	Kind       string        `json:"kind"`
+	SDP        string        `json:"sdp,omitempty"`
+	Candidate  *ICECandidate `json:"candidate,omitempty"`
+	// Tracks is the map described on VoiceSignalRequest, relayed unread.
+	Tracks map[string]int64 `json:"tracks,omitempty"`
+}
+
+// Actions a VoicePeerEvent can ask the host for.
+const (
+	PeerAdd    = "add"
+	PeerRemove = "remove"
+)
+
+// VoicePeerEvent tells the host of a client_host channel that somebody is
+// waiting to be dialled, or has gone. Only the host receives it.
+type VoicePeerEvent struct {
+	ChannelID int64  `json:"channelId"`
+	UserID    int64  `json:"userId"`
+	Action    string `json:"action"`
+	Epoch     int64  `json:"epoch"`
+}
+
+// VoiceHostEvent announces the result of an election in a client_host channel.
+// HostUserID is null when the channel has emptied.
+type VoiceHostEvent struct {
+	ChannelID  int64  `json:"channelId"`
+	HostUserID *int64 `json:"hostUserId"`
+	Epoch      int64  `json:"epoch"`
+}
+
+// Reasons a media session is reset.
+const (
+	ResetHostChanged   = "host_changed"   // the relaying peer was replaced
+	ResetConfigChanged = "config_changed" // the audio plane was reconfigured
+	ResetFailed        = "failed"         // the transport gave up
+	ResetDisabled      = "disabled"       // voice was switched off
+)
+
+// VoiceResetEvent tells a client its media session is gone and that opening a
+// new one is the way back. It is not an error: a host handover is the ordinary
+// case, and the client is expected to reconnect rather than report anything.
+type VoiceResetEvent struct {
+	ChannelID int64  `json:"channelId"`
+	Reason    string `json:"reason"`
 }

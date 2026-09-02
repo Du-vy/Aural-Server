@@ -40,7 +40,39 @@ const (
 	// what stops a script from turning that into a load generator.
 	searchBurst       = 6
 	searchesPerSecond = 1
+	// signalBurst and signalsPerSecond throttle voice signalling. ICE
+	// candidates arrive in a burst at the start of a call and then stop, so the
+	// bucket is deep and the refill is modest: it is sized to let a call be set
+	// up twice over and to stop the socket being used as a message bus.
+	signalBurst      = 96
+	signalsPerSecond = 12
+	// speakingBurst and speakingPerSecond throttle the speaking indicator,
+	// which is the one voice frame a client sends continuously. Two transitions
+	// a second is faster than speech alternates; the burst covers a stutter.
+	speakingBurst     = 12
+	speakingPerSecond = 2
 )
+
+// sessionVoice is the audio half of a session's state.
+//
+// channelID is the channel a media session is open in, and is zero when there
+// is none. It is held separately from the session's channel because the two
+// genuinely differ: somebody in a voice channel with no microphone sits in the
+// channel with no media session at all.
+//
+// The mute and deafen flags come in pairs because they have different owners.
+// selfMute is the participant's own choice and is theirs to undo; mute is
+// imposed by a moderator and is not. Folding them into one flag would let
+// unmuting yourself undo being muted by somebody else.
+type sessionVoice struct {
+	channelID int64
+	connected bool
+	selfMute  bool
+	selfDeaf  bool
+	mute      bool
+	deaf      bool
+	speaking  bool
+}
 
 // Session is one client connection and the identity behind it.
 type Session struct {
@@ -57,6 +89,10 @@ type Session struct {
 	// searches throttles searching, which costs far more per request than
 	// anything else a client can ask for.
 	searches *rateLimiter
+	// signals and speaking throttle the two voice ops a client sends without
+	// being asked to.
+	signals  *rateLimiter
+	speaking *rateLimiter
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -69,6 +105,7 @@ type Session struct {
 	channelID   *int64
 	tokenHash   string
 	authAttempt int
+	voice       sessionVoice
 }
 
 func newSession(id int64, hub *Hub, conn *websocket.Conn, log *slog.Logger) *Session {
@@ -81,6 +118,8 @@ func newSession(id int64, hub *Hub, conn *websocket.Conn, log *slog.Logger) *Ses
 		closed:   make(chan struct{}),
 		messages: newRateLimiter(messageBurst, messagesPerSecond),
 		searches: newRateLimiter(searchBurst, searchesPerSecond),
+		signals:  newRateLimiter(signalBurst, signalsPerSecond),
+		speaking: newRateLimiter(speakingBurst, speakingPerSecond),
 	}
 }
 
@@ -129,6 +168,106 @@ func (s *Session) setChannel(id *int64) {
 	s.mu.Lock()
 	s.channelID = id
 	s.mu.Unlock()
+}
+
+// --- voice ------------------------------------------------------------------
+
+// voiceSnapshot copies the audio half of the session.
+func (s *Session) voiceSnapshot() sessionVoice {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.voice
+}
+
+// openVoiceSession records that media is up in a channel. It returns false when
+// a session was already open in a different channel, which cannot happen from a
+// well-behaved client and must not be allowed to leave two rooms believing they
+// hold the same person.
+func (s *Session) openVoiceSession(channelID int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.voice.connected && s.voice.channelID != channelID {
+		return false
+	}
+	s.voice.channelID = channelID
+	s.voice.connected = true
+	return true
+}
+
+// clearVoiceSession closes the media session in a channel and reports whether
+// there was one. Passing zero closes whichever session is open.
+//
+// The moderated mute and deafen flags survive it: they belong to the identity
+// for as long as it is connected, and leaving a channel is not an appeal.
+func (s *Session) clearVoiceSession(channelID int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.voice.connected {
+		return false
+	}
+	if channelID != 0 && s.voice.channelID != channelID {
+		return false
+	}
+	s.voice.channelID = 0
+	s.voice.connected = false
+	s.voice.speaking = false
+	return true
+}
+
+// voiceChannel is the channel a media session is open in, or zero.
+func (s *Session) voiceChannel() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.voice.connected {
+		return 0
+	}
+	return s.voice.channelID
+}
+
+// setSelfVoice applies the participant's own mute and deafen. Deafening mutes
+// as well: a channel you cannot hear is one there is no point talking into,
+// and every other client works that way.
+func (s *Session) setSelfVoice(mute, deaf *bool) sessionVoice {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if mute != nil {
+		s.voice.selfMute = *mute
+	}
+	if deaf != nil {
+		s.voice.selfDeaf = *deaf
+		if *deaf {
+			s.voice.selfMute = true
+		}
+	}
+	return s.voice
+}
+
+// setModeratedVoice applies a moderator's mute and deafen.
+func (s *Session) setModeratedVoice(mute, deaf *bool) sessionVoice {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if mute != nil {
+		s.voice.mute = *mute
+	}
+	if deaf != nil {
+		s.voice.deaf = *deaf
+		if *deaf {
+			s.voice.mute = true
+		}
+	}
+	return s.voice
+}
+
+// setSpeaking records a speaking transition and reports whether it was one.
+// A client that repeats itself is answered without a broadcast.
+func (s *Session) setSpeaking(speaking bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.voice.speaking == speaking {
+		return false
+	}
+	s.voice.speaking = speaking
+	return true
 }
 
 func (s *Session) setUser(u store.User) {
@@ -356,4 +495,11 @@ var routes = map[string]route{
 	protocol.OpRoleDelete:   {needsAuth: true, fn: handleRoleDelete},
 	protocol.OpRoleAssign:   {needsAuth: true, fn: handleRoleAssign},
 	protocol.OpRoleUnassign: {needsAuth: true, fn: handleRoleUnassign},
+
+	protocol.OpVoiceConnect:  {needsAuth: true, fn: handleVoiceConnect},
+	protocol.OpVoiceLeave:    {needsAuth: true, fn: handleVoiceLeave},
+	protocol.OpVoiceSignal:   {needsAuth: true, fn: handleVoiceSignal},
+	protocol.OpVoiceState:    {needsAuth: true, fn: handleVoiceState},
+	protocol.OpVoiceModerate: {needsAuth: true, fn: handleVoiceModerate},
+	protocol.OpVoiceSpeaking: {needsAuth: true, fn: handleVoiceSpeaking},
 }

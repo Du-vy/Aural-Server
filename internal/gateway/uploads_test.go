@@ -518,4 +518,3 @@ func TestAvatarAndBannerUploads(t *testing.T) {
 	}
 	resBad.Body.Close()
 }
-
