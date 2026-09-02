@@ -301,7 +301,7 @@ channel never leaks through the presence list.
   "name": "Aural Server",
   "description": "",
   "protocolVersion": 1,
-  "softwareVersion": "0.1.0",
+  "softwareVersion": "0.5.0",
   "maxUsers": 64,
   "onlineUsers": 3,
   "passwordProtected": false,
