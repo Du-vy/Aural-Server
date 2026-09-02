@@ -33,8 +33,7 @@ if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) {
   process.exit(1);
 }
 
-const cleanVersion = version.replace(/^v/, "");
-const tag = `v${cleanVersion}`;
-
-console.log(`version=${cleanVersion}`);
-console.log(`tag=${tag}`);
+// The regex above already rejects a leading `v`, so the version is the bare
+// number and the tag is that number with the prefix this repo tags with.
+console.log(`version=${version}`);
+console.log(`tag=v${version}`);

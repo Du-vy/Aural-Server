@@ -21,11 +21,11 @@ on:
       release_type:
         description: "How to leave the release when builds finish"
         type: choice
-        default: published
+        default: draft
         options:
-          - published   # public, marked as the latest release
           - draft       # created, visible only to maintainers until published by hand
           - prerelease  # public, flagged as a prerelease
+          - published   # public, marked as the latest release
       dry_run:
         description: "Build only - attach archives to this workflow run, create no tag, release or public image"
         type: boolean
@@ -81,9 +81,6 @@ jobs:
 
       - name: Resolve version from buildinfo
         id: version
-        env:
-          RELEASE_TYPE: ${{ inputs.release_type }}
-          DRY_RUN: ${{ inputs.dry_run }}
         run: node .github/scripts/resolve-version.mjs >> "$GITHUB_OUTPUT"
 
       - name: Refuse a tag that already exists
@@ -188,7 +185,9 @@ jobs:
           cp config.example.json dist/staging/
           cp README.md dist/staging/
           cp LICENSE dist/staging/
-          if [ -f run.bat ]; then
+          # A Windows convenience script has no business in a tarball for
+          # Linux, macOS or FreeBSD.
+          if [ "$FORMAT" = "zip" ] && [ -f run.bat ]; then
             cp run.bat dist/staging/
           fi
 
@@ -235,16 +234,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub (optional)
-        if: ${{ !inputs.dry_run && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        uses: docker/login-action@v3
-        with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
-
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -274,10 +263,21 @@ jobs:
   # ---------------------------------------------------------------------------
   # 4. Publish Release: Downloads all archives, calculates checksums, and creates
   # the release in one atomic step (no API race conditions or tag lookup failures).
+  #
+  # The archives and the container image are separate deliverables, so this waits
+  # for the image but does not require it. A plain `needs` on build-docker meant
+  # a QEMU hiccup on one of three platforms silently skipped this job, and a
+  # skipped job is grey in the UI, not red: the release simply never appeared and
+  # nothing said why. The archives are what this job publishes; if they built,
+  # they ship, and the notes below drop the container section instead.
   # ---------------------------------------------------------------------------
   publish-release:
     name: Publish Release
     needs: [checks, build-binaries, build-docker]
+    if: >-
+      ${{ !cancelled()
+      && needs.checks.result == 'success'
+      && needs.build-binaries.result == 'success' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
@@ -299,6 +299,7 @@ jobs:
       - name: Prepare release notes
         env:
           VERSION: ${{ needs.checks.outputs.version }}
+          DOCKER_RESULT: ${{ needs.build-docker.result }}
         run: |
           REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           cat <<EOF > release_notes.md
@@ -320,6 +321,11 @@ jobs:
           | FreeBSD | x86_64 (amd64) | \`aural-server-${VERSION}-freebsd-amd64.tar.gz\` |
 
           Verify file integrity with \`checksums.txt\` (SHA-256).
+          EOF
+
+          # Only advertise the image when it actually reached the registry.
+          if [ "$DOCKER_RESULT" = "success" ]; then
+            cat <<EOF >> release_notes.md
 
           ### Docker Container
 
@@ -335,6 +341,9 @@ jobs:
           docker compose logs -f
           \`\`\`
           EOF
+          else
+            echo "::warning::The container image did not publish (build-docker: $DOCKER_RESULT). The release ships the archives only, and its notes omit the Docker section."
+          fi
 
       - name: Create GitHub Release with all assets
         if: ${{ !inputs.dry_run }}
