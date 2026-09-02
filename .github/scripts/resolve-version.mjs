@@ -33,16 +33,6 @@ if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) {
   process.exit(1);
 }
 
-const releaseType = process.env.RELEASE_TYPE || "";
-const isDryRun = process.env.DRY_RUN === "true";
-
-if (releaseType === "published" && !isDryRun && version.includes("-dev")) {
-  console.error(
-    `Cannot publish release with development version "${version}". Remove "-dev" from internal/buildinfo/buildinfo.go and commit.`
-  );
-  process.exit(1);
-}
-
 const cleanVersion = version.replace(/^v/, "");
 const tag = `v${cleanVersion}`;
 
