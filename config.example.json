@@ -30,8 +30,8 @@
     "stereo": false,
     "max_participants": 0,
     "public_ip": "",
-    "udp_port_min": 0,
-    "udp_port_max": 0,
+    "udp_port_min": 40000,
+    "udp_port_max": 40100,
     "ice_servers": []
   },
   "uploads": {

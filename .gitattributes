@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts keep LF endings even on a Windows checkout: a CRLF entrypoint
+# copied into a Linux image fails to start, and the error names the shebang
+# rather than the line ending.
+*.sh text eol=lf

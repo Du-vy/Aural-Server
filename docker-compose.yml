@@ -8,7 +8,7 @@
 # generated inside the `./data` directory. Check the logs to copy the owner token.
 #
 # To issue a replacement owner token:
-#   docker compose exec aural aural-server -new-owner-token -config /data/config.json
+#   docker compose exec aural docker-entrypoint.sh -new-owner-token -config /data/config.json
 
 services:
   aural:
@@ -23,7 +23,10 @@ services:
     ports:
       # HTTP and WebSocket API / Signalling
       - "9871:9871"
-      # WebRTC Voice Media (UDP). Matches default or configured range in config.json:
+      # WebRTC Voice Media (UDP). A fresh config.json leaves the range empty,
+      # which makes the server bind media to ephemeral ports that this mapping
+      # does not cover. Publishing a fixed range means pinning the same one in
+      # config.json, then restarting:
       # "voice": { "udp_port_min": 40000, "udp_port_max": 40100 }
       - "40000-40100:40000-40100/udp"
     volumes:
@@ -31,6 +34,12 @@ services:
       - ./data:/data
     environment:
       - TZ=UTC
+      # The uid:gid the server runs as, and the owner the container gives the
+      # data directory on startup. Change them to match a host user that
+      # already owns ./data; the defaults are fine for a directory Docker
+      # creates itself.
+      - PUID=10001
+      - PGID=10001
 
     # WebRTC Note for Linux Hosts:
     # If running on a dedicated Linux host or VPS, you may prefer host networking

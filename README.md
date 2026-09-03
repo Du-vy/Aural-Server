@@ -71,8 +71,19 @@ docker run -d \
 All persistent data (`config.json`, `aural.db`, `uploads/`, `acme/`) is stored inside the `/data` volume. To issue a new owner token via Docker:
 
 ```sh
-docker compose exec aural aural-server -new-owner-token -config /data/config.json
+docker compose exec aural docker-entrypoint.sh -new-owner-token -config /data/config.json
 ```
+
+The server runs as an unprivileged user, and the container takes ownership of
+`/data` on startup so that a bind-mounted host directory works without any
+preparation. Set `PUID` and `PGID` to run as some other uid/gid — a host user
+that already owns the directory, say. Starting the container with an explicit
+`--user` skips that step entirely, in which case the directory has to be owned
+by that user beforehand.
+
+Voice media uses ephemeral UDP ports until `voice.udp_port_min` and
+`voice.udp_port_max` are set, so a published port range only carries traffic
+once the same range is pinned in `config.json`.
 
 ### Flags
 
