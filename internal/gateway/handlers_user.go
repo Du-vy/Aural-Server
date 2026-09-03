@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/coder/websocket"
 
@@ -312,9 +313,10 @@ func handleUserMove(ctx context.Context, s *Session, raw json.RawMessage) (any, 
 	return struct{}{}, nil
 }
 
-// handleUserKick disconnects a user. Without bans in v0.1 this is a boot, not a
-// block: the user may reconnect immediately.
-func handleUserKick(_ context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
+// handleUserKick disconnects a user and revokes their membership.
+// Supports both online and offline users, logs the kick to the database with
+// reason, and optionally purges message history according to DeleteMessages.
+func handleUserKick(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
 	req, failure := decode[protocol.UserKickRequest](raw)
 	if failure != nil {
 		return nil, failure
@@ -328,24 +330,101 @@ func handleUserKick(_ context.Context, s *Session, raw json.RawMessage) (any, *p
 		return nil, protocol.Errorf(protocol.ErrBadRequest, "you cannot kick yourself")
 	}
 
-	target, ok := s.hub.SessionForUser(req.UserID)
-	if !ok {
-		return nil, protocol.Errorf(protocol.ErrNotFound, "that user is not connected")
-	}
-	if failure := s.hub.requireOutranks(s, req.UserID); failure != nil {
+	// 1. Check role hierarchy (works for both online and offline users)
+	if failure := s.hub.requireOutranksUser(ctx, s, req.UserID); failure != nil {
 		return nil, failure
+	}
+
+	// 2. Fetch target user info (from live session or database)
+	var targetNickname string
+	var targetUsername *string
+	targetSession, online := s.hub.SessionForUser(req.UserID)
+	if online {
+		targetUser := targetSession.User()
+		targetNickname = targetUser.Nickname
+		targetUsername = targetUser.Username
+	} else {
+		u, err := s.hub.st.UserByID(ctx, req.UserID)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, protocol.Errorf(protocol.ErrNotFound, "that user does not exist")
+		}
+		if err != nil {
+			return nil, protocol.Errorf(protocol.ErrInternal, "failed to fetch user")
+		}
+		targetNickname = u.Nickname
+		targetUsername = u.Username
 	}
 
 	reason := cleanText(req.Reason)
 	if reason == "" {
 		reason = "kicked"
 	}
+
+	actorNickname := s.User().Nickname
+	actorID := s.UserID()
+	targetID := req.UserID
+
+	// 3. Record kick in database
+	deleteMode := req.DeleteMessages
+	if deleteMode == "" {
+		deleteMode = "none"
+	}
+	_ = s.hub.st.RecordKick(ctx, store.KickRecord{
+		UserID:          &targetID,
+		UserNickname:    targetNickname,
+		UserUsername:    targetUsername,
+		ActorID:         &actorID,
+		ActorNickname:   actorNickname,
+		Reason:          reason,
+		DeletedMessages: deleteMode,
+		CreatedAt:       time.Now().Unix(),
+	})
+
+	// 4. Optionally purge message history
+	var cutoff int64 = -1
+	switch deleteMode {
+	case "1d", "24h":
+		cutoff = time.Now().Unix() - 24*3600
+	case "7d":
+		cutoff = time.Now().Unix() - 7*24*3600
+	case "30d", "1m":
+		cutoff = time.Now().Unix() - 30*24*3600
+	case "all":
+		cutoff = 0
+	}
+
+	if cutoff >= 0 {
+		deletedTargets, err := s.hub.st.DeleteMessagesByUser(ctx, req.UserID, cutoff)
+		if err == nil && len(deletedTargets) > 0 {
+			for _, dt := range deletedTargets {
+				event := protocol.MessageDeletedEvent{MessageID: dt.ID, ChannelID: dt.ChannelID}
+				s.hub.BroadcastChannelEvent(protocol.Event(protocol.EvMessageDeleted, event), dt.ChannelID)
+			}
+		}
+	}
+
 	s.log.Info("user kicked",
 		slog.Int64("by", s.UserID()),
 		slog.Int64("user", req.UserID),
-		slog.String("reason", reason))
+		slog.String("reason", reason),
+		slog.String("delete_messages", deleteMode),
+		slog.Bool("online", online))
 
-	go target.Close(websocket.StatusPolicyViolation, reason)
+	// 5. If user is online, disconnect their live session
+	if online && targetSession != nil {
+		go targetSession.Close(websocket.StatusPolicyViolation, reason)
+	}
+
+	// 6. Revoke session tokens and remove user from database
+	_ = s.hub.st.DeleteTokensForUser(ctx, req.UserID)
+	_ = s.hub.st.DeleteUser(ctx, req.UserID)
+
+	// 7. Broadcast user.removed to all connected clients
+	s.hub.Broadcast(protocol.Event(protocol.EvUserRemoved, protocol.UserRemovedEvent{
+		UserID: req.UserID,
+		Reason: reason,
+	}))
+
 	return struct{}{}, nil
 }
 

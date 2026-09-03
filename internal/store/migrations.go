@@ -238,6 +238,22 @@ var migrations = []string{
 	-- fresh one, exactly as the AttachFiles migration did.
 	UPDATE roles SET permissions = permissions | 128 WHERE managed = 'everyone';
 	`,
+	// 9: moderation kick log.
+	`
+	CREATE TABLE kicks (
+		id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id            INTEGER,
+		user_nickname      TEXT NOT NULL,
+		user_username      TEXT,
+		actor_id           INTEGER,
+		actor_nickname     TEXT NOT NULL,
+		reason             TEXT NOT NULL,
+		deleted_messages   TEXT NOT NULL DEFAULT 'none',
+		created_at         INTEGER NOT NULL
+	);
+	CREATE INDEX idx_kicks_user ON kicks(user_id);
+	CREATE INDEX idx_kicks_created ON kicks(created_at DESC);
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

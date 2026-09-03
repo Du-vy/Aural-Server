@@ -96,6 +96,7 @@ const (
 	EvUserDisconnected = "user.disconnected"
 	EvUserUpdated      = "user.updated"
 	EvUserMoved        = "user.moved"
+	EvUserRemoved      = "user.removed"
 
 	EvChannelCreated = "channel.created"
 	EvChannelUpdated = "channel.updated"

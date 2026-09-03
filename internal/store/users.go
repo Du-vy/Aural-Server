@@ -463,3 +463,62 @@ func placeholders(n int) string {
 	}
 	return string(buf)
 }
+
+// KickRecord stores the audit trail for an administrative kick.
+type KickRecord struct {
+	UserID          *int64
+	UserNickname    string
+	UserUsername    *string
+	ActorID         *int64
+	ActorNickname   string
+	Reason          string
+	DeletedMessages string
+	CreatedAt       int64
+}
+
+// RecordKick persists a kick audit record.
+func (s *Store) RecordKick(ctx context.Context, k KickRecord) error {
+	if k.CreatedAt == 0 {
+		k.CreatedAt = now()
+	}
+	if k.DeletedMessages == "" {
+		k.DeletedMessages = "none"
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO kicks (user_id, user_nickname, user_username, actor_id, actor_nickname, reason, deleted_messages, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		k.UserID, k.UserNickname, k.UserUsername, k.ActorID, k.ActorNickname, k.Reason, k.DeletedMessages, k.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("store: record kick: %w", err)
+	}
+	return nil
+}
+
+// KicksByUserID queries kick audit records for a given user.
+func (s *Store) KicksByUserID(ctx context.Context, userID int64) ([]KickRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT user_id, user_nickname, user_username, actor_id, actor_nickname, reason, deleted_messages, created_at
+		FROM kicks WHERE user_id = ?`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []KickRecord
+	for rows.Next() {
+		var k KickRecord
+		if err := rows.Scan(&k.UserID, &k.UserNickname, &k.UserUsername, &k.ActorID, &k.ActorNickname, &k.Reason, &k.DeletedMessages, &k.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, nil
+}
+
+// DeleteUser removes a user identity from the server.
+func (s *Store) DeleteUser(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: delete user: %w", err)
+	}
+	return nil
+}

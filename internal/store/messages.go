@@ -208,3 +208,55 @@ func (s *Store) DeleteMessage(ctx context.Context, id int64) error {
 	}
 	return requireOneRow(res, "message")
 }
+
+type DeletedMessageTarget struct {
+	ID        int64
+	ChannelID int64
+}
+
+// DeleteMessagesByUser removes messages written by a specific user, optionally restricted
+// by a cutoff timestamp (seconds). If cutoff <= 0, all messages are removed.
+func (s *Store) DeleteMessagesByUser(ctx context.Context, userID int64, cutoff int64) ([]DeletedMessageTarget, error) {
+	var query string
+	var args []any
+	if cutoff > 0 {
+		query = `SELECT id, channel_id FROM messages WHERE user_id = ? AND created_at >= ?`
+		args = []any{userID, cutoff}
+	} else {
+		query = `SELECT id, channel_id FROM messages WHERE user_id = ?`
+		args = []any{userID}
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query messages to delete: %w", err)
+	}
+	defer rows.Close()
+
+	var targets []DeletedMessageTarget
+	for rows.Next() {
+		var t DeletedMessageTarget
+		if err := rows.Scan(&t.ID, &t.ChannelID); err != nil {
+			return nil, fmt.Errorf("store: scan message target: %w", err)
+		}
+		targets = append(targets, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate messages to delete: %w", err)
+	}
+
+	if len(targets) == 0 {
+		return nil, nil
+	}
+
+	if cutoff > 0 {
+		_, err = s.db.ExecContext(ctx, `DELETE FROM messages WHERE user_id = ? AND created_at >= ?`, userID, cutoff)
+	} else {
+		_, err = s.db.ExecContext(ctx, `DELETE FROM messages WHERE user_id = ?`, userID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: delete messages: %w", err)
+	}
+
+	return targets, nil
+}

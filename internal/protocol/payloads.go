@@ -419,8 +419,9 @@ type UserMoveRequest struct {
 }
 
 type UserKickRequest struct {
-	UserID int64  `json:"userId"`
-	Reason string `json:"reason,omitempty"`
+	UserID         int64  `json:"userId"`
+	Reason         string `json:"reason,omitempty"`
+	DeleteMessages string `json:"deleteMessages,omitempty"`
 }
 
 type ChannelCreateRequest struct {
@@ -653,6 +654,11 @@ type UserEvent struct {
 
 type UserDisconnectedEvent struct {
 	UserID int64 `json:"userId"`
+}
+
+type UserRemovedEvent struct {
+	UserID int64  `json:"userId"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // UserMovedEvent reports a channel change. Both ends are included so a client
