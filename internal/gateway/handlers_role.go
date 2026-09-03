@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strconv"
 
 	"github.com/aural-chat/aural-server/internal/permissions"
 	"github.com/aural-chat/aural-server/internal/protocol"
@@ -66,6 +67,11 @@ func handleRoleCreate(ctx context.Context, s *Session, raw json.RawMessage) (any
 
 	view := roleView(created)
 	s.hub.Broadcast(protocol.Event(protocol.EvRoleCreated, protocol.RoleEvent{Role: view}))
+
+	entry := auditTarget(protocol.AuditTargetRole, created.ID, created.Name)
+	entry.Action = protocol.AuditRoleCreate
+	s.hub.audit(ctx, s, entry)
+
 	s.log.Info("role created", slog.Int64("role", created.ID), slog.String("name", created.Name))
 
 	return protocol.RoleEvent{Role: view}, nil
@@ -92,6 +98,9 @@ func handleRoleUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 		return nil, protocol.Errorf(protocol.ErrForbidden, "that role sits at or above your own")
 	}
 
+	// Captured before anything is patched, so the log can say what actually
+	// changed rather than only what it was set to.
+	before := role
 	permissionsChanged := false
 
 	if req.Name != nil {
@@ -159,6 +168,17 @@ func handleRoleUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 
 	view := roleView(role)
 	s.hub.Broadcast(protocol.Event(protocol.EvRoleUpdated, protocol.RoleEvent{Role: view}))
+
+	entry := auditTarget(protocol.AuditTargetRole, role.ID, role.Name)
+	entry.Action = protocol.AuditRoleUpdate
+	entry.Changes = changed(nil, "name", before.Name, role.Name)
+	entry.Changes = changed(entry.Changes, "color", before.Color, role.Color)
+	entry.Changes = changed(entry.Changes, "permissions",
+		before.Permissions.String(), role.Permissions.String())
+	entry.Changes = changed(entry.Changes, "position",
+		strconv.Itoa(before.Position), strconv.Itoa(role.Position))
+	s.hub.audit(ctx, s, entry)
+
 	if permissionsChanged {
 		s.hub.resyncAll(ctx)
 		s.hub.evictFromUnreachableChannels()
@@ -203,6 +223,11 @@ func handleRoleDelete(ctx context.Context, s *Session, raw json.RawMessage) (any
 	s.hub.Broadcast(protocol.Event(protocol.EvRoleDeleted, protocol.RoleDeletedEvent{RoleID: req.RoleID}))
 	s.hub.resyncAll(ctx)
 	s.hub.evictFromUnreachableChannels()
+
+	entry := auditTarget(protocol.AuditTargetRole, role.ID, role.Name)
+	entry.Action = protocol.AuditRoleDelete
+	s.hub.audit(ctx, s, entry)
+
 	s.log.Info("role deleted", slog.Int64("role", req.RoleID))
 
 	return protocol.RoleDeletedEvent{RoleID: req.RoleID}, nil
@@ -253,6 +278,17 @@ func (s *Session) changeRoleMembership(ctx context.Context, raw json.RawMessage,
 	if err != nil {
 		return nil, internalError(s, "change role membership", err)
 	}
+
+	// Logged against the member rather than the role: reading the log to find
+	// out what happened to somebody is what it is for, and a grant is a thing
+	// done to a person.
+	entry := auditTarget(protocol.AuditTargetUser, req.UserID, s.hub.nicknameOf(ctx, req.UserID))
+	entry.Action = protocol.AuditRoleUnassign
+	if grant {
+		entry.Action = protocol.AuditRoleAssign
+	}
+	entry.Changes = []store.AuditChange{{Key: "role", After: role.Name}}
+	s.hub.audit(ctx, s, entry)
 
 	target, online := s.hub.SessionForUser(req.UserID)
 	if !online {
@@ -368,4 +404,19 @@ func (h *Hub) requireOutranksUser(ctx context.Context, actor *Session, targetID 
 		return protocol.Errorf(protocol.ErrForbidden, "that user stands at or above you")
 	}
 	return nil
+}
+
+// nicknameOf is the name to record for somebody an action was taken against.
+// It reads the live session first and falls back to the row, because the
+// nickname is what makes a log entry readable and the id is what makes it
+// precise: an entry needs both, and a member who has just been removed still
+// has to appear under the name everybody knew them by.
+func (h *Hub) nicknameOf(ctx context.Context, userID int64) string {
+	if session, online := h.SessionForUser(userID); online {
+		return session.User().Nickname
+	}
+	if user, err := h.st.UserByID(ctx, userID); err == nil {
+		return user.Nickname
+	}
+	return ""
 }

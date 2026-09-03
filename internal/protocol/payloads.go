@@ -80,6 +80,25 @@ type ServerInfo struct {
 	// An operator can switch them off, and a client that is told so hides that
 	// whole interface rather than offering something every send is refused for.
 	DirectMessages bool `json:"directMessages"`
+	// Expressions is what this server accepts as a custom emoji, sticker or
+	// soundboard clip. The client needs it before it uploads: the trimmer has
+	// to know how long a sound may be, and the picker has to know when there
+	// is no slot left.
+	Expressions ExpressionLimits `json:"expressions"`
+}
+
+// ExpressionLimits is the ceiling on what a server carries for its own people.
+// Byte counts are decimal strings, as everywhere else in this protocol.
+type ExpressionLimits struct {
+	MaxEmojis   int `json:"maxEmojis"`
+	MaxStickers int `json:"maxStickers"`
+	MaxSounds   int `json:"maxSounds"`
+	// MaxSoundSeconds is how long one clip may run. The client trims to it
+	// before uploading rather than being refused afterwards.
+	MaxSoundSeconds int    `json:"maxSoundSeconds"`
+	MaxEmojiBytes   string `json:"maxEmojiBytes"`
+	MaxStickerBytes string `json:"maxStickerBytes"`
+	MaxSoundBytes   string `json:"maxSoundBytes"`
 }
 
 // Uploads tells a client what this server accepts before it sends anything, so
@@ -503,6 +522,16 @@ type Attachment struct {
 type Hello struct {
 	Server      ServerInfo `json:"server"`
 	HeartbeatMs int        `json:"heartbeatMs"`
+	// DeviceSalt is a random value this server minted once and keeps. A client
+	// folds it into the stable machine attributes it can read and sends the
+	// hash as Device on the auth op that follows.
+	//
+	// Salting is the whole design. The value identifies a machine on this
+	// server, which is what makes a ban survive a new account and a cleared
+	// browser profile; the same machine produces an unrelated value on every
+	// other server, so nothing here can be used to follow somebody around.
+	// Absent from a server that has no use for it.
+	DeviceSalt string `json:"deviceSalt,omitempty"`
 }
 
 // Ready is the full state snapshot delivered once authentication succeeds.
@@ -535,6 +564,12 @@ type Ready struct {
 	// with what is waiting in each. It travels in the snapshot because a badge
 	// is the whole reason to know a thread exists before opening it.
 	Conversations []Conversation `json:"conversations,omitempty"`
+	// Expressions is every custom emoji and sticker the server carries. It is
+	// in the snapshot rather than fetched because a message cannot be rendered
+	// without it: `:shrug:` in the very first line of history has to resolve.
+	Expressions []Expression `json:"expressions,omitempty"`
+	// Sounds is the soundboard, which the panel is drawn from.
+	Sounds []Sound `json:"sounds,omitempty"`
 }
 
 // --- requests ---------------------------------------------------------------
@@ -542,17 +577,21 @@ type Ready struct {
 type AuthGuestRequest struct {
 	Nickname       string `json:"nickname"`
 	ServerPassword string `json:"serverPassword,omitempty"`
+	// Device is what a ban against a machine is matched on. See Hello.
+	Device string `json:"device,omitempty"`
 }
 
 type AuthTokenRequest struct {
 	Token          string `json:"token"`
 	ServerPassword string `json:"serverPassword,omitempty"`
+	Device         string `json:"device,omitempty"`
 }
 
 type AuthLoginRequest struct {
 	Username       string `json:"username"`
 	Password       string `json:"password"`
 	ServerPassword string `json:"serverPassword,omitempty"`
+	Device         string `json:"device,omitempty"`
 }
 
 type AuthRegisterRequest struct {

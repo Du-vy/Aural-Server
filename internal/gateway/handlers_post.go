@@ -81,6 +81,21 @@ func handlePostCreate(ctx context.Context, s *Session, raw json.RawMessage) (any
 		post.Location = event.Location
 	}
 
+	// The body of a post is a message like any other, so the same rules apply
+	// to it. The title is screened too: it is the part a listing shows, which
+	// makes it the part worth writing something unacceptable into.
+	verdict, failure := s.screenMessage(ctx, req.ChannelID, content)
+	if failure != nil {
+		return nil, failure
+	}
+	content = verdict.Content
+
+	titleVerdict, failure := s.screenText(ctx, req.ChannelID, title)
+	if failure != nil {
+		return nil, failure
+	}
+	post.Title = titleVerdict.Content
+
 	created, body, err := s.hub.st.CreatePost(ctx, post, content)
 	if err != nil {
 		return nil, internalError(s, "store the post", err)

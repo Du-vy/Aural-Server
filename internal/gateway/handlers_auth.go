@@ -31,6 +31,14 @@ func handleAuthGuest(ctx context.Context, s *Session, raw json.RawMessage) (any,
 	if failure := checkServerPassword(s.hub.cfg, req.ServerPassword); failure != nil {
 		return nil, failure
 	}
+	s.setDevice(cleanDevice(req.Device))
+	// Before the identity is minted, not after: a banned machine asking for a
+	// fresh guest is the exact case a ban on anything but the account exists
+	// for, and letting the row be written first would leave one behind on
+	// every attempt.
+	if failure := s.screenConnection(ctx, 0); failure != nil {
+		return nil, failure
+	}
 
 	nickname := req.Nickname
 	if cleanText(nickname) == "" {
@@ -72,6 +80,7 @@ func handleAuthToken(ctx context.Context, s *Session, raw json.RawMessage) (any,
 	if failure := checkServerPassword(s.hub.cfg, req.ServerPassword); failure != nil {
 		return nil, failure
 	}
+	s.setDevice(cleanDevice(req.Device))
 
 	tokenHash := auth.HashToken(req.Token)
 	user, err := s.hub.st.UserByTokenHash(ctx, tokenHash)
@@ -85,6 +94,9 @@ func handleAuthToken(ctx context.Context, s *Session, raw json.RawMessage) (any,
 	// turns away the guest identities it handed out earlier.
 	if !user.Registered() && !s.hub.cfg.Registration.AllowGuests {
 		return nil, protocol.Errorf(protocol.ErrGuestsDisabled, "this server only accepts registered accounts")
+	}
+	if failure := s.screenConnection(ctx, user.ID); failure != nil {
+		return nil, failure
 	}
 	if err := s.hub.st.TouchToken(ctx, tokenHash); err != nil {
 		s.log.Warn("touch token", slog.Any("error", err))
@@ -112,6 +124,7 @@ func handleAuthLogin(ctx context.Context, s *Session, raw json.RawMessage) (any,
 	if req.Username == "" || req.Password == "" {
 		return nil, protocol.Errorf(protocol.ErrBadRequest, "username and password are required")
 	}
+	s.setDevice(cleanDevice(req.Device))
 
 	user, err := s.hub.st.UserByUsername(ctx, req.Username)
 	if errors.Is(err, store.ErrNotFound) {
@@ -134,6 +147,12 @@ func handleAuthLogin(ctx context.Context, s *Session, raw json.RawMessage) (any,
 	}
 	if !ok {
 		return nil, protocol.Errorf(protocol.ErrInvalidCredentials, "username or password is wrong")
+	}
+	// After the password, deliberately: telling somebody they are banned
+	// before they have proved who they are would answer "does this account
+	// exist" to anybody who asked.
+	if failure := s.screenConnection(ctx, user.ID); failure != nil {
+		return nil, failure
 	}
 
 	rawToken, tokenHash, err := auth.NewToken()
@@ -244,6 +263,28 @@ func (s *Session) beginAuthAttempt() *protocol.Error {
 	return nil
 }
 
+// screenConnection refuses a connection a ban in force catches.
+//
+// It asks about all three handles at once — the account, the address, the
+// machine — because a ban carries as many of them as were known when it was
+// issued, and which one catches somebody coming back is exactly the thing that
+// cannot be predicted. userID is zero for a guest who has no identity yet.
+func (s *Session) screenConnection(ctx context.Context, userID int64) *protocol.Error {
+	// The owner is never refused. A ban is issued by somebody the owner put
+	// there, an address is shared often enough that one can catch the wrong
+	// person, and a server whose owner cannot get in has no way back.
+	if s.hub.IsOwner(userID) {
+		return nil
+	}
+	ban, banned := s.hub.FindActiveBan(ctx, userID, s.Peer(), s.Device())
+	if !banned {
+		return nil
+	}
+	s.log.Info("refused a banned connection",
+		slog.Int64("user", userID), slog.Int64("ban", ban.ID))
+	return banError(ban)
+}
+
 // finishAuth is the tail every successful authentication shares: resolve the
 // permissions, take the identity slot, announce the arrival, and answer with a
 // full state snapshot.
@@ -272,6 +313,16 @@ func (s *Session) finishAuth(ctx context.Context, user store.User, tokenHash, ra
 	}
 	if err := h.st.TouchUser(ctx, user.ID); err != nil {
 		s.log.Warn("touch user", slog.Any("error", err))
+	}
+	// Where this identity connected from, so that a ban issued against it
+	// later can reach the same address and the same machine. It is the whole
+	// of what makes banning a guest mean anything, since the identity itself
+	// lasts no longer than the connection.
+	if err := h.st.RecordIdentityMark(ctx, user.ID, store.IdentityMark{
+		IP:     s.Peer(),
+		Device: s.Device(),
+	}); err != nil {
+		s.log.Warn("record where this connection came from", slog.Any("error", err))
 	}
 
 	ready, err := h.buildReady(ctx, s, rawToken)
@@ -341,6 +392,20 @@ func (h *Hub) buildReady(ctx context.Context, s *Session, sessionToken string) (
 		conversations = views
 	}
 
+	// The custom emoji travel with the snapshot rather than being fetched:
+	// a message cannot be rendered without them, and `:shrug:` in the very
+	// first line of history has to resolve before anything is drawn.
+	storedExpressions := h.SortedExpressions()
+	expressions := make([]protocol.Expression, 0, len(storedExpressions))
+	for _, e := range storedExpressions {
+		expressions = append(expressions, expressionView(e))
+	}
+	storedSounds := h.SortedSounds()
+	sounds := make([]protocol.Sound, 0, len(storedSounds))
+	for _, sound := range storedSounds {
+		sounds = append(sounds, soundView(sound))
+	}
+
 	return protocol.Ready{
 		SessionToken: sessionToken,
 		User:         s.view(),
@@ -353,6 +418,8 @@ func (h *Hub) buildReady(ctx context.Context, s *Session, sessionToken string) (
 		VoiceStates:  h.voiceStatesFor(s),
 
 		Conversations: conversations,
+		Expressions:   expressions,
+		Sounds:        sounds,
 	}, nil
 }
 

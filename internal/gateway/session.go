@@ -70,6 +70,12 @@ const (
 	// a second is faster than speech alternates; the burst covers a stutter.
 	speakingBurst     = 12
 	speakingPerSecond = 2
+	// soundBurst and soundsPerSecond throttle the soundboard, which is paced
+	// far more tightly than anything else a client sends. One frame plays up
+	// to ten seconds of audio at everybody in the channel at once, so the
+	// bucket is what stands between a soundboard and a siren.
+	soundBurst      = 3
+	soundsPerSecond = 0.35
 )
 
 // sessionVoice is the audio half of a session's state.
@@ -99,6 +105,12 @@ type Session struct {
 	hub *Hub
 	log *slog.Logger
 
+	// peer is where the connection came from, as far as this server can
+	// honestly tell — the immediate socket, or the furthest hop a trusted
+	// proxy vouched for. It is fixed for the life of the connection, so it
+	// needs no lock, and it is one half of what a ban is matched on.
+	peer string
+
 	conn *websocket.Conn
 	out  chan protocol.Envelope
 
@@ -112,6 +124,8 @@ type Session struct {
 	// being asked to.
 	signals  *rateLimiter
 	speaking *rateLimiter
+	// soundboard throttles playing a clip at a room.
+	soundboard *rateLimiter
 
 	// slowSlots bounds the reads running off the read loop. It is a channel
 	// rather than a counter so that taking a slot is a non-blocking try: a
@@ -130,25 +144,64 @@ type Session struct {
 	tokenHash   string
 	authAttempt int
 	voice       sessionVoice
+	// device is the machine identifier this connection presented, hashed by
+	// the client over a salt only this server holds. Empty from a client that
+	// sends none, which matches nothing and is not an error: the identifier is
+	// a way of making a ban stick, not a credential.
+	device string
+	// recent is what the flood and repetition rules remember, and is the only
+	// automatic-moderation state that cannot live in the database: it is about
+	// the last few seconds, and it is thrown away with the connection.
+	recent []recentMessage
 }
 
-func newSession(id int64, hub *Hub, conn *websocket.Conn, log *slog.Logger) *Session {
+// recentMessage is one thing this connection wrote, kept only long enough for
+// the flood and repetition rules to have something to compare against.
+type recentMessage struct {
+	at     time.Time
+	folded string
+}
+
+func newSession(id int64, hub *Hub, conn *websocket.Conn, peer string, log *slog.Logger) *Session {
 	return &Session{
-		ID:        id,
-		hub:       hub,
-		log:       log.With(slog.Int64("session", id)),
-		conn:      conn,
-		out:       make(chan protocol.Envelope, outboundBuffer),
-		slowSlots: make(chan struct{}, maxSlowInFlight),
-		closed:    make(chan struct{}),
-		messages:  newRateLimiter(messageBurst, messagesPerSecond),
-		searches:  newRateLimiter(searchBurst, searchesPerSecond),
-		signals:   newRateLimiter(signalBurst, signalsPerSecond),
-		speaking:  newRateLimiter(speakingBurst, speakingPerSecond),
+		ID:         id,
+		hub:        hub,
+		log:        log.With(slog.Int64("session", id)),
+		peer:       peer,
+		conn:       conn,
+		out:        make(chan protocol.Envelope, outboundBuffer),
+		slowSlots:  make(chan struct{}, maxSlowInFlight),
+		closed:     make(chan struct{}),
+		messages:   newRateLimiter(messageBurst, messagesPerSecond),
+		searches:   newRateLimiter(searchBurst, searchesPerSecond),
+		signals:    newRateLimiter(signalBurst, signalsPerSecond),
+		speaking:   newRateLimiter(speakingBurst, speakingPerSecond),
+		soundboard: newRateLimiter(soundBurst, soundsPerSecond),
 	}
 }
 
 // --- accessors --------------------------------------------------------------
+
+// Peer is where the connection came from.
+func (s *Session) Peer() string { return s.peer }
+
+// Device is the machine identifier the connection presented, or empty.
+func (s *Session) Device() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.device
+}
+
+// setDevice records the identifier an auth op carried. It is taken from the
+// first authentication and not changed afterwards: a connection that could
+// rewrite it mid-session could shed a ban by asking twice.
+func (s *Session) setDevice(device string) {
+	s.mu.Lock()
+	if s.device == "" {
+		s.device = device
+	}
+	s.mu.Unlock()
+}
 
 // UserID is the identity behind the session, or zero before authentication.
 func (s *Session) UserID() int64 {
@@ -579,6 +632,25 @@ var routes = map[string]route{
 	protocol.OpUserUpdate: {needsAuth: true, fn: handleUserUpdate},
 	protocol.OpUserMove:   {needsAuth: true, fn: handleUserMove},
 	protocol.OpUserKick:   {needsAuth: true, fn: handleUserKick},
+
+	// Moderation that outlives a connection, and the record of it. Reading the
+	// log walks a table that only grows, so it is dispatched off the read loop
+	// with the other reads that page through history.
+	protocol.OpBanList:   {needsAuth: true, fn: handleBanList},
+	protocol.OpBanCreate: {needsAuth: true, fn: handleBanCreate},
+	protocol.OpBanDelete: {needsAuth: true, fn: handleBanDelete},
+	protocol.OpAuditList: {needsAuth: true, slow: true, fn: handleAuditList},
+
+	protocol.OpAutoModGet:    {needsAuth: true, fn: handleAutoModGet},
+	protocol.OpAutoModUpdate: {needsAuth: true, fn: handleAutoModUpdate},
+
+	// Custom emoji, stickers and the soundboard. Creating one is an upload
+	// over HTTP; what is left is renaming, removing, and playing.
+	protocol.OpExpressionUpdate: {needsAuth: true, fn: handleExpressionUpdate},
+	protocol.OpExpressionDelete: {needsAuth: true, fn: handleExpressionDelete},
+	protocol.OpSoundUpdate:      {needsAuth: true, fn: handleSoundUpdate},
+	protocol.OpSoundDelete:      {needsAuth: true, fn: handleSoundDelete},
+	protocol.OpSoundPlay:        {needsAuth: true, fn: handleSoundPlay},
 
 	protocol.OpChannelCreate: {needsAuth: true, fn: handleChannelCreate},
 	protocol.OpChannelUpdate: {needsAuth: true, fn: handleChannelUpdate},

@@ -79,6 +79,13 @@ func handleMessageSend(ctx context.Context, s *Session, raw json.RawMessage) (an
 	if !s.messages.allow() {
 		return nil, protocol.Errorf(protocol.ErrRateLimited, "you are sending messages too quickly")
 	}
+	// Automatic moderation runs last, on the way in: a message a rule refuses
+	// is never written, and one a rule censors is never written uncensored.
+	verdict, failure := s.screenMessage(ctx, req.ChannelID, content)
+	if failure != nil {
+		return nil, failure
+	}
+	content = verdict.Content
 
 	created, err := s.hub.st.CreateMessage(ctx, req.ChannelID, postID, s.UserID(), content)
 	if err != nil {
@@ -472,6 +479,13 @@ func handleMessageEdit(ctx context.Context, s *Session, raw json.RawMessage) (an
 	if !s.messages.allow() {
 		return nil, protocol.Errorf(protocol.ErrRateLimited, "you are editing messages too quickly")
 	}
+	// Editing is screened too. A rule that only looked at sends would be
+	// worked around by posting a full stop and then editing it.
+	verdict, failure := s.screenText(ctx, existing.ChannelID, content)
+	if failure != nil {
+		return nil, failure
+	}
+	content = verdict.Content
 
 	updated, err := s.hub.st.UpdateMessageContent(ctx, req.MessageID, content)
 	if err != nil {
@@ -545,6 +559,15 @@ func handleMessageDelete(ctx context.Context, s *Session, raw json.RawMessage) (
 	if !own {
 		s.log.Info("message deleted by a moderator",
 			slog.Int64("message", existing.ID), slog.Int64("channel", existing.ChannelID))
+		// Only somebody else's message is logged. Deleting your own needs no
+		// permission and is nobody's business but yours, so recording it would
+		// make the log a record of what everybody had second thoughts about.
+		entry := auditTarget(protocol.AuditTargetMessage, existing.ID, existing.Author)
+		entry.Action = protocol.AuditMessageDelete
+		if channel, ok := s.hub.Channel(existing.ChannelID); ok {
+			entry.Changes = []store.AuditChange{{Key: "channel", After: channel.Name}}
+		}
+		s.hub.audit(ctx, s, entry)
 	}
 
 	return event, nil

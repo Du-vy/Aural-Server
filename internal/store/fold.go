@@ -86,3 +86,12 @@ func foldForSearch(in string) string {
 	}
 	return b.String()
 }
+
+// Fold exposes the same reduction to the rest of the server.
+//
+// Automatic moderation compares a message against a list of words a moderator
+// typed, and has to do it the way a search does: one entry has to catch the
+// word however it was capitalised or accented, or a word list is defeated by
+// pressing shift. Sharing the function rather than writing a second one is
+// what keeps the two from disagreeing about what "the same word" means.
+func Fold(in string) string { return foldForSearch(in) }

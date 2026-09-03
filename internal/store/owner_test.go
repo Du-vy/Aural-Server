@@ -85,6 +85,12 @@ func TestOwnershipIsBackfilledFromTheAdminRole(t *testing.T) {
 	// under test, so the schema has to be wound back with it. Each migration
 	// added below this one gets a line here.
 	for _, statement := range []string{
+		`DROP TABLE IF EXISTS sounds`,
+		`DROP TABLE IF EXISTS expressions`,
+		`DROP TABLE IF EXISTS audit_entries`,
+		`DROP TABLE IF EXISTS identity_marks`,
+		`DROP TABLE IF EXISTS ban_matches`,
+		`DROP TABLE IF EXISTS bans`,
 		`DROP INDEX IF EXISTS idx_messages_post`,
 		`ALTER TABLE messages DROP COLUMN post_id`,
 		`DROP TABLE IF EXISTS post_rsvps`,

@@ -46,11 +46,33 @@ const (
 	// everybody may reply and only a few may post — and SendMessages alone
 	// could not express that.
 	CreatePosts Permission = 1 << 14
+	// UseSoundboard covers playing one of the server's stored sounds into the
+	// voice channel you are sitting in. It is separate from Speak because the
+	// two are different acts on the same room: Speak carries your voice, this
+	// one plays a clip at everybody, and a channel very often wants one
+	// without the other.
+	UseSoundboard Permission = 1 << 15
 
 	KickUsers   Permission = 1 << 16
 	MoveUsers   Permission = 1 << 17
 	MuteUsers   Permission = 1 << 18
 	DeafenUsers Permission = 1 << 19
+	// BanUsers covers refusing somebody the server rather than merely ending
+	// their connection. It is its own bit rather than part of KickUsers
+	// because a ban outlives the session it was issued in and reaches the
+	// address and the device behind it: it is a standing decision, and handing
+	// somebody the right to make one is a larger thing than letting them close
+	// a socket.
+	BanUsers Permission = 1 << 20
+	// ViewAuditLog covers reading the record of what moderators did. It grants
+	// nothing else: reading the log is how a server holds its own staff to
+	// account, so it is deliberately reachable without any power to act.
+	ViewAuditLog Permission = 1 << 21
+	// ManageExpressions covers the custom emoji, stickers and soundboard
+	// sounds a server carries. One bit rather than three: they are the same
+	// act — putting a file everybody's client will fetch into a shared
+	// namespace — and differ only in where it is rendered.
+	ManageExpressions Permission = 1 << 22
 
 	// Administrator bypasses every other check, including channel overwrites.
 	Administrator Permission = 1 << 31
@@ -63,10 +85,11 @@ const None Permission = 0
 var order = []Permission{
 	ViewChannel, Connect, Speak, SendMessages, ChangeNickname, Register, AttachFiles,
 	SendDirectMessages,
-	CreatePosts,
+	CreatePosts, UseSoundboard,
 	ManageChannels, ManageRoles, ManageServer, ManageNicknames, ManageMessages,
-	ManageWebhooks,
-	KickUsers, MoveUsers, MuteUsers, DeafenUsers,
+	ManageWebhooks, ManageExpressions,
+	KickUsers, BanUsers, MoveUsers, MuteUsers, DeafenUsers,
+	ViewAuditLog,
 	Administrator,
 }
 
@@ -80,16 +103,20 @@ var names = map[Permission]string{
 	AttachFiles:        "AttachFiles",
 	SendDirectMessages: "SendDirectMessages",
 	CreatePosts:        "CreatePosts",
+	UseSoundboard:      "UseSoundboard",
 	ManageChannels:     "ManageChannels",
 	ManageRoles:        "ManageRoles",
 	ManageServer:       "ManageServer",
 	ManageNicknames:    "ManageNicknames",
 	ManageMessages:     "ManageMessages",
 	ManageWebhooks:     "ManageWebhooks",
+	ManageExpressions:  "ManageExpressions",
 	KickUsers:          "KickUsers",
+	BanUsers:           "BanUsers",
 	MoveUsers:          "MoveUsers",
 	MuteUsers:          "MuteUsers",
 	DeafenUsers:        "DeafenUsers",
+	ViewAuditLog:       "ViewAuditLog",
 	Administrator:      "Administrator",
 }
 
@@ -106,7 +133,7 @@ var All = func() Permission {
 // user, guests included: they can look around, talk, write to somebody
 // privately, and claim an account.
 const DefaultEveryone = ViewChannel | Connect | Speak | SendMessages | ChangeNickname |
-	Register | AttachFiles | SendDirectMessages | CreatePosts
+	Register | AttachFiles | SendDirectMessages | CreatePosts | UseSoundboard
 
 // DefaultRegistered is granted on top of DefaultEveryone once a user claims an
 // account. It is deliberately empty so that a fresh server treats guests and

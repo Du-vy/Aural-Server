@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strconv"
 
 	"github.com/aural-chat/aural-server/internal/permissions"
 	"github.com/aural-chat/aural-server/internal/protocol"
@@ -62,6 +63,11 @@ func handleChannelCreate(ctx context.Context, s *Session, raw json.RawMessage) (
 
 	view := channelView(created)
 	s.hub.BroadcastChannelEvent(protocol.Event(protocol.EvChannelCreated, protocol.ChannelEvent{Channel: view}), created.ID)
+	entry := auditTarget(protocol.AuditTargetChannel, created.ID, created.Name)
+	entry.Action = protocol.AuditChannelCreate
+	entry.Changes = []store.AuditChange{{Key: "type", After: created.Type}}
+	s.hub.audit(ctx, s, entry)
+
 	s.log.Info("channel created", slog.Int64("channel", created.ID), slog.String("name", created.Name))
 
 	return protocol.ChannelEvent{Channel: view}, nil
@@ -82,6 +88,10 @@ func handleChannelUpdate(ctx context.Context, s *Session, raw json.RawMessage) (
 	if failure := s.hub.requireChannelPermission(s, &req.ChannelID, permissions.ManageChannels); failure != nil {
 		return nil, failure
 	}
+
+	// Captured before anything is patched, so the log can say what actually
+	// changed rather than only what it was set to.
+	before := current
 
 	// A move or an overwrite edit can change who may see the channel, which
 	// means the affected clients need a fresh snapshot rather than a patch.
@@ -174,6 +184,15 @@ func handleChannelUpdate(ctx context.Context, s *Session, raw json.RawMessage) (
 	// Anybody sitting in a channel they may no longer enter is shown the door.
 	s.hub.evictFromUnreachableChannels()
 
+	entry := auditTarget(protocol.AuditTargetChannel, current.ID, current.Name)
+	entry.Action = protocol.AuditChannelUpdate
+	entry.Changes = changed(nil, "name", before.Name, current.Name)
+	entry.Changes = changed(entry.Changes, "topic", before.Topic, current.Topic)
+	if needsResync {
+		entry.Changes = append(entry.Changes, store.AuditChange{Key: "permissions", After: "changed"})
+	}
+	s.hub.audit(ctx, s, entry)
+
 	return protocol.ChannelEvent{Channel: view}, nil
 }
 
@@ -183,9 +202,13 @@ func handleChannelDelete(ctx context.Context, s *Session, raw json.RawMessage) (
 	if failure != nil {
 		return nil, failure
 	}
-	if _, ok := s.hub.Channel(req.ChannelID); !ok {
+	existing, ok := s.hub.Channel(req.ChannelID)
+	if !ok {
 		return nil, protocol.Errorf(protocol.ErrNotFound, "no such channel")
 	}
+	// Read before the row goes: the log has to be able to name what was
+	// deleted, and nothing can look it up afterwards.
+	deletedName := existing.Name
 	if failure := s.hub.requireChannelPermission(s, &req.ChannelID, permissions.ManageChannels); failure != nil {
 		return nil, failure
 	}
@@ -232,6 +255,16 @@ func handleChannelDelete(ctx context.Context, s *Session, raw json.RawMessage) (
 	// The channel is gone, so visibility can no longer be resolved from it:
 	// every client is told, and simply ignores an id it never had.
 	s.hub.Broadcast(protocol.Event(protocol.EvChannelDeleted, event))
+	entry := auditTarget(protocol.AuditTargetChannel, req.ChannelID, deletedName)
+	entry.Action = protocol.AuditChannelDelete
+	if len(cascaded) > 0 {
+		entry.Changes = []store.AuditChange{{
+			Key:   "alsoDeleted",
+			After: strconv.Itoa(len(cascaded)) + " inside it",
+		}}
+	}
+	s.hub.audit(ctx, s, entry)
+
 	s.log.Info("channel deleted", slog.Int64("channel", req.ChannelID), slog.Int("cascaded", len(cascaded)))
 
 	return event, nil

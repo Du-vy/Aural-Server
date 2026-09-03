@@ -66,6 +66,16 @@ type Hub struct {
 	everyoneID   int64
 	registeredID int64
 	adminID      int64
+	// expressions and sounds are the files a server carries for its own
+	// people. They are cached beside the roles and channels for the same
+	// reason: every message rendered and every soundboard opened reads them,
+	// and only an administrator ever writes one.
+	expressions map[int64]store.Expression
+	sounds      map[int64]store.Sound
+	// automod is the rule set every message is screened against, which is the
+	// hottest read on the server: it is consulted on the way in to every
+	// single send.
+	automod protocol.AutoModConfig
 	// ownerID is the identity that owns the server, which is not a role and is
 	// therefore cached beside the role table rather than in it.
 	ownerID int64
@@ -85,6 +95,11 @@ type Hub struct {
 	// resolved to the last time it was looked up.
 	publicIP   atomic.Pointer[string]
 	publicAddr *publicip.Resolver
+
+	// deviceSalt is the per-install secret a client folds into the machine
+	// identifier it presents. It is read once at startup and never changes
+	// while the process runs, so it needs no lock.
+	deviceSalt string
 }
 
 // NewHub builds a hub and primes its caches from the database. cfgPath is where
@@ -99,7 +114,19 @@ func NewHub(ctx context.Context, cfg *config.Config, cfgPath string, st *store.S
 		byUser:      map[int64]*Session{},
 		voiceRooms:  map[int64]*voiceRoom{},
 		voiceEpochs: map[int64]int64{},
+		expressions: map[int64]store.Expression{},
+		sounds:      map[int64]store.Sound{},
+		automod:     protocol.DefaultAutoMod(),
 	}
+
+	// Minted on the first start and kept: a salt that changed on restart would
+	// make every device identifier new, and a ban against a machine would last
+	// exactly as long as the process did.
+	salt, err := loadDeviceSalt(ctx, st)
+	if err != nil {
+		return nil, err
+	}
+	h.deviceSalt = salt
 
 	// The address the relay advertises is resolved before it is built, so a
 	// server whose voice.public_ip is a hostname starts with the right one
@@ -145,6 +172,15 @@ func NewHub(ctx context.Context, cfg *config.Config, cfgPath string, st *store.S
 	if err := h.ReloadChannels(ctx); err != nil {
 		return nil, err
 	}
+	if err := h.ReloadExpressions(ctx); err != nil {
+		return nil, err
+	}
+	if err := h.ReloadSounds(ctx); err != nil {
+		return nil, err
+	}
+	if err := h.ReloadAutoMod(ctx); err != nil {
+		return nil, err
+	}
 	if cfg.Uploads.Enabled {
 		// The quota is measured against what the database already accounts
 		// for, so a restart neither forgets stored files nor double-counts them.
@@ -160,6 +196,14 @@ func NewHub(ctx context.Context, cfg *config.Config, cfgPath string, st *store.S
 			return nil, err
 		}
 		used += pictures
+		// Emoji, stickers and sounds take the same disk everything else does,
+		// and leaving them out would drift the ceiling further from the truth
+		// with every upload.
+		expressions, err := st.TotalExpressionBytes(ctx)
+		if err != nil {
+			return nil, err
+		}
+		used += expressions
 		files, err := uploads.Open(cfg.Uploads.Path,
 			cfg.Uploads.MaxFileBytes, cfg.Uploads.MaxTotalBytes, used)
 		if err != nil {
@@ -314,6 +358,80 @@ func (h *Hub) ReloadChannels(ctx context.Context) error {
 	h.channels = byID
 	h.cacheMu.Unlock()
 	return nil
+}
+
+// ReloadExpressions refreshes the cached emoji and sticker table.
+func (h *Hub) ReloadExpressions(ctx context.Context) error {
+	list, err := h.st.AllExpressions(ctx)
+	if err != nil {
+		return err
+	}
+	byID := make(map[int64]store.Expression, len(list))
+	for _, e := range list {
+		byID[e.ID] = e
+	}
+
+	h.cacheMu.Lock()
+	h.expressions = byID
+	h.cacheMu.Unlock()
+	return nil
+}
+
+// ReloadSounds refreshes the cached soundboard.
+func (h *Hub) ReloadSounds(ctx context.Context) error {
+	list, err := h.st.AllSounds(ctx)
+	if err != nil {
+		return err
+	}
+	byID := make(map[int64]store.Sound, len(list))
+	for _, s := range list {
+		byID[s.ID] = s
+	}
+
+	h.cacheMu.Lock()
+	h.sounds = byID
+	h.cacheMu.Unlock()
+	return nil
+}
+
+// Sound returns a cached soundboard clip.
+func (h *Hub) Sound(id int64) (store.Sound, bool) {
+	h.cacheMu.RLock()
+	defer h.cacheMu.RUnlock()
+	s, ok := h.sounds[id]
+	return s, ok
+}
+
+// SortedExpressions lists the custom emoji and stickers in a stable order.
+func (h *Hub) SortedExpressions() []store.Expression {
+	h.cacheMu.RLock()
+	out := make([]store.Expression, 0, len(h.expressions))
+	for _, e := range h.expressions {
+		out = append(out, e)
+	}
+	h.cacheMu.RUnlock()
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+// SortedSounds lists the soundboard in the order it was built up, which is the
+// order the panel draws it in.
+func (h *Hub) SortedSounds() []store.Sound {
+	h.cacheMu.RLock()
+	out := make([]store.Sound, 0, len(h.sounds))
+	for _, s := range h.sounds {
+		out = append(out, s)
+	}
+	h.cacheMu.RUnlock()
+
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // Role returns a cached role.

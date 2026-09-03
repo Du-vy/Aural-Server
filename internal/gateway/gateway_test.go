@@ -68,6 +68,10 @@ type client struct {
 	seq  int
 	// pending holds events read while waiting for a reply.
 	pending []protocol.Envelope
+	// hello is the first frame the server sent, kept because two of the things
+	// it carries — the server preview and the device salt — are only ever sent
+	// there.
+	hello protocol.Hello
 }
 
 func (h *harness) dial() *client {
@@ -84,8 +88,12 @@ func (h *harness) dial() *client {
 	h.t.Cleanup(func() { conn.Close(websocket.StatusNormalClosure, "") })
 
 	c := &client{t: h.t, conn: conn, ctx: ctx}
-	if hello := c.next(); hello.Op != protocol.EvHello {
+	hello := c.next()
+	if hello.Op != protocol.EvHello {
 		h.t.Fatalf("expected %s first, got %s", protocol.EvHello, hello.Op)
+	}
+	if err := json.Unmarshal(hello.Data, &c.hello); err != nil {
+		h.t.Fatalf("decode hello: %v", err)
 	}
 	return c
 }

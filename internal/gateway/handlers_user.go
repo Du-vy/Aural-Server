@@ -380,40 +380,10 @@ func handleUserKick(ctx context.Context, s *Session, raw json.RawMessage) (any, 
 		CreatedAt:       time.Now().Unix(),
 	})
 
-	// 4. Optionally purge message history
-	var cutoff int64 = -1
-	switch deleteMode {
-	case "1d", "24h":
-		cutoff = time.Now().Unix() - 24*3600
-	case "7d":
-		cutoff = time.Now().Unix() - 7*24*3600
-	case "30d", "1m":
-		cutoff = time.Now().Unix() - 30*24*3600
-	case "all":
-		cutoff = 0
-	}
-
-	if cutoff >= 0 {
-		// Posts go first. A post is a title in front of a thread, so deleting
-		// only the messages would leave their entries standing with nothing in
-		// them; deleting the post takes its whole thread, including whatever
-		// other people commented on it.
-		purgedPosts, err := s.hub.st.DeletePostsByUser(ctx, req.UserID, cutoff)
-		if err == nil {
-			for _, pt := range purgedPosts {
-				event := protocol.PostDeletedEvent{PostID: pt.ID, ChannelID: pt.ChannelID}
-				s.hub.BroadcastChannelEvent(protocol.Event(protocol.EvPostDeleted, event), pt.ChannelID)
-			}
-		}
-
-		deletedTargets, err := s.hub.st.DeleteMessagesByUser(ctx, req.UserID, cutoff)
-		if err == nil && len(deletedTargets) > 0 {
-			for _, dt := range deletedTargets {
-				event := protocol.MessageDeletedEvent{MessageID: dt.ID, ChannelID: dt.ChannelID}
-				s.hub.BroadcastChannelEvent(protocol.Event(protocol.EvMessageDeleted, event), dt.ChannelID)
-			}
-		}
-	}
+	// 4. Optionally purge message history. Shared with ban, which differs in
+	// what it does to the identity and not at all in what it does to what the
+	// identity wrote.
+	s.purgeUserContent(ctx, req.UserID, deleteMode)
 
 	s.log.Info("user kicked",
 		slog.Int64("by", s.UserID()),
@@ -436,6 +406,14 @@ func handleUserKick(ctx context.Context, s *Session, raw json.RawMessage) (any, 
 		UserID: req.UserID,
 		Reason: reason,
 	}))
+
+	entry := auditTarget(protocol.AuditTargetUser, targetID, targetNickname)
+	entry.Action = protocol.AuditUserKick
+	entry.Reason = reason
+	if deleteMode != "none" {
+		entry.Changes = []store.AuditChange{{Key: "deletedMessages", After: deleteMode}}
+	}
+	s.hub.audit(ctx, s, entry)
 
 	return struct{}{}, nil
 }
@@ -484,6 +462,11 @@ func handleServerClaimAdmin(ctx context.Context, s *Session, raw json.RawMessage
 
 	view := s.view()
 	s.hub.BroadcastUserUpdated(view)
+
+	entry := auditTarget(protocol.AuditTargetServer, s.UserID(), s.User().Nickname)
+	entry.Action = protocol.AuditOwnerClaim
+	s.hub.audit(ctx, s, entry)
+
 	s.log.Info("server ownership claimed", slog.Int64("user", s.UserID()))
 
 	// Ownership uncovers every restricted channel at once, so the claimer is
@@ -588,6 +571,24 @@ func handleServerUpdate(_ context.Context, s *Session, raw json.RawMessage) (any
 
 	info := s.hub.serverInfo()
 	s.hub.Broadcast(protocol.Event(protocol.EvServerUpdated, protocol.ServerUpdatedEvent{Server: info}))
+
+	entry := auditTarget(protocol.AuditTargetServer, 0, info.Name)
+	entry.Action = protocol.AuditServerUpdate
+	if req.Name != nil {
+		entry.Changes = changed(entry.Changes, "name", "", name)
+	}
+	if req.Description != nil {
+		entry.Changes = append(entry.Changes, store.AuditChange{Key: "description", After: "changed"})
+	}
+	if req.KlipyAPIKey != nil {
+		// The credential itself never reaches the log. That it was replaced is
+		// the part a moderator reading this needs to know.
+		entry.Changes = append(entry.Changes, store.AuditChange{Key: "klipyApiKey", After: "changed"})
+	}
+	if voiceChanged {
+		entry.Changes = append(entry.Changes, store.AuditChange{Key: "voice", After: "reconfigured"})
+	}
+	s.hub.audit(context.Background(), s, entry)
 
 	if voiceChanged {
 		// The Opus parameters live in SDP that was negotiated before this, and

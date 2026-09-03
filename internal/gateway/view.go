@@ -285,6 +285,24 @@ func (h *Hub) serverInfo() protocol.ServerInfo {
 		Uploads:             h.uploadInfo(),
 		KlipyEnabled:        h.KlipyAPIKey() != "",
 		DirectMessages:      h.DirectMessagesEnabled(),
+		Expressions:         h.expressionLimits(),
+	}
+}
+
+// expressionLimits is what a client is told before it uploads a custom emoji,
+// sticker or sound: how many slots are left to fill and how big and how long
+// one may be. The trimmer needs the duration before it can cut anything, which
+// is why this travels in the preview rather than being discovered by refusal.
+func (h *Hub) expressionLimits() protocol.ExpressionLimits {
+	cfg := h.cfg.Expressions
+	return protocol.ExpressionLimits{
+		MaxEmojis:       cfg.MaxEmojis,
+		MaxStickers:     cfg.MaxStickers,
+		MaxSounds:       cfg.MaxSounds,
+		MaxSoundSeconds: cfg.MaxSoundSeconds,
+		MaxEmojiBytes:   strconv.FormatInt(cfg.MaxEmojiBytes, 10),
+		MaxStickerBytes: strconv.FormatInt(cfg.MaxStickerBytes, 10),
+		MaxSoundBytes:   strconv.FormatInt(cfg.MaxSoundBytes, 10),
 	}
 }
 

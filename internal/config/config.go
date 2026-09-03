@@ -25,6 +25,7 @@ type Config struct {
 	Registration Registration `json:"registration"`
 	Voice        Voice        `json:"voice"`
 	Uploads      Uploads      `json:"uploads"`
+	Expressions  Expressions  `json:"expressions"`
 	Unfurl       Unfurl       `json:"unfurl"`
 	Integrations Integrations `json:"integrations"`
 	DDNS         DDNS         `json:"ddns"`
@@ -181,6 +182,34 @@ type Uploads struct {
 	// is kept before it is swept. Someone who picks a file and then abandons
 	// the message leaves one behind, and it must not be kept forever.
 	PendingTTLMinutes int `json:"pending_ttl_minutes"`
+}
+
+// Expressions governs what a server carries for its own people: custom emoji,
+// stickers, and the soundboard.
+//
+// The ceilings are per server rather than per uploader because that is what
+// they are protecting — one shared namespace and one disk — and because the
+// person who fills them is by definition somebody already trusted with
+// ManageExpressions.
+type Expressions struct {
+	// MaxEmojis and MaxStickers cap the shared namespace. Fifty each is
+	// Discord's free tier and about as many as a picker stays usable at.
+	MaxEmojis   int `json:"max_emojis"`
+	MaxStickers int `json:"max_stickers"`
+	// MaxSounds caps the soundboard.
+	MaxSounds int `json:"max_sounds"`
+	// MaxSoundSeconds is how long one clip may run. The client trims to it
+	// before uploading, and the server checks the result: a clip is played at
+	// everybody in the room at once, and length is the whole of how annoying
+	// that can be made.
+	MaxSoundSeconds int `json:"max_sound_seconds"`
+	// The byte ceilings. A sound is allowed more room than a picture because a
+	// trimmed clip arrives as uncompressed audio: the client cuts the file it
+	// was given, and re-encoding to Opus in a browser costs a second of wall
+	// time per second of audio.
+	MaxEmojiBytes   int64 `json:"max_emoji_bytes"`
+	MaxStickerBytes int64 `json:"max_sticker_bytes"`
+	MaxSoundBytes   int64 `json:"max_sound_bytes"`
 }
 
 // Unfurl controls link preview fetching and caching.
@@ -352,6 +381,15 @@ const (
 	DefaultMaxAvatarBytes int64 = 8 * 1024 * 1024
 	DefaultMaxBannerBytes int64 = 16 * 1024 * 1024
 	DefaultMaxTotalBytes  int64 = 5 * 1024 * 1024 * 1024
+
+	DefaultMaxEmojis       = 50
+	DefaultMaxStickers     = 50
+	DefaultMaxSounds       = 50
+	DefaultMaxSoundSeconds = 10
+
+	DefaultMaxEmojiBytes   int64 = 512 * 1024
+	DefaultMaxStickerBytes int64 = 1024 * 1024
+	DefaultMaxSoundBytes   int64 = 4 * 1024 * 1024
 )
 
 // The audio plane a fresh install starts from. 48 kHz is Opus's own clock, so
@@ -426,6 +464,15 @@ func Default() Config {
 			MaxTotalBytes:     DefaultMaxTotalBytes,
 			MaxPerMessage:     10,
 			PendingTTLMinutes: 60,
+		},
+		Expressions: Expressions{
+			MaxEmojis:       DefaultMaxEmojis,
+			MaxStickers:     DefaultMaxStickers,
+			MaxSounds:       DefaultMaxSounds,
+			MaxSoundSeconds: DefaultMaxSoundSeconds,
+			MaxEmojiBytes:   DefaultMaxEmojiBytes,
+			MaxStickerBytes: DefaultMaxStickerBytes,
+			MaxSoundBytes:   DefaultMaxSoundBytes,
 		},
 		Unfurl: Unfurl{
 			Enabled:      true,
@@ -555,6 +602,7 @@ func (c *Config) Validate() error {
 	if err := c.Voice.validate(); err != nil {
 		return err
 	}
+	c.Expressions.validate()
 
 	if c.Uploads.Enabled {
 		c.Uploads.Path = strings.TrimSpace(c.Uploads.Path)
@@ -631,6 +679,44 @@ func (c *Config) Validate() error {
 }
 
 // Address is the host:port the listener binds to.
+// validate fills in anything the file left out or set to nonsense. Nothing here
+// is fatal: a server whose emoji ceiling reads zero should carry the default
+// number of emoji, not refuse to start.
+func (e *Expressions) validate() {
+	if e.MaxEmojis < 0 {
+		e.MaxEmojis = 0
+	} else if e.MaxEmojis == 0 {
+		e.MaxEmojis = DefaultMaxEmojis
+	}
+	if e.MaxStickers < 0 {
+		e.MaxStickers = 0
+	} else if e.MaxStickers == 0 {
+		e.MaxStickers = DefaultMaxStickers
+	}
+	if e.MaxSounds < 0 {
+		e.MaxSounds = 0
+	} else if e.MaxSounds == 0 {
+		e.MaxSounds = DefaultMaxSounds
+	}
+	if e.MaxSoundSeconds < 1 {
+		e.MaxSoundSeconds = DefaultMaxSoundSeconds
+	}
+	// A minute is the ceiling on the ceiling. The soundboard is a soundboard,
+	// and a clip long enough to be a song is a file to post in a channel.
+	if e.MaxSoundSeconds > 60 {
+		e.MaxSoundSeconds = 60
+	}
+	if e.MaxEmojiBytes < 1 {
+		e.MaxEmojiBytes = DefaultMaxEmojiBytes
+	}
+	if e.MaxStickerBytes < 1 {
+		e.MaxStickerBytes = DefaultMaxStickerBytes
+	}
+	if e.MaxSoundBytes < 1 {
+		e.MaxSoundBytes = DefaultMaxSoundBytes
+	}
+}
+
 func (c *Config) Address() string {
 	return net.JoinHostPort(c.Server.Bind, strconv.Itoa(c.Server.Port))
 }

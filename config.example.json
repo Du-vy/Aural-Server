@@ -45,6 +45,15 @@
     "max_per_message": 10,
     "pending_ttl_minutes": 60
   },
+  "expressions": {
+    "max_emojis": 50,
+    "max_stickers": 50,
+    "max_sounds": 50,
+    "max_sound_seconds": 10,
+    "max_emoji_bytes": 524288,
+    "max_sticker_bytes": 1048576,
+    "max_sound_bytes": 4194304
+  },
   "unfurl": {
     "enabled": true,
     "cache_ttl_days": 7

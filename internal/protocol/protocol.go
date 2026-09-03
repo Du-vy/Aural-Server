@@ -50,6 +50,33 @@ const (
 	OpUserMove   = "user.move"   // move self (or another user) between channels
 	OpUserKick   = "user.kick"
 
+	// Bans. A kick ends a connection; a ban is a standing refusal, so it has
+	// its own small set of ops and a list that outlives everybody named in it.
+	OpBanList   = "ban.list"
+	OpBanCreate = "ban.create"
+	OpBanDelete = "ban.delete" // lift one
+
+	// The record of what moderators did. There is no op to write one: entries
+	// are produced by the actions themselves, never by a client.
+	OpAuditList = "audit.list"
+
+	// Automatic moderation. The whole rule set is read and written at once,
+	// because the rules constrain one another and a half-applied edit is not a
+	// state worth being able to reach.
+	OpAutoModGet    = "automod.get"
+	OpAutoModUpdate = "automod.update"
+
+	// Custom emoji and stickers. Creating one is an upload over HTTP, like
+	// every other file; these are what is left — renaming and removing.
+	OpExpressionUpdate = "expression.update"
+	OpExpressionDelete = "expression.delete"
+
+	// The soundboard. Uploading a clip is an HTTP upload; playing one is a
+	// frame, because everybody in the channel has to hear it at once.
+	OpSoundUpdate = "sound.update"
+	OpSoundDelete = "sound.delete"
+	OpSoundPlay   = "sound.play"
+
 	OpChannelCreate = "channel.create"
 	OpChannelUpdate = "channel.update"
 	OpChannelDelete = "channel.delete"
@@ -117,6 +144,29 @@ const (
 	EvUserMoved        = "user.moved"
 	EvUserRemoved      = "user.removed"
 
+	EvBanCreated = "ban.created"
+	EvBanDeleted = "ban.deleted"
+
+	// EvAuditEntry carries one new line of the log, so a settings screen that
+	// is open updates rather than going stale. It only reaches the sessions
+	// allowed to read the log at all.
+	EvAuditEntry = "audit.entry"
+
+	EvAutoModUpdated = "automod.updated"
+
+	EvExpressionCreated = "expression.created"
+	EvExpressionUpdated = "expression.updated"
+	EvExpressionDeleted = "expression.deleted"
+
+	EvSoundCreated = "sound.created"
+	EvSoundUpdated = "sound.updated"
+	EvSoundDeleted = "sound.deleted"
+	// EvSoundPlayed reaches everybody sitting in the voice channel it was
+	// played in. Each client fetches the clip and mixes it into its own
+	// output, which is what makes the soundboard work identically whoever is
+	// relaying the call.
+	EvSoundPlayed = "sound.played"
+
 	EvChannelCreated = "channel.created"
 	EvChannelUpdated = "channel.updated"
 	EvChannelDeleted = "channel.deleted"
@@ -178,6 +228,16 @@ const (
 	ErrPostLocked         = "post_locked"    // no more comments are accepted on it
 	ErrVoiceDisabled      = "voice_disabled" // this server runs no audio plane
 	ErrVoiceFailed        = "voice_failed"   // the media session could not be set up
+	// ErrBanned is the refusal a banned connection is given. Its message
+	// carries the reason and, when the ban ends, when.
+	ErrBanned = "banned"
+	// ErrAutoModBlocked is a message a rule refused to accept. It is separate
+	// from forbidden because nothing about the writer is wrong: the same
+	// person may send the same message with one word changed.
+	ErrAutoModBlocked = "automod_blocked"
+	// ErrExpressionLimit is a server that already holds as many emoji,
+	// stickers or sounds as it is configured to.
+	ErrExpressionLimit = "expression_limit"
 )
 
 // Error is the payload of an OpError reply.

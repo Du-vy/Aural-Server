@@ -119,6 +119,9 @@ never on `message`.
 | `uploads_disabled` | This server does not accept file uploads. |
 | `dm_disabled` | This server does not carry private conversations. |
 | `dm_blocked` | A privacy setting refuses this private message. |
+| `banned` | A ban in force catches this connection. The message names the reason and, when the ban ends, the date. |
+| `automod_blocked` | A rule refused the message. Separate from `forbidden`: nothing about the writer is wrong. |
+| `expression_limit` | This server already holds as many emoji, stickers or sounds as it is configured to. |
 
 ## Numbers
 
@@ -396,7 +399,77 @@ member.
     "maxTotalBytes": "5368709120",  // "0" means no ceiling but the disk
     "usedBytes": "1048576",
     "maxPerMessage": 10
+  },
+  "expressions": {
+    "maxEmojis": 50,
+    "maxStickers": 50,
+    "maxSounds": 50,
+    "maxSoundSeconds": 10,        // the trimmer cuts to this before uploading
+    "maxEmojiBytes": "524288",
+    "maxStickerBytes": "1048576",
+    "maxSoundBytes": "4194304"
   }
+}
+
+// Ban - one standing refusal
+{
+  "id": 3,
+  "userId": 9,                 // null once the identity is gone, which for a
+                               // guest is immediately
+  "userNickname": "Nuisance",
+  "userUsername": null,
+  "actorId": 4,
+  "actorNickname": "Pablo",
+  "reason": "spam",
+  "createdAt": 1735689600,
+  "expiresAt": null,           // null is permanent
+  "active": true,              // false once the date has passed; the row stays
+  // What it catches, counted rather than named: an address and a device hash
+  // identify somebody off this server too.
+  "matches": [
+    { "kind": "user", "count": 1 },
+    { "kind": "device", "count": 2 }
+  ]
+}
+
+// AuditEntry - one line of the record of what moderators did
+{
+  "id": 41,
+  "actorId": 4,
+  "actorName": "Pablo",
+  "action": "user.ban",
+  "targetType": "user",        // user | role | channel | message | post
+                               // | server | webhook | expression | sound
+  "targetId": 9,
+  "targetName": "Nuisance",    // captured as it read at the time
+  "reason": "spam",
+  "changes": [{ "key": "expires", "before": "", "after": "2026-01-01T00:00:00Z" }],
+  "createdAt": 1735689600
+}
+
+// Expression - a custom emoji or sticker
+{
+  "id": 2,
+  "kind": "emoji",             // emoji | sticker
+  "name": "shrug",             // what writers type between colons
+  "url": "/attachments/<key>/shrug.png",
+  "animated": false,
+  "size": "4096",
+  "creatorId": 4,
+  "createdAt": 1735689600
+}
+
+// Sound - one soundboard clip
+{
+  "id": 1,
+  "name": "Airhorn",
+  "emoji": "",                 // the glyph on the button; may be empty
+  "url": "/attachments/<key>/airhorn.wav",
+  "durationMs": 2000,
+  "volume": 100,               // 0-100, the clip's own level
+  "size": "192044",
+  "creatorId": 4,
+  "createdAt": 1735689600
 }
 ```
 
@@ -421,10 +494,14 @@ A 64-bit mask. `Administrator` bypasses every other check.
 | 12 | `ManageMessages` | Delete other people's messages |
 | 13 | `ManageWebhooks` | Create, edit and revoke the webhooks of a channel |
 | 14 | `CreatePosts` | Start an entry in an announcement, forum, media or calendar channel |
+| 15 | `UseSoundboard` | Play one of the server's stored sounds at a voice channel |
 | 16 | `KickUsers` | Disconnect a user |
 | 17 | `MoveUsers` | Move a user between voice channels |
 | 18 | `MuteUsers` | Reserved for voice moderation |
 | 19 | `DeafenUsers` | Reserved for voice moderation |
+| 20 | `BanUsers` | Refuse somebody the server, and the address and device behind them |
+| 21 | `ViewAuditLog` | Read the record of what moderators did |
+| 22 | `ManageExpressions` | Upload and remove custom emoji, stickers and soundboard sounds |
 | 31 | `Administrator` | Everything, unconditionally |
 
 ### Resolution
@@ -490,7 +567,18 @@ Every op below needs an authenticated session.
 | `server.update` | `ManageServer` | `{ name?, description?, klipyApiKey?, voice? }`. Persisted to the configuration file. `voice` replaces the audio plane whole and restarts every call. |
 | `user.update` | `ChangeNickname`, or `ManageNicknames` for others | `{ userId?, nickname }`. Renaming somebody else works while they are offline; the rest of the fields are your own and need a connection. |
 | `user.move` | `Connect` on the destination; `MoveUsers` for others | `{ userId?, channelId }`. `channelId: null` leaves. The target must be connected. |
-| `user.kick` | `KickUsers` | `{ userId, reason? }`. Disconnects, so the target must be connected; there are no bans in v0.1. |
+| `user.kick` | `KickUsers` | `{ userId, reason?, deleteMessages? }`. Ends the connection and removes the identity. `deleteMessages` purges what they wrote: `none`, `1d`, `7d`, `30d` or `all`. |
+| `ban.list` | `BanUsers` | `{}`. Newest first. The handles a ban catches are counted, never named. |
+| `ban.create` | `BanUsers`, and rank over the target | `{ userId, reason?, duration?, deleteMessages?, matchIp?, matchDevice? }`. `duration` is in seconds; zero, or absent, is permanent. Both match flags default to on. |
+| `ban.delete` | `BanUsers` | `{ banId }`. Lifts the ban and every handle it held. |
+| `audit.list` | `ViewAuditLog` | `{ actorId?, action?, before?, limit? }`. Pages backwards by entry id. There is no op to write one. |
+| `automod.get` | `ManageServer` | `{}`. The whole rule set. |
+| `automod.update` | `ManageServer` | `{ config }`. Replaces it whole. What comes back is what is now in force, bounded and de-duplicated. |
+| `expression.update` | `ManageExpressions` | `{ expressionId, name }`. Renames a custom emoji or sticker. The picture itself is never edited. |
+| `expression.delete` | `ManageExpressions` | `{ expressionId }`. Takes the file with it. |
+| `sound.update` | `ManageExpressions` | `{ soundId, name?, emoji?, volume? }`. `volume` runs 0–100. |
+| `sound.delete` | `ManageExpressions` | `{ soundId }`. Takes the file with it. |
+| `sound.play` | `UseSoundboard` in the channel you are sitting in | `{ soundId }`. The channel is not a parameter: it is wherever you are. Refused while moderator-muted. Rate limited far more tightly than a message. |
 | `channel.create` | `ManageChannels` on the parent | `{ name, type, parentId?, topic?, position?, userLimit? }`. |
 | `channel.update` | `ManageChannels` on the channel; `ManageRoles` to touch `overwrites` | `{ channelId, name?, topic?, parentId?, position?, userLimit?, overwrites? }`. |
 | `channel.delete` | `ManageChannels` on the channel | `{ channelId }`. Cascades to descendants. |
@@ -549,6 +637,178 @@ Two notes on `user.move`:
   channel you are not in.
 - `parentId` in `channel.update` is three-valued: absent leaves the parent alone,
   `null` detaches the channel to the root, and a number reparents it.
+
+## Moderation
+
+### Bans
+
+A kick ends a connection. A ban is a standing decision, and it is stored as one:
+a row saying who, why, by whom and until when, and a set of **handles** it is
+matched against.
+
+There are three kinds of handle, and a ban usually carries several:
+
+| Kind | What it is | What it is worth |
+| --- | --- | --- |
+| `user` | The identity itself | Exact, and replaced for free on a server that hands out guest identities |
+| `ip` | The address it connected from | Changes on a reboot; shared by a household, a university, one phone network |
+| `device` | The machine behind it, as this server sees it | Survives a new account and a cleared browser profile |
+
+Which handles a ban picks up is decided by the server, from where that identity
+has actually been seen — the connection it is on right now, and the last few
+addresses and devices recorded against it. `matchIp` and `matchDevice` are the
+switches that say how far to reach.
+
+**The device handle is a hash the client computes.** `hello` carries a
+`deviceSalt`: a random value this server minted once and keeps. A client folds
+it into whatever stable attributes it can read about the machine and sends the
+hash as `device` on the auth op that follows. So the value identifies a machine
+*on this server*, which is what makes a ban survive a new account, and is
+unrelated to the value the same machine presents anywhere else, so it cannot be
+used to follow somebody between servers. A client that sends none matches
+nothing, which is not an error: it is a way of making a ban stick, not a
+credential.
+
+None of this is a wall, and it is not meant to be. Somebody who reinstalls their
+system, or runs a client they modified, is through. What it raises is the cost of
+the ordinary case: closing the client, opening it again, and coming straight back
+as a new guest.
+
+**Bans are enforced on the authentication op, never on the upgrade.** An address
+is shared, so the one check that could not tell who was asking is the one that
+would eventually lock somebody's own staff out. By the time the auth op runs the
+identity is known, and:
+
+- **The owner is never refused**, however a ban was issued. A server whose owner
+  cannot get in has no way back.
+- **A handle the moderator issuing the ban, or the owner, is also sitting behind
+  is not attached to it.** Banning a troublemaker from your own network must not
+  ban you.
+
+The ban list never carries the handle values. A moderator deciding whether to
+lift a ban needs to know that it reaches a machine, not which machine, and an
+address identifies somebody off this server as well as on it.
+
+A ban whose date has passed stops being enforced the moment it does, and stays
+in the list as a record of what was done.
+
+### The audit log
+
+Every moderation action writes one entry: who did it, what they did, what it was
+done to, and which fields changed. Everything about the target is captured as it
+read at the time, so a role deleted last week still has its name in the log.
+
+There is no op to write an entry. A record a client could append to would be a
+record of what somebody claimed to have done.
+
+`audit.entry` is pushed to the sessions holding `ViewAuditLog` as entries are
+written, so an open settings screen stays current.
+
+A blocked message is deliberately not copied into the log. It was never accepted
+by this server, and writing it into a table more people can read than could have
+read the message would make the blocking the thing that published it.
+
+### Automatic moderation
+
+`automod.get` and `automod.update` read and write one object. It is whole rather
+than per field because the rules constrain one another, and a half-applied edit
+is not a state worth being able to reach.
+
+Six rules, each with `enabled`, an `action`, and its own `exemptRoles` on top of
+the server-wide list:
+
+| Rule | Matches | Actions |
+| --- | --- | --- |
+| `words` | Listed terms, folded the way search folds them, so one entry catches every capitalisation and accent. `wholeWord` keeps a list from catching an innocent word that contains a banned one. | `block`, `censor` |
+| `links` | URLs, including the ones written without a scheme. `allowedDomains` are let through, and an entry covers its own subdomains. | `block`, `censor` |
+| `mentions` | More than `limit` people addressed in one message. | `block` |
+| `caps` | More than `percent` of the cased letters upper case, ignoring messages shorter than `minLength`. | `block` |
+| `flood` | More than `messages` sent within `seconds`. | `block` |
+| `repetition` | The same message `times` in a row. | `block` |
+
+A rule that has nothing to mask can only block: a message that mentions too many
+people cannot be partly mentioned. The server rewrites `censor` to `block` on
+those rather than refusing the edit.
+
+Rules run on the way in, so a blocked message never existed and a censored one
+was never stored uncensored. Edits and post titles are screened too — a rule
+that only looked at sends would be worked around by posting a full stop and
+editing it — but neither counts towards `flood` or `repetition`: an edit is not
+a new message.
+
+Holding `Administrator` is exemption in itself, which is the rule the permission
+mask follows everywhere else on this server.
+
+A refused message answers `automod_blocked`, with a message naming what stopped
+it. It is a separate code from `forbidden` because nothing about the writer is
+wrong: the same person may send the same message with one word changed.
+
+## Expressions and the soundboard
+
+### Custom emoji and stickers
+
+One table, one namespace, one management screen. They differ in where a client
+draws them: an emoji goes inline in a line of text, a sticker is the whole of a
+message.
+
+Uploading is HTTP, like every other file:
+
+```
+POST /upload/emoji?name=<name>
+POST /upload/sticker?name=<name>
+Authorization: Bearer <session token>
+Content-Type: multipart/form-data, one part named "file"
+```
+
+`ManageExpressions`, PNG / GIF / WebP / JPG, and one name per kind. A name is
+two to thirty-two characters of letters, digits and underscores — narrow because
+it sits between two colons in the middle of a sentence, and anything that could
+also be punctuation would make `:name:` ambiguous with the text around it.
+
+The reply is an `Expression`, and `expression.created` reaches everybody.
+
+**Nothing is rewritten on the way in.** A message written with `:shrug:` stores
+`:shrug:`, and a client resolves it against the emoji table when it renders. So
+history survives an emoji being renamed or deleted, and reading a server that
+carries none shows the colons somebody actually typed.
+
+The whole table travels in `ready`, because a message cannot be rendered without
+it: `:shrug:` in the very first line of history has to resolve before anything is
+drawn.
+
+### The soundboard
+
+Short clips anybody in a voice channel may play at the room.
+
+```
+POST /upload/sound?name=<name>&emoji=<emoji>
+Authorization: Bearer <session token>
+Content-Type: multipart/form-data, one part named "file"
+```
+
+`ManageExpressions`, and **WAV only**. That is what makes the length limit
+enforceable rather than merely declared: a RIFF header states its own duration,
+so the server reads how long a clip runs instead of believing a number the
+uploader chose. The client decodes whatever was picked, cuts the range somebody
+chose, and re-encodes — which is also what makes trimming a three-minute song
+down to eight seconds something that happens in the picker rather than in
+another application.
+
+The ceilings are per server and are advertised in `ServerInfo.expressions`, so a
+client knows before it uploads: `maxEmojis`, `maxStickers`, `maxSounds`,
+`maxSoundSeconds`, and a byte ceiling for each kind. They are configured under
+`expressions` in the configuration file.
+
+`sound.play` names only the clip. The channel is wherever the caller is sitting,
+because playing a sound into a room you are not in is not something anybody
+should be able to do. The server checks `UseSoundboard` there, refuses a
+participant a moderator has muted, and pushes `sound.played` to everybody in the
+channel.
+
+**Each client fetches the clip and mixes it into its own output.** Nothing is
+injected into anybody's microphone. So it sounds the same to everybody, it works
+identically whether the call is relayed by the server or by another participant,
+and being deafened silences it exactly as it silences everything else.
 
 ## Voice
 
@@ -1103,6 +1363,12 @@ They default to 50 MiB and 5 GiB.
 | `role.created` / `role.updated` / `role.deleted` | `{ role }` / `{ roleId }` | Everyone. |
 | `server.updated` | `{ server }` | Everyone. |
 | `voice.*` | See [Voice](#voice) | The audio plane. |
+| `ban.created` / `ban.deleted` | Reaches the sessions holding `BanUsers`. |
+| `audit.entry` | One new line of the log. Reaches the sessions holding `ViewAuditLog`. |
+| `automod.updated` | Reaches the sessions holding `ManageServer`. |
+| `expression.created` / `expression.updated` / `expression.deleted` | The custom emoji and stickers. Everybody, since everybody renders them. |
+| `sound.created` / `sound.updated` / `sound.deleted` | The soundboard. |
+| `sound.played` | `{ soundId, userId, channelId }`. Reaches everybody sitting in that voice channel, whether or not they hold a media session. |
 
 When a permission change could add or remove channels from what somebody is
 allowed to see, the affected clients receive a fresh `ready` event rather than a
@@ -1139,9 +1405,9 @@ refresh is worth.
 Group conversations, files in a private conversation, and blocking somebody
 outright: `dmPrivacy` is a door held for a class of people, not a list of names.
 
-Bans, per-user permission overwrites, and screen sharing. Video would reuse the
-whole of [Voice](#voice) — the signalling is codec-agnostic — and needs a
-second track and a way to say which is which.
+Per-user permission overwrites and screen sharing. Video would reuse the whole
+of [Voice](#voice) - the signalling is codec-agnostic - and needs a second
+track and a way to say which is which.
 
 Voice states are not persisted, for the same reason channel membership is not:
 a mute belongs to a session. An identity that reconnects arrives unmuted, and a

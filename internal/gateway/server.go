@@ -94,6 +94,12 @@ func New(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Stor
 	mux.HandleFunc("OPTIONS /upload/avatar", s.handlePreflight)
 	mux.HandleFunc("POST /upload/banner", s.handleBannerUpload)
 	mux.HandleFunc("OPTIONS /upload/banner", s.handlePreflight)
+	mux.HandleFunc("POST /upload/emoji", s.handleEmojiUpload)
+	mux.HandleFunc("OPTIONS /upload/emoji", s.handlePreflight)
+	mux.HandleFunc("POST /upload/sticker", s.handleStickerUpload)
+	mux.HandleFunc("OPTIONS /upload/sticker", s.handlePreflight)
+	mux.HandleFunc("POST /upload/sound", s.handleSoundUploadHTTP)
+	mux.HandleFunc("OPTIONS /upload/sound", s.handlePreflight)
 	mux.HandleFunc("GET "+uploadPrefix+"{key}/{filename}", s.handleAttachment)
 	mux.HandleFunc("OPTIONS "+uploadPrefix+"{key}/{filename}", s.handlePreflight)
 	mux.HandleFunc("GET /unfurl", s.handleUnfurl)
@@ -241,6 +247,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bans are deliberately not enforced here, where the only thing known
+	// about a connection is where it came from.
+	//
+	// Refusing a banned address at the upgrade would save a socket and four
+	// rate limiters, and would also be the one check that cannot tell who is
+	// asking. An address is shared — a household, a university, one phone
+	// network — so on the day somebody bans a troublemaker from the same
+	// network as themselves, that check is what locks the owner out of their
+	// own server with no way back in. Every ban is therefore enforced on the
+	// authentication op, where the identity is known and the owner is exempt.
+	// An unauthenticated socket is already bounded by the auth deadline and by
+	// the headroom above max_users.
+
 	// Counted before the upgrade, so a flood is refused with an HTTP status a
 	// client can read rather than with a socket that is opened and then shut.
 	live := s.live.Add(1)
@@ -266,12 +285,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// The peer travels with every line this session logs, so an authentication
 	// that fails, a rate limit that trips or a client that falls behind can be
 	// traced back to where it came from.
-	session := newSession(s.seq.Add(1), s.hub, conn, s.log.With(slog.String("peer", peer)))
+	session := newSession(s.seq.Add(1), s.hub, conn, peer, s.log.With(slog.String("peer", peer)))
 	defer s.finishSession(session)
 
 	session.Send(protocol.Event(protocol.EvHello, protocol.Hello{
 		Server:      s.hub.serverInfo(),
 		HeartbeatMs: int(heartbeatInterval.Milliseconds()),
+		DeviceSalt:  s.hub.DeviceSalt(),
 	}))
 	session.serve(r.Context())
 }

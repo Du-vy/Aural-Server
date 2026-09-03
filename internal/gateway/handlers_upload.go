@@ -499,6 +499,12 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 			filename = picture.Filename
 			contentType = uploads.ContentType(picture.Filename)
 			modTime = time.Unix(picture.CreatedAt, 0)
+		} else if name, kind, at, eErr := s.st.FileByStorageKey(r.Context(), key); eErr == nil {
+			// A custom emoji, a sticker or a soundboard clip, which live in
+			// their own tables for the same reason avatars do.
+			filename = name
+			contentType = kind
+			modTime = time.Unix(at, 0)
 		} else {
 			contentType = uploads.ContentType(filename)
 		}
@@ -614,15 +620,15 @@ func writeProtocolError(w http.ResponseWriter, failure *protocol.Error) {
 
 func statusForCode(code string) int {
 	switch code {
-	case protocol.ErrBadRequest:
+	case protocol.ErrBadRequest, protocol.ErrAutoModBlocked:
 		return http.StatusBadRequest
 	case protocol.ErrUnauthorized, protocol.ErrInvalidCredentials:
 		return http.StatusUnauthorized
-	case protocol.ErrForbidden, protocol.ErrGuestsDisabled, protocol.ErrUploadsDisabled:
+	case protocol.ErrForbidden, protocol.ErrGuestsDisabled, protocol.ErrUploadsDisabled, protocol.ErrBanned:
 		return http.StatusForbidden
 	case protocol.ErrNotFound:
 		return http.StatusNotFound
-	case protocol.ErrConflict:
+	case protocol.ErrConflict, protocol.ErrExpressionLimit:
 		return http.StatusConflict
 	case protocol.ErrTooLarge:
 		return http.StatusRequestEntityTooLarge
@@ -678,12 +684,20 @@ func (s *Server) sweepOrphanedFiles(ctx context.Context) {
 		s.log.Warn("skipping orphan sweep: could not read profile media keys", slog.Any("error", err))
 		return
 	}
+	expressions, err := s.st.ExpressionKeys(ctx)
+	if err != nil {
+		s.log.Warn("skipping orphan sweep: could not read expression keys", slog.Any("error", err))
+		return
+	}
 
-	keep := make(map[string]struct{}, len(attachments)+len(pictures))
+	keep := make(map[string]struct{}, len(attachments)+len(pictures)+len(expressions))
 	for _, key := range attachments {
 		keep[key] = struct{}{}
 	}
 	for _, key := range pictures {
+		keep[key] = struct{}{}
+	}
+	for _, key := range expressions {
 		keep[key] = struct{}{}
 	}
 
@@ -795,6 +809,19 @@ func (s *Server) sweepRetention(ctx context.Context) {
 			s.log.Warn("prune stale tokens", slog.Any("error", err))
 		} else if revoked > 0 {
 			s.log.Info("revoked idle session tokens", slog.Int64("count", revoked))
+		}
+	}
+
+	// Where identities have connected from exists to make a ban land, and a
+	// place nobody has connected from in months would not. It is pruned on the
+	// same window as the tokens, which is the other thing that stops being
+	// true about somebody who has gone.
+	if days := s.cfg.Retention.TokenIdleDays; days > 0 {
+		cutoff := now.Add(-time.Duration(days) * 24 * time.Hour).Unix()
+		if dropped, err := s.st.PruneIdentityMarks(ctx, cutoff); err != nil {
+			s.log.Warn("prune identity marks", slog.Any("error", err))
+		} else if dropped > 0 {
+			s.log.Info("forgot where idle identities used to connect from", slog.Int64("count", dropped))
 		}
 	}
 

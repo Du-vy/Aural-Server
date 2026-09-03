@@ -141,6 +141,15 @@ leave out falls back to its default. See `config.example.json` for the full file
     "max_per_message": 10,
     "pending_ttl_minutes": 60       // how long an unposted upload is kept
   },
+  "expressions": {
+    "max_emojis": 50,          // custom emoji this server carries
+    "max_stickers": 50,
+    "max_sounds": 50,          // soundboard clips
+    "max_sound_seconds": 10,   // how long one clip may run
+    "max_emoji_bytes": 524288,
+    "max_sticker_bytes": 1048576,
+    "max_sound_bytes": 4194304
+  },
   "ddns": {
     "enabled": false,          // keep a dynamic DNS record pointing here
     "provider": "",            // duckdns | cloudflare
@@ -361,6 +370,123 @@ Deleting a message deletes the files it carried, on disk and in the database.
 That is the whole of the moderation story: anyone who may delete the message —
 its author, or a holder of `ManageMessages` — takes its files with it.
 
+## Moderation
+
+### Kicks and bans
+
+A kick ends a connection. A ban is a standing decision, and the difference
+matters on a server that hands out guest identities to anybody who asks: an
+account is one click away from being replaced, so banning one buys nothing on
+its own.
+
+A ban therefore carries up to three **handles**, and is matched on any of them:
+
+| Handle | Strength |
+| --- | --- |
+| The account | Exact, and free to replace |
+| The address it connected from | Changes on a reboot; shared by a household, a university, one phone network |
+| The machine behind it | Survives a new account and a cleared browser profile |
+
+The machine handle is the interesting one, and it is deliberately not hardware
+fingerprinting. There are no serial numbers here, no volume identifiers, no
+registry reads, no spawned processes and no canvas readback — partly because
+that is the road to being flagged by an antivirus scanner, and mostly because it
+does not work any better: somebody who reinstalls their system is through either
+way. What the client sends is a hash over a random identifier it wrote once into
+the steadiest directory the platform offers, plus what the operating system
+hands any process for free.
+
+That hash is salted with a value **this server** minted and keeps, so the same
+machine presents a different identifier to every server it connects to: the
+value means something here, which is what makes a ban survive a new account and
+a cleared browser profile, and means nothing anywhere else, so it cannot be used
+to follow somebody around. The server never learns the material behind it.
+
+None of it is a wall. What it raises is the cost of the ordinary case: closing
+the client, opening it again, and coming straight back as a new guest.
+
+Two rules keep the feature from turning on the people using it:
+
+- **The owner is never refused**, however a ban was issued. A server whose owner
+  cannot get in has no way back.
+- **A handle the moderator issuing the ban, or the owner, is sitting behind is
+  not attached to it.** An address is shared, and banning a troublemaker from
+  your own network must not ban you.
+
+Bans need the new `BanUsers` permission and rank over the target. The list shows
+what each ban catches, counted rather than named: a moderator deciding whether
+to lift one needs to know that it reaches a machine, not which machine.
+
+### The audit log
+
+Every moderation action writes a line: who did it, what they did, what it was
+done to, and which fields changed — all captured as they read at the time, so a
+role deleted last week still has its name in the log.
+
+Nothing can write to it but the actions themselves. It is behind its own
+`ViewAuditLog` permission, which grants nothing else: reading the log is how a
+server holds its own staff to account, so it is deliberately reachable without
+any power to act.
+
+A blocked message is not copied into it. It was never accepted by this server,
+and writing it into a table more people can read than could have read the
+message would make the blocking the thing that published it.
+
+### AutoMod
+
+Six rules, applied to every message as it arrives, off until an administrator
+switches them on:
+
+| Rule | What it catches |
+| --- | --- |
+| Blocked words | Listed terms, matched however they were capitalised or accented |
+| Links | URLs, including the ones written without a scheme, with an allow list |
+| Mention spam | More than N people addressed at once |
+| Shouting | A message that is mostly capitals |
+| Flooding | More than N messages within M seconds |
+| Repetition | The same message N times in a row |
+
+Each either refuses the message or masks the offending part, and each carries
+its own list of exempt roles on top of a server-wide one — because those are
+genuinely different exemptions: staff are usually exempt from everything, while
+one rule is very often lifted for a single role that nothing else applies to.
+Holding `Administrator` is exemption in itself. Channels can be exempted too.
+
+Rules run on the way in, so a blocked message never existed and a censored one
+was never stored uncensored. Edits and post titles are screened as well, since a
+rule that only looked at sends would be worked around by posting a full stop and
+editing it.
+
+## Expressions and the soundboard
+
+Custom **emoji** are written into a message as `:name:` and rendered inline.
+Custom **stickers** are sent instead of a message. Both are uploaded over the
+same HTTP endpoints attachments use, under the new `ManageExpressions`
+permission, and both are capped per server.
+
+Nothing is rewritten on the way in: a message written with `:shrug:` stores
+`:shrug:`, and a client resolves it when it renders. So history survives an
+emoji being renamed or deleted, and reading a server that carries none shows the
+colons somebody actually typed.
+
+The **soundboard** is short clips anybody in a voice channel may play at the
+room, under `UseSoundboard`. Fifty clips of up to ten seconds by default, both
+configurable.
+
+Two decisions worth naming:
+
+- **A clip is uploaded as WAV**, whatever the file it was cut from. That is what
+  makes the length limit enforceable rather than merely declared: a RIFF header
+  states its own duration, so the server reads how long a clip runs instead of
+  believing a number the uploader chose. The client decodes whatever was picked,
+  trims the range somebody chose in the picker, and re-encodes.
+- **Each client plays the clip itself.** Nothing is injected into anybody's
+  microphone: the server says which clip was played, and every client in the
+  channel fetches it and mixes it into its own output. So it sounds the same to
+  everybody, works identically whether the call is relayed by the server or by
+  another participant, and being deafened silences it exactly as it silences
+  everything else.
+
 ## Webhooks
 
 A webhook is a URL that posts into one text channel with no account behind it —
@@ -437,7 +563,7 @@ Three roles are built in and cannot be deleted:
 
 | Role | Held by | Default permissions |
 | --- | --- | --- |
-| `everyone` | Everyone, guests included | View, Connect, Speak, SendMessages, ChangeNickname, Register, AttachFiles |
+| `everyone` | Everyone, guests included | View, Connect, Speak, SendMessages, ChangeNickname, Register, AttachFiles, SendDirectMessages, CreatePosts, UseSoundboard |
 | `Member` | Anyone who has claimed an account | None — a fresh server treats guests and members alike |
 | `Admin` | Whoever the owner grants it to | Administrator |
 
@@ -463,7 +589,7 @@ internal/config       JSON configuration, defaults and validation
 internal/store        SQLite schema, migrations and every query
 internal/auth         Argon2id passwords and opaque session tokens
 internal/permissions  the bitmask and the resolution rules
-internal/uploads      attachment storage on disk, quota and content types
+internal/uploads      attachment storage on disk, quota, content types, WAV length
 internal/voice        the Opus parameters, and the WebRTC relay
 internal/publicip     the address the relay advertises: literal, DNS or STUN
 internal/ddns         DuckDNS and Cloudflare: address records and DNS-01
@@ -540,7 +666,12 @@ pointed at one works by changing nothing but the address. Rich embeds, file
 deliveries, the GitHub and Slack payload dialects, per-webhook rate limits, and
 the `ManageWebhooks` permission.
 
-**Later** — bots and a bot API, bans, per-user permission overwrites, screen
+**Unreleased** — moderation that outlives a connection: bans matched on the
+account, the address and a salted per-server device identifier, an audit log
+of what moderators did, and AutoMod. Plus the things a server carries for its
+own people: custom emoji, stickers, and a soundboard.
+
+**Later** — bots and a bot API, per-user permission overwrites, screen
 sharing, and Aural Hub, a directory for finding public servers.
 
 ## License

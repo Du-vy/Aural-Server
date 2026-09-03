@@ -373,6 +373,133 @@ var migrations = []string{
 	-- which is the same shape as making a text channel read-only.
 	UPDATE roles SET permissions = permissions | 16384 WHERE managed = 'everyone';
 	`,
+	// 13: moderation that outlives a connection, the record of it, and the
+	// files a server carries for its own people.
+	//
+	// A ban is one decision with several handles on it. The row in bans is the
+	// decision — who, why, by whom, until when — and the rows in ban_matches
+	// are the things a connection is compared against: an identity, an
+	// address, a device. Splitting them is what lets one ban reach the account
+	// and the two addresses it was last seen from without becoming three
+	// unrelated bans that have to be lifted one at a time, and what makes the
+	// check on every connection a single indexed lookup.
+	`
+	CREATE TABLE bans (
+		id             INTEGER PRIMARY KEY AUTOINCREMENT,
+		-- The identity as it was. Deliberately not a foreign key: banning a
+		-- guest deletes the row it names, and a ban that forgot who it was for
+		-- the moment it took effect would be unreadable in the list.
+		user_id        INTEGER,
+		user_nickname  TEXT    NOT NULL,
+		user_username  TEXT,
+		actor_id       INTEGER,
+		actor_nickname TEXT    NOT NULL,
+		reason         TEXT    NOT NULL DEFAULT '',
+		created_at     INTEGER NOT NULL,
+		-- NULL is permanent. A ban that has expired is left in place rather
+		-- than deleted, so the list still shows that it happened.
+		expires_at     INTEGER
+	);
+	CREATE INDEX idx_bans_created ON bans(created_at DESC);
+	CREATE INDEX idx_bans_user ON bans(user_id) WHERE user_id IS NOT NULL;
+
+	CREATE TABLE ban_matches (
+		ban_id INTEGER NOT NULL REFERENCES bans(id) ON DELETE CASCADE,
+		-- 'user', 'ip' or 'device'.
+		kind   TEXT NOT NULL,
+		value  TEXT NOT NULL,
+		PRIMARY KEY (kind, value)
+	);
+	CREATE INDEX idx_ban_matches_ban ON ban_matches(ban_id);
+
+	-- Where an identity has connected from. It is what lets a ban issued
+	-- against an account also reach the address and the device behind it,
+	-- which is the whole of what makes banning a guest mean anything: the
+	-- identity itself lasts no longer than the connection.
+	--
+	-- The device value is a hash the client computes over a salt this server
+	-- minted, so it identifies a machine here and is meaningless anywhere
+	-- else. A client that sends none is recorded with an empty one, which
+	-- matches nothing.
+	CREATE TABLE identity_marks (
+		user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		ip            TEXT    NOT NULL DEFAULT '',
+		device        TEXT    NOT NULL DEFAULT '',
+		first_seen_at INTEGER NOT NULL,
+		last_seen_at  INTEGER NOT NULL,
+		PRIMARY KEY (user_id, ip, device)
+	);
+	CREATE INDEX idx_identity_marks_ip ON identity_marks(ip) WHERE ip <> '';
+	CREATE INDEX idx_identity_marks_device ON identity_marks(device) WHERE device <> '';
+	CREATE INDEX idx_identity_marks_seen ON identity_marks(last_seen_at);
+
+	-- What moderators did, in the order they did it. Every entry names an
+	-- actor, an action, and the thing it was done to, captured as it read at
+	-- the time: a role that is later deleted still has a name in the log.
+	CREATE TABLE audit_entries (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		actor_id    INTEGER,
+		actor_name  TEXT    NOT NULL,
+		action      TEXT    NOT NULL,
+		target_type TEXT    NOT NULL DEFAULT '',
+		target_id   INTEGER,
+		target_name TEXT    NOT NULL DEFAULT '',
+		reason      TEXT    NOT NULL DEFAULT '',
+		-- A JSON array of {key, before, after}, or NULL for an action that
+		-- changed nothing that can be written down that way.
+		changes     TEXT,
+		created_at  INTEGER NOT NULL
+	);
+	CREATE INDEX idx_audit_created ON audit_entries(id DESC);
+	CREATE INDEX idx_audit_actor ON audit_entries(actor_id, id DESC);
+	CREATE INDEX idx_audit_action ON audit_entries(action, id DESC);
+
+	-- The custom emoji and stickers a server carries. One table: they are the
+	-- same object — a name, a picture, and a namespace everybody shares — and
+	-- differ only in where a client renders them.
+	CREATE TABLE expressions (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		-- 'emoji' or 'sticker'.
+		kind         TEXT    NOT NULL,
+		name         TEXT    NOT NULL,
+		storage_key  TEXT    NOT NULL UNIQUE,
+		filename     TEXT    NOT NULL,
+		content_type TEXT    NOT NULL,
+		size         INTEGER NOT NULL,
+		animated     INTEGER NOT NULL DEFAULT 0,
+		creator_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+		created_at   INTEGER NOT NULL
+	);
+	-- A name is what a writer types, so it has to be unique within its kind.
+	CREATE UNIQUE INDEX idx_expressions_name ON expressions(kind, name);
+
+	-- The soundboard: short clips anybody in a voice channel may play at the
+	-- room. The bytes live in the upload store beside everything else; this is
+	-- the row that names one and keeps it out of the orphan sweep.
+	CREATE TABLE sounds (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		name         TEXT    NOT NULL,
+		-- The emoji shown on the button, which may be empty.
+		emoji        TEXT    NOT NULL DEFAULT '',
+		storage_key  TEXT    NOT NULL UNIQUE,
+		filename     TEXT    NOT NULL,
+		content_type TEXT    NOT NULL,
+		size         INTEGER NOT NULL,
+		duration_ms  INTEGER NOT NULL DEFAULT 0,
+		-- Per-sound playback level, 0..100, so one clip recorded hot does not
+		-- have to be re-cut to sit beside the others.
+		volume       INTEGER NOT NULL DEFAULT 100,
+		creator_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+		created_at   INTEGER NOT NULL
+	);
+	CREATE INDEX idx_sounds_name ON sounds(name);
+
+	-- Existing servers seeded their everyone role before the soundboard
+	-- existed, and a server that upgrades should behave like a fresh one:
+	-- playing a sound is something anybody in the channel may do until an
+	-- administrator says otherwise.
+	UPDATE roles SET permissions = permissions | 32768 WHERE managed = 'everyone';
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own
