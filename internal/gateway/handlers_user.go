@@ -394,6 +394,18 @@ func handleUserKick(ctx context.Context, s *Session, raw json.RawMessage) (any, 
 	}
 
 	if cutoff >= 0 {
+		// Posts go first. A post is a title in front of a thread, so deleting
+		// only the messages would leave their entries standing with nothing in
+		// them; deleting the post takes its whole thread, including whatever
+		// other people commented on it.
+		purgedPosts, err := s.hub.st.DeletePostsByUser(ctx, req.UserID, cutoff)
+		if err == nil {
+			for _, pt := range purgedPosts {
+				event := protocol.PostDeletedEvent{PostID: pt.ID, ChannelID: pt.ChannelID}
+				s.hub.BroadcastChannelEvent(protocol.Event(protocol.EvPostDeleted, event), pt.ChannelID)
+			}
+		}
+
 		deletedTargets, err := s.hub.st.DeleteMessagesByUser(ctx, req.UserID, cutoff)
 		if err == nil && len(deletedTargets) > 0 {
 			for _, dt := range deletedTargets {

@@ -308,6 +308,71 @@ var migrations = []string{
 	ALTER TABLE messages ADD COLUMN embeds TEXT;
 	CREATE INDEX idx_messages_webhook ON messages(webhook_id) WHERE webhook_id IS NOT NULL;
 	`,
+	// 12: posts, the entries of an announcement, forum, media or calendar
+	// channel.
+	//
+	// A post is a title and some metadata in front of an ordinary thread. Its
+	// body and its comments are rows in messages carrying post_id, which is
+	// what makes files, edits, deletion and moderation reach a post without a
+	// second implementation of any of them. The channel timeline is therefore
+	// the messages of a channel with no post_id, and a thread is the messages
+	// with one.
+	`
+	CREATE TABLE posts (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+		-- As in messages: an author who is deleted leaves their posts behind,
+		-- attributed to the name captured in author.
+		user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+		author     TEXT    NOT NULL,
+		title      TEXT    NOT NULL,
+		-- The first message of the thread. It is set immediately after the row
+		-- is inserted, in the same transaction, because the message needs the
+		-- post id and the post needs the message id. NULL means the body was
+		-- deleted out from under the post by a moderation purge, which renders
+		-- as a post with a title and nothing else.
+		root_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+		locked     INTEGER NOT NULL DEFAULT 0,
+		pinned     INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL,
+		edited_at  INTEGER,
+		-- Calendar posts only. NULL starts_at is what tells the two kinds
+		-- apart in a query, so it carries the same meaning as the channel type
+		-- and is cheaper to ask.
+		starts_at  INTEGER,
+		ends_at    INTEGER,
+		all_day    INTEGER NOT NULL DEFAULT 0,
+		location   TEXT    NOT NULL DEFAULT ''
+	);
+	-- A channel's entries are read newest first, exactly as its history is.
+	CREATE INDEX idx_posts_channel ON posts(channel_id, id DESC);
+	-- A calendar is read as a window in time rather than as a page.
+	CREATE INDEX idx_posts_starts ON posts(channel_id, starts_at) WHERE starts_at IS NOT NULL;
+
+	-- NULL is a message written straight into a text channel, which is every
+	-- row that exists today. ON DELETE CASCADE is what makes deleting a post
+	-- take its thread with it, and the thread take its files.
+	ALTER TABLE messages ADD COLUMN post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE;
+	-- A thread is read oldest first, the order it is rendered in.
+	CREATE INDEX idx_messages_post ON messages(post_id, id) WHERE post_id IS NOT NULL;
+
+	CREATE TABLE post_rsvps (
+		post_id    INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+		user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		-- 'going', 'maybe' or 'declined'. Withdrawing an answer deletes the
+		-- row: having said nothing is not one of the three answers.
+		response   TEXT    NOT NULL,
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (post_id, user_id)
+	);
+
+	-- Existing servers seeded their everyone role before CreatePosts existed,
+	-- and a server that upgrades should behave like a fresh one: a forum is
+	-- somewhere anybody may start a topic until an administrator says
+	-- otherwise. An announcement channel is made read-only with an overwrite,
+	-- which is the same shape as making a text channel read-only.
+	UPDATE roles SET permissions = permissions | 16384 WHERE managed = 'everyone';
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

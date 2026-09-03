@@ -39,6 +39,13 @@ const (
 	// webhook URL is a standing permission to post: handing somebody the right
 	// to mint one is a larger thing than letting them rename a channel.
 	ManageWebhooks Permission = 1 << 13
+	// CreatePosts covers starting an entry in a channel that holds them: an
+	// announcement, a forum topic, a media item, an event. It is separate from
+	// SendMessages because those channels distinguish writing an entry from
+	// commenting on one — an announcement channel is exactly the case where
+	// everybody may reply and only a few may post — and SendMessages alone
+	// could not express that.
+	CreatePosts Permission = 1 << 14
 
 	KickUsers   Permission = 1 << 16
 	MoveUsers   Permission = 1 << 17
@@ -56,6 +63,7 @@ const None Permission = 0
 var order = []Permission{
 	ViewChannel, Connect, Speak, SendMessages, ChangeNickname, Register, AttachFiles,
 	SendDirectMessages,
+	CreatePosts,
 	ManageChannels, ManageRoles, ManageServer, ManageNicknames, ManageMessages,
 	ManageWebhooks,
 	KickUsers, MoveUsers, MuteUsers, DeafenUsers,
@@ -71,6 +79,7 @@ var names = map[Permission]string{
 	Register:           "Register",
 	AttachFiles:        "AttachFiles",
 	SendDirectMessages: "SendDirectMessages",
+	CreatePosts:        "CreatePosts",
 	ManageChannels:     "ManageChannels",
 	ManageRoles:        "ManageRoles",
 	ManageServer:       "ManageServer",
@@ -97,7 +106,7 @@ var All = func() Permission {
 // user, guests included: they can look around, talk, write to somebody
 // privately, and claim an account.
 const DefaultEveryone = ViewChannel | Connect | Speak | SendMessages | ChangeNickname |
-	Register | AttachFiles | SendDirectMessages
+	Register | AttachFiles | SendDirectMessages | CreatePosts
 
 // DefaultRegistered is granted on top of DefaultEveryone once a user claims an
 // account. It is deliberately empty so that a fresh server treats guests and

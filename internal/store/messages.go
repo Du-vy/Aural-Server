@@ -7,10 +7,14 @@ import (
 	"fmt"
 )
 
-// Message is one post in a text channel.
+// Message is one line of a text channel, or of a post's thread.
 type Message struct {
 	ID        int64
 	ChannelID int64
+	// PostID is set on a message that belongs to a post: its body, or one of
+	// the comments under it. NULL is a message written straight into a text
+	// channel, which is what every channel timeline query asks for.
+	PostID *int64
 	// UserID is nil once the author's account has been removed. Author holds
 	// the name to show in that case.
 	UserID    *int64
@@ -35,7 +39,7 @@ type Message struct {
 // the name captured when the message was sent. Reading the current nickname is
 // what makes a rename show up throughout the history instead of only on new
 // messages, which matches the identity model: the row is the person.
-const messageColumns = `m.id, m.channel_id, m.user_id,
+const messageColumns = `m.id, m.channel_id, m.post_id, m.user_id,
 	COALESCE(u.nickname, m.author), m.content, m.created_at, m.edited_at,
 	m.webhook_id, m.webhook_avatar, m.embeds`
 
@@ -43,8 +47,8 @@ const messageFrom = ` FROM messages m LEFT JOIN users u ON u.id = m.user_id`
 
 func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 	var m Message
-	err := row.Scan(&m.ID, &m.ChannelID, &m.UserID, &m.Author, &m.Content, &m.CreatedAt, &m.EditedAt,
-		&m.WebhookID, &m.WebhookAvatar, &m.Embeds)
+	err := row.Scan(&m.ID, &m.ChannelID, &m.PostID, &m.UserID, &m.Author, &m.Content,
+		&m.CreatedAt, &m.EditedAt, &m.WebhookID, &m.WebhookAvatar, &m.Embeds)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, ErrNotFound
 	}
@@ -54,19 +58,39 @@ func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 	return m, nil
 }
 
-// CreateMessage stores a post and returns it as it will be rendered.
-func (s *Store) CreateMessage(ctx context.Context, channelID, userID int64, content string) (Message, error) {
-	ts := now()
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO messages (channel_id, user_id, author, content, search_text, created_at)
-		 VALUES (?, ?, (SELECT nickname FROM users WHERE id = ?), ?, ?, ?)`,
-		channelID, userID, userID, content, foldForSearch(content), ts)
+// execer is whatever a write can be sent through: the database, or a
+// transaction. Writing a post takes two rows that name each other, so the one
+// insert both paths share has to work either way.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// insertMessage writes one message row and returns its id. postID is nil for a
+// line of a text channel and set for the body or a comment of a post.
+func insertMessage(ctx context.Context, q execer, channelID int64, postID *int64,
+	userID int64, content string, ts int64) (int64, error) {
+	res, err := q.ExecContext(ctx,
+		`INSERT INTO messages (channel_id, post_id, user_id, author, content, search_text, created_at)
+		 VALUES (?, ?, ?, (SELECT nickname FROM users WHERE id = ?), ?, ?, ?)`,
+		channelID, postID, userID, userID, content, foldForSearch(content), ts)
 	if err != nil {
-		return Message{}, fmt.Errorf("store: create message: %w", err)
+		return 0, fmt.Errorf("store: create message: %w", err)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		return Message{}, fmt.Errorf("store: create message: %w", err)
+		return 0, fmt.Errorf("store: create message: %w", err)
+	}
+	return id, nil
+}
+
+// CreateMessage stores a message and returns it as it will be rendered. A
+// non-nil postID makes it a comment on that post rather than a line of the
+// channel timeline.
+func (s *Store) CreateMessage(ctx context.Context, channelID int64, postID *int64,
+	userID int64, content string) (Message, error) {
+	id, err := insertMessage(ctx, s.db, channelID, postID, userID, content, now())
+	if err != nil {
+		return Message{}, err
 	}
 	return s.MessageByID(ctx, id)
 }
@@ -119,6 +143,10 @@ func (s *Store) MessageByID(ctx context.Context, id int64) (Message, error) {
 
 // MessagesBefore reads one page of a channel's history, newest first.
 //
+// It is the channel timeline, so the messages of its posts are not in it: a
+// comment belongs to the thread it was written in, and is read by
+// PostMessagesBefore instead.
+//
 // A zero before starts at the newest message. The page is returned newest
 // first because that is the order the query walks the index in; callers that
 // render oldest first reverse it.
@@ -130,12 +158,13 @@ func (s *Store) MessagesBefore(ctx context.Context, channelID, before int64, lim
 	if before > 0 {
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT `+messageColumns+messageFrom+
-				` WHERE m.channel_id = ? AND m.id < ? ORDER BY m.id DESC LIMIT ?`,
+				` WHERE m.channel_id = ? AND m.post_id IS NULL AND m.id < ?
+				  ORDER BY m.id DESC LIMIT ?`,
 			channelID, before, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT `+messageColumns+messageFrom+
-				` WHERE m.channel_id = ? ORDER BY m.id DESC LIMIT ?`,
+				` WHERE m.channel_id = ? AND m.post_id IS NULL ORDER BY m.id DESC LIMIT ?`,
 			channelID, limit)
 	}
 	if err != nil {
@@ -169,12 +198,48 @@ func scanMessages(rows *sql.Rows, size int) ([]Message, error) {
 func (s *Store) MessagesAfter(ctx context.Context, channelID, after int64, limit int) ([]Message, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+messageColumns+messageFrom+
-			` WHERE m.channel_id = ? AND m.id > ? ORDER BY m.id ASC LIMIT ?`,
+			` WHERE m.channel_id = ? AND m.post_id IS NULL AND m.id > ?
+			  ORDER BY m.id ASC LIMIT ?`,
 		channelID, after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: read history: %w", err)
 	}
 	return scanMessages(rows, limit)
+}
+
+// PostMessagesBefore reads one page of a post's comments, newest first.
+//
+// rootMessageID is the body of the post, which is not one of its comments: it
+// travels with the post itself, so paging back through a long thread never
+// re-sends it. It is also the lowest id in the thread, which is what makes
+// excluding it a bound on the page rather than a second condition.
+func (s *Store) PostMessagesBefore(ctx context.Context, postID, rootMessageID, before int64, limit int) ([]Message, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if before > 0 {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT `+messageColumns+messageFrom+
+				` WHERE m.post_id = ? AND m.id > ? AND m.id < ? ORDER BY m.id DESC LIMIT ?`,
+			postID, rootMessageID, before, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT `+messageColumns+messageFrom+
+				` WHERE m.post_id = ? AND m.id > ? ORDER BY m.id DESC LIMIT ?`,
+			postID, rootMessageID, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read thread: %w", err)
+	}
+	return scanMessages(rows, limit)
+}
+
+// HasPostMessagesBefore reports whether any comment older than id remains.
+func (s *Store) HasPostMessagesBefore(ctx context.Context, postID, rootMessageID, id int64) (bool, error) {
+	return s.probeHistory(ctx,
+		`SELECT EXISTS(SELECT 1 FROM messages WHERE post_id = ? AND id > ? AND id < ?)`,
+		postID, rootMessageID, id)
 }
 
 // MessagesAround reads a page centred on one message, oldest first.
@@ -207,13 +272,17 @@ func (s *Store) MessagesAround(ctx context.Context, channelID, id int64, limit i
 // HasMessagesBefore reports whether anything older than id remains, which is
 // what tells a client another page is worth asking for.
 func (s *Store) HasMessagesBefore(ctx context.Context, channelID, id int64) (bool, error) {
-	return s.probeHistory(ctx, `SELECT EXISTS(SELECT 1 FROM messages WHERE channel_id = ? AND id < ?)`, channelID, id)
+	return s.probeHistory(ctx,
+		`SELECT EXISTS(SELECT 1 FROM messages WHERE channel_id = ? AND post_id IS NULL AND id < ?)`,
+		channelID, id)
 }
 
 // HasMessagesAfter reports whether anything newer than id remains, which is
 // what tells a client whether it is holding the present or a window behind it.
 func (s *Store) HasMessagesAfter(ctx context.Context, channelID, id int64) (bool, error) {
-	return s.probeHistory(ctx, `SELECT EXISTS(SELECT 1 FROM messages WHERE channel_id = ? AND id > ?)`, channelID, id)
+	return s.probeHistory(ctx,
+		`SELECT EXISTS(SELECT 1 FROM messages WHERE channel_id = ? AND post_id IS NULL AND id > ?)`,
+		channelID, id)
 }
 
 func (s *Store) probeHistory(ctx context.Context, query string, args ...any) (bool, error) {

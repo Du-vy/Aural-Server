@@ -584,6 +584,15 @@ var routes = map[string]route{
 	protocol.OpChannelUpdate: {needsAuth: true, fn: handleChannelUpdate},
 	protocol.OpChannelDelete: {needsAuth: true, fn: handleChannelDelete},
 
+	// Posts. Listing one channel's entries reads their bodies and the shape of
+	// every thread, so it is dispatched off the read loop with the other reads
+	// that walk history rather than an index of it.
+	protocol.OpPostCreate: {needsAuth: true, fn: handlePostCreate},
+	protocol.OpPostList:   {needsAuth: true, slow: true, fn: handlePostList},
+	protocol.OpPostUpdate: {needsAuth: true, fn: handlePostUpdate},
+	protocol.OpPostDelete: {needsAuth: true, fn: handlePostDelete},
+	protocol.OpPostRSVP:   {needsAuth: true, fn: handlePostRSVP},
+
 	protocol.OpMessageSend: {needsAuth: true, fn: handleMessageSend},
 	// The two reads that walk history rather than an index of it, and the only
 	// requests here that can outlast a heartbeat.

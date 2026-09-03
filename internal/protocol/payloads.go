@@ -1,10 +1,40 @@
 package protocol
 
 // Channel types.
+//
+// The four below ChannelVoice hold posts rather than a stream of messages: an
+// entry with a title, and a thread of comments hanging off it. They differ in
+// what an entry carries and in how a client lays them out, not in the ops that
+// reach them, so PostChannel is what every check on the server asks.
 const (
-	ChannelCategory = "category"
-	ChannelText     = "text"
-	ChannelVoice    = "voice"
+	ChannelCategory     = "category"
+	ChannelText         = "text"
+	ChannelVoice        = "voice"
+	ChannelAnnouncement = "announcement" // a few write, everybody comments
+	ChannelForum        = "forum"        // topics anybody may start
+	ChannelMedia        = "media"        // entries whose point is the file
+	ChannelCalendar     = "calendar"     // entries that happen at a time
+)
+
+// PostChannel reports whether a channel type holds posts.
+func PostChannel(channelType string) bool {
+	switch channelType {
+	case ChannelAnnouncement, ChannelForum, ChannelMedia, ChannelCalendar:
+		return true
+	default:
+		return false
+	}
+}
+
+// RSVP responses to a calendar event.
+const (
+	RSVPGoing    = "going"
+	RSVPMaybe    = "maybe"
+	RSVPDeclined = "declined"
+	// RSVPNone withdraws an answer. It is a response rather than a separate op
+	// because "I have not said" and "I am not coming" are different things, and
+	// a client that lets somebody take an answer back needs to say which.
+	RSVPNone = ""
 )
 
 // Voice hosting modes a server can advertise. They differ only in who relays:
@@ -196,8 +226,8 @@ type Overwrite struct {
 	Deny   string `json:"deny"`
 }
 
-// Channel is a node of the channel tree. Categories hold other channels; text
-// and voice channels are always leaves.
+// Channel is a node of the channel tree. Categories hold other channels; every
+// other type is always a leaf.
 type Channel struct {
 	ID         int64       `json:"id"`
 	ParentID   *int64      `json:"parentId"`
@@ -232,6 +262,11 @@ type Message struct {
 	ID        int64  `json:"id"`
 	ChannelID int64  `json:"channelId"`
 	UserID    *int64 `json:"userId"` // nil once an author's account is gone
+	// PostID is set on a message that belongs to a post: its body, or one of
+	// the comments under it. It is absent on everything written straight into
+	// a text channel, which is what tells a client whether a message.created
+	// belongs in the channel timeline or inside a thread it may not have open.
+	PostID    *int64 `json:"postId,omitempty"`
 	Author    string `json:"author"`
 	Content   string `json:"content"`
 	CreatedAt int64  `json:"createdAt"`
@@ -260,6 +295,68 @@ type MessageWebhook struct {
 	// Avatar is an absolute URL, or absent. A webhook is an outside service,
 	// so nothing about its picture is hosted here.
 	Avatar *string `json:"avatar,omitempty"`
+}
+
+// Post is one entry of a channel that holds entries: an announcement, a forum
+// topic, a media item, a calendar event.
+//
+// Body is a Message, and the comments under it are Messages too, carrying the
+// post's id. That is the whole of the design: a post is a title and some
+// metadata in front of an ordinary thread, so everything a message already has
+// — files, edits, embeds, deletion, moderation — reaches a post without a
+// second implementation of any of it.
+type Post struct {
+	ID        int64  `json:"id"`
+	ChannelID int64  `json:"channelId"`
+	UserID    *int64 `json:"userId"` // nil once an author's account is gone
+	Author    string `json:"author"`
+	Title     string `json:"title"`
+	// Locked closes the thread: no further comments, and the existing ones
+	// stay readable. Only somebody with ManageMessages may set it.
+	Locked bool `json:"locked"`
+	// Pinned lifts the post to the top of its channel's listing.
+	Pinned    bool   `json:"pinned"`
+	CreatedAt int64  `json:"createdAt"`
+	EditedAt  *int64 `json:"editedAt"`
+	// Body is the first message of the thread: what the author wrote, and the
+	// files they wrote it with. It is absent only for a post whose body was
+	// deleted out from under it by a purge, which a client renders as a post
+	// with a title and nothing else rather than as an error.
+	Body *Message `json:"body,omitempty"`
+	// Comments is how many messages hang off the post, not counting the body.
+	Comments int `json:"comments"`
+	// LastCommentAt is when the thread was last added to, or the creation time
+	// of a post nobody has answered. It is what a forum listing sorts on.
+	LastCommentAt int64 `json:"lastCommentAt"`
+	// Event is set on, and only on, a post in a calendar channel.
+	Event *PostEventDetails `json:"event,omitempty"`
+	// RSVP travels with a calendar post: the tallies everybody sees, and the
+	// answer of whoever is being sent the frame.
+	RSVP *PostRSVPSummary `json:"rsvp,omitempty"`
+}
+
+// PostEventDetails is when and where a calendar post happens.
+//
+// The two timestamps are Unix seconds, as everywhere else in this protocol.
+// An all-day event still carries a start: the day it falls on is read from it,
+// in the reader's own zone, which is what makes one date land on the same day
+// for everybody who is looking at their own calendar.
+type PostEventDetails struct {
+	StartsAt int64 `json:"startsAt"`
+	// EndsAt is absent for an event with no stated finish.
+	EndsAt   *int64 `json:"endsAt,omitempty"`
+	AllDay   bool   `json:"allDay"`
+	Location string `json:"location,omitempty"`
+}
+
+// PostRSVPSummary counts the answers to a calendar post.
+type PostRSVPSummary struct {
+	Going    int `json:"going"`
+	Maybe    int `json:"maybe"`
+	Declined int `json:"declined"`
+	// Own is the answer of the identity this frame was sent to, or empty for
+	// somebody who has not answered.
+	Own string `json:"own"`
 }
 
 // Webhook is a URL that posts into one channel with no identity behind it.
@@ -559,9 +656,79 @@ type ChannelDeleteRequest struct {
 	ChannelID int64 `json:"channelId"`
 }
 
+// PostCreateRequest starts an entry in a channel that holds them.
+//
+// Content and Attachments are the body, and go through exactly the checks
+// message.send makes of them: a media post is the case where the files are the
+// whole point, and an announcement is the case where the words are.
+type PostCreateRequest struct {
+	ChannelID   int64   `json:"channelId"`
+	Title       string  `json:"title"`
+	Content     string  `json:"content,omitempty"`
+	Attachments []int64 `json:"attachments,omitempty"`
+	// Event is required in a calendar channel and refused everywhere else.
+	Event *PostEventDetails `json:"event,omitempty"`
+}
+
+// PostListRequest pages through one channel's entries.
+//
+// Before pages backwards by post id, newest first, exactly as message.history
+// does. From and To instead ask for a window in time and are only meaningful
+// in a calendar channel, where a client renders a month rather than a page.
+type PostListRequest struct {
+	ChannelID int64 `json:"channelId"`
+	Before    int64 `json:"before,omitempty"`
+	From      int64 `json:"from,omitempty"`
+	To        int64 `json:"to,omitempty"`
+	Limit     int   `json:"limit,omitempty"`
+}
+
+// PostListResult is ordered the way the channel is read: pinned posts first,
+// then newest first — or, for a window of a calendar, earliest event first.
+type PostListResult struct {
+	ChannelID int64  `json:"channelId"`
+	Posts     []Post `json:"posts"`
+	// HasMore reports whether older entries remain past the last one here. It
+	// is always false for a window, which is bounded by dates rather than by
+	// how much fits in one page.
+	HasMore bool `json:"hasMore"`
+}
+
+// PostUpdateRequest edits a post. An absent field is left alone.
+//
+// The body is not here: it is a message, so it is edited through message.edit
+// like any other, by its author and nobody else. What this op carries is what
+// belongs to the post rather than to the writing — its title, whether it is
+// closed, whether it is pinned, and when the event happens.
+type PostUpdateRequest struct {
+	PostID int64   `json:"postId"`
+	Title  *string `json:"title,omitempty"`
+	Locked *bool   `json:"locked,omitempty"`
+	Pinned *bool   `json:"pinned,omitempty"`
+	// Event replaces the whole of an event, so a client sends back the fields
+	// it did not change. Absent leaves the existing one untouched.
+	Event *PostEventDetails `json:"event,omitempty"`
+}
+
+type PostDeleteRequest struct {
+	PostID int64 `json:"postId"`
+}
+
+// PostRSVPRequest answers a calendar post. An empty response withdraws an
+// answer already given.
+type PostRSVPRequest struct {
+	PostID   int64  `json:"postId"`
+	Response string `json:"response"`
+}
+
 type MessageSendRequest struct {
 	ChannelID int64  `json:"channelId"`
 	Content   string `json:"content"`
+	// PostID comments on a post instead of writing into the channel. The
+	// channel is still named, and still has to be the one the post is in: a
+	// comment is a message in that channel, visible to exactly the people the
+	// channel is.
+	PostID int64 `json:"postId,omitempty"`
 	// Attachments are the ids returned by POST /upload. A message may carry
 	// files with no text of its own, which is the one case where empty content
 	// is accepted.
@@ -575,6 +742,10 @@ type MessageSendRequest struct {
 // end. Sending none of them reads the newest page.
 type MessageHistoryRequest struct {
 	ChannelID int64 `json:"channelId"`
+	// PostID reads the comments under one post rather than the channel
+	// timeline. A post's own body is not a page of its comments: it arrives
+	// with the post, so paging back through a long thread never re-sends it.
+	PostID int64 `json:"postId,omitempty"`
 	// Before pages backwards, stopping short of this id.
 	Before int64 `json:"before,omitempty"`
 	// After pages forwards, starting past this id. It is what a client walks
@@ -588,8 +759,11 @@ type MessageHistoryRequest struct {
 
 // MessageHistoryResult is ordered oldest first, the order it is rendered in.
 type MessageHistoryResult struct {
-	ChannelID int64     `json:"channelId"`
-	Messages  []Message `json:"messages"`
+	ChannelID int64 `json:"channelId"`
+	// PostID echoes the thread the page came from, so a client holding
+	// several open threads can tell which one answered.
+	PostID   int64     `json:"postId,omitempty"`
+	Messages []Message `json:"messages"`
 	// HasMore reports whether older messages remain before the first one here.
 	HasMore bool `json:"hasMore"`
 	// HasMoreAfter reports whether newer messages remain past the last one
@@ -825,6 +999,32 @@ type ChannelDeletedEvent struct {
 	ChannelID int64 `json:"channelId"`
 	// Cascaded lists descendants removed along with the channel.
 	Cascaded []int64 `json:"cascaded"`
+}
+
+type PostEvent struct {
+	Post Post `json:"post"`
+}
+
+// PostDeletedEvent carries the channel as well, for the same reason
+// MessageDeletedEvent does.
+type PostDeletedEvent struct {
+	PostID    int64 `json:"postId"`
+	ChannelID int64 `json:"channelId"`
+}
+
+// PostRSVPEvent reports one answer to a calendar post.
+//
+// It is its own event rather than a post.updated because the tallies are the
+// same for everybody while the answer is one person's: sending a whole Post
+// would either leak whose answer it was as everybody's, or force every
+// recipient to forget their own. So the counts travel once, and UserID says
+// whose answer changed — the one client it belongs to updates Own from it.
+type PostRSVPEvent struct {
+	PostID    int64           `json:"postId"`
+	ChannelID int64           `json:"channelId"`
+	UserID    int64           `json:"userId"`
+	Response  string          `json:"response"`
+	RSVP      PostRSVPSummary `json:"rsvp"`
 }
 
 type MessageEvent struct {

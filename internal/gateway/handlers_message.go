@@ -31,7 +31,7 @@ const (
 	maxSearchAuthors = 16
 )
 
-// handleMessageSend posts a message to a text channel.
+// handleMessageSend posts a message to a text channel, or a comment to a post.
 func handleMessageSend(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
 	req, failure := decode[protocol.MessageSendRequest](raw)
 	if failure != nil {
@@ -47,7 +47,26 @@ func handleMessageSend(ctx context.Context, s *Session, raw json.RawMessage) (an
 	if failure != nil {
 		return nil, failure
 	}
-	if failure := s.requireTextChannel(req.ChannelID, permissions.SendMessages); failure != nil {
+	// A comment is a message in the channel its post is in, so the permission
+	// checks are the channel's either way. What a post adds is that it can be
+	// closed, and that the channel is not a text channel at all.
+	var postID *int64
+	if req.PostID > 0 {
+		post, _, failure := s.loadVisiblePost(ctx, req.PostID)
+		if failure != nil {
+			return nil, failure
+		}
+		if post.ChannelID != req.ChannelID {
+			return nil, protocol.Errorf(protocol.ErrBadRequest, "that post is in another channel")
+		}
+		if post.Locked {
+			return nil, protocol.Errorf(protocol.ErrPostLocked, "that post is closed to comments")
+		}
+		if failure := s.hub.requireChannelPermission(s, &req.ChannelID, permissions.SendMessages); failure != nil {
+			return nil, failure
+		}
+		postID = &post.ID
+	} else if failure := s.requireTextChannel(req.ChannelID, permissions.SendMessages); failure != nil {
 		return nil, failure
 	}
 	if len(attachmentIDs) > 0 {
@@ -61,7 +80,7 @@ func handleMessageSend(ctx context.Context, s *Session, raw json.RawMessage) (an
 		return nil, protocol.Errorf(protocol.ErrRateLimited, "you are sending messages too quickly")
 	}
 
-	created, err := s.hub.st.CreateMessage(ctx, req.ChannelID, s.UserID(), content)
+	created, err := s.hub.st.CreateMessage(ctx, req.ChannelID, postID, s.UserID(), content)
 	if err != nil {
 		return nil, internalError(s, "store the message", err)
 	}
@@ -139,6 +158,9 @@ func handleMessageHistory(ctx context.Context, s *Session, raw json.RawMessage) 
 		return nil, protocol.Errorf(protocol.ErrBadRequest,
 			"before, after and around name three different pages; send one")
 	}
+	if req.PostID > 0 {
+		return s.postHistory(ctx, req)
+	}
 	// Reading needs only the right to see the channel: a member who may not
 	// post can still follow along.
 	if failure := s.requireTextChannel(req.ChannelID, permissions.ViewChannel); failure != nil {
@@ -186,6 +208,65 @@ func handleMessageHistory(ctx context.Context, s *Session, raw json.RawMessage) 
 		result.HasMoreAfter, err = s.hub.st.HasMessagesAfter(ctx, req.ChannelID, page[len(page)-1].ID)
 		if err != nil {
 			return nil, internalError(s, "read the channel history", err)
+		}
+	}
+	return result, nil
+}
+
+// postHistory reads one page of a post's comments.
+//
+// Only the backwards cursor is accepted: a thread is opened at its start and
+// read forwards, and the paging a client does in one is scrolling back through
+// a long conversation, never jumping into the middle of it. The body is not a
+// page of the thread — it arrives with the post.
+func (s *Session) postHistory(ctx context.Context, req protocol.MessageHistoryRequest) (any, *protocol.Error) {
+	if req.After > 0 || req.Around > 0 {
+		return nil, protocol.Errorf(protocol.ErrBadRequest,
+			"a post's comments are paged backwards from before")
+	}
+	post, _, failure := s.loadVisiblePost(ctx, req.PostID)
+	if failure != nil {
+		return nil, failure
+	}
+	if req.ChannelID != 0 && post.ChannelID != req.ChannelID {
+		return nil, protocol.Errorf(protocol.ErrBadRequest, "that post is in another channel")
+	}
+
+	limit := req.Limit
+	if limit <= 0 {
+		limit = defaultHistoryLimit
+	}
+	if limit > maxHistoryLimit {
+		limit = maxHistoryLimit
+	}
+
+	// A post whose body was purged has no root to exclude, and every message
+	// left in the thread is a comment.
+	var root int64
+	if post.RootMessageID != nil {
+		root = *post.RootMessageID
+	}
+
+	page, err := s.hub.st.PostMessagesBefore(ctx, post.ID, root, req.Before, limit)
+	if err != nil {
+		return nil, internalError(s, "read the post", err)
+	}
+	reverse(page)
+
+	views, failure := s.messageViews(ctx, page, "read the post")
+	if failure != nil {
+		return nil, failure
+	}
+
+	result := protocol.MessageHistoryResult{
+		ChannelID: post.ChannelID,
+		PostID:    post.ID,
+		Messages:  views,
+	}
+	if len(page) > 0 {
+		result.HasMore, err = s.hub.st.HasPostMessagesBefore(ctx, post.ID, root, page[0].ID)
+		if err != nil {
+			return nil, internalError(s, "read the post", err)
 		}
 	}
 	return result, nil
@@ -425,6 +506,19 @@ func handleMessageDelete(ctx context.Context, s *Session, raw json.RawMessage) (
 	if !own {
 		if failure := s.hub.requireChannelPermission(s, &existing.ChannelID, permissions.ManageMessages); failure != nil {
 			return nil, failure
+		}
+	}
+	// The body of a post is not a message anybody deletes on its own: doing so
+	// would leave the post standing with nothing in it. Deleting the post is
+	// the act that was meant, and it takes the whole thread with it.
+	if existing.PostID != nil {
+		post, err := s.hub.st.PostByID(ctx, *existing.PostID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, internalError(s, "read the message", err)
+		}
+		if post.RootMessageID != nil && *post.RootMessageID == existing.ID {
+			return nil, protocol.Errorf(protocol.ErrBadRequest,
+				"that message is the body of a post; delete the post instead")
 		}
 	}
 

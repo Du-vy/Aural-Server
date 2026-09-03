@@ -46,6 +46,57 @@ func channelView(c store.Channel) protocol.Channel {
 	return out
 }
 
+// postView converts a stored post into its wire form.
+//
+// The body is passed in rather than read here because a listing renders every
+// body it needs in one pass, and because the one path that has just written a
+// post already holds it.
+func postView(p store.Post, body *protocol.Message, stats store.PostStats,
+	counts store.PostRSVPCounts, own string) protocol.Post {
+	out := protocol.Post{
+		ID:        p.ID,
+		ChannelID: p.ChannelID,
+		UserID:    p.UserID,
+		Author:    p.Author,
+		Title:     p.Title,
+		Locked:    p.Locked,
+		Pinned:    p.Pinned,
+		CreatedAt: p.CreatedAt,
+		EditedAt:  p.EditedAt,
+		Body:      body,
+		Comments:  stats.Comments,
+		// A thread nobody has answered was last active when it was written,
+		// which is what keeps a listing sortable by one field.
+		LastCommentAt: stats.LastCommentAt,
+	}
+	if out.LastCommentAt == 0 {
+		out.LastCommentAt = p.CreatedAt
+	}
+	if p.Event() {
+		out.Event = &protocol.PostEventDetails{
+			StartsAt: *p.StartsAt,
+			EndsAt:   p.EndsAt,
+			AllDay:   p.AllDay,
+			Location: p.Location,
+		}
+		summary := rsvpView(counts, own)
+		out.RSVP = &summary
+	}
+	return out
+}
+
+// rsvpView converts stored tallies and one identity's answer into the wire
+// form. An empty own is somebody who has not answered, which is not the same
+// as somebody who has declined.
+func rsvpView(counts store.PostRSVPCounts, own string) protocol.PostRSVPSummary {
+	return protocol.PostRSVPSummary{
+		Going:    counts.Going,
+		Maybe:    counts.Maybe,
+		Declined: counts.Declined,
+		Own:      own,
+	}
+}
+
 // messageView converts a stored message and the files it carries into the wire
 // form. A message with no files carries an absent field rather than an empty
 // list, which keeps the common frame the size it has always been.
@@ -53,6 +104,7 @@ func messageView(m store.Message, attachments []store.Attachment) protocol.Messa
 	out := protocol.Message{
 		ID:        m.ID,
 		ChannelID: m.ChannelID,
+		PostID:    m.PostID,
 		UserID:    m.UserID,
 		Author:    m.Author,
 		Content:   m.Content,

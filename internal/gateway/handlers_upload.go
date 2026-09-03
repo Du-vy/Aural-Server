@@ -130,9 +130,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The same two checks message.send makes, made here so a file that could
-	// never be posted is never written: the channel must be a text channel the
-	// uploader may both see and attach to.
+	// The same checks message.send and post.create make, made here so a file
+	// that could never be posted is never written: the channel must carry
+	// messages, and the uploader must be able to see it, write in it and
+	// attach to it.
 	base, roleIDs, err := s.hub.UserPermissions(r.Context(), user)
 	if err != nil {
 		s.log.Error("resolve uploader permissions", slog.Any("error", err))
@@ -145,11 +146,19 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, protocol.ErrNotFound, "no such channel")
 		return
 	}
-	if channel.Type != protocol.ChannelText {
+	if channel.Type != protocol.ChannelText && !protocol.PostChannel(channel.Type) {
 		writeAPIError(w, http.StatusBadRequest, protocol.ErrBadRequest, "that channel does not carry messages")
 		return
 	}
-	if !perms.Has(permissions.SendMessages) || !perms.Has(permissions.AttachFiles) {
+	// In a channel that holds posts, a file may be going into an entry or into
+	// a comment on one, and those are two different permissions. Either is
+	// enough to justify the upload: which of the two it was is settled when
+	// the post or the comment that claims it is sent.
+	mayWrite := perms.Has(permissions.SendMessages)
+	if protocol.PostChannel(channel.Type) {
+		mayWrite = mayWrite || perms.Has(permissions.CreatePosts)
+	}
+	if !mayWrite || !perms.Has(permissions.AttachFiles) {
 		writeAPIError(w, http.StatusForbidden, protocol.ErrForbidden, "you may not attach files here")
 		return
 	}

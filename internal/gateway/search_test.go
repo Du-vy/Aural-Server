@@ -17,7 +17,7 @@ func seedMessages(t *testing.T, st *store.Store, channelID, userID int64, conten
 	ctx := context.Background()
 	out := make([]store.Message, 0, len(contents))
 	for _, content := range contents {
-		m, err := st.CreateMessage(ctx, channelID, userID, content)
+		m, err := st.CreateMessage(ctx, channelID, nil, userID, content)
 		if err != nil {
 			t.Fatalf("seed message %q: %v", content, err)
 		}

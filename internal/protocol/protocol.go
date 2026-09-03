@@ -54,6 +54,16 @@ const (
 	OpChannelUpdate = "channel.update"
 	OpChannelDelete = "channel.delete"
 
+	// Posts: the entries of a channel that holds entries rather than a
+	// stream. One set of ops serves announcements, forum topics, media items
+	// and calendar events, because they differ in what they carry and in who
+	// may write one, not in what may be done to them.
+	OpPostCreate = "post.create"
+	OpPostList   = "post.list" // page through one channel's entries
+	OpPostUpdate = "post.update"
+	OpPostDelete = "post.delete"
+	OpPostRSVP   = "post.rsvp" // answer a calendar event
+
 	OpMessageSend    = "message.send"
 	OpMessageHistory = "message.history" // page through a channel
 	OpMessageSearch  = "message.search"  // look through every readable channel
@@ -111,6 +121,11 @@ const (
 	EvChannelUpdated = "channel.updated"
 	EvChannelDeleted = "channel.deleted"
 
+	EvPostCreated = "post.created"
+	EvPostUpdated = "post.updated"
+	EvPostDeleted = "post.deleted"
+	EvPostRSVP    = "post.rsvp" // one answer to a calendar post
+
 	EvMessageCreated = "message.created"
 	EvMessageUpdated = "message.updated"
 	EvMessageDeleted = "message.deleted"
@@ -160,6 +175,7 @@ const (
 	ErrUploadsDisabled    = "uploads_disabled"
 	ErrDMDisabled         = "dm_disabled"    // this server carries no private messages
 	ErrDMBlocked          = "dm_blocked"     // the other person does not accept them
+	ErrPostLocked         = "post_locked"    // no more comments are accepted on it
 	ErrVoiceDisabled      = "voice_disabled" // this server runs no audio plane
 	ErrVoiceFailed        = "voice_failed"   // the media session could not be set up
 )

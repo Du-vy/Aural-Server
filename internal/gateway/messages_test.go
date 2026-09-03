@@ -216,7 +216,7 @@ func TestHistoryPagesBackwards(t *testing.T) {
 	// why this writes through the store rather than the wire.
 	ctx := context.Background()
 	for i := range 12 {
-		if _, err := h.store.CreateMessage(ctx, channel.ID, 1, string(rune('a'+i))); err != nil {
+		if _, err := h.store.CreateMessage(ctx, channel.ID, nil, 1, string(rune('a'+i))); err != nil {
 			t.Fatalf("seed message %d: %v", i, err)
 		}
 	}
@@ -377,7 +377,7 @@ func TestMessagingNeedsSendMessages(t *testing.T) {
 
 	// Reading is governed by ViewChannel, not by SendMessages, so a muted
 	// member can still follow the conversation.
-	if _, err := h.store.CreateMessage(ctx, channel.ID, ready.User.ID, "still readable"); err != nil {
+	if _, err := h.store.CreateMessage(ctx, channel.ID, nil, ready.User.ID, "still readable"); err != nil {
 		t.Fatalf("seed message: %v", err)
 	}
 	page := ok[protocol.MessageHistoryResult](guest, protocol.OpMessageHistory,
@@ -419,7 +419,7 @@ func TestMessagesAreHiddenWithTheirChannel(t *testing.T) {
 	admin, ready := h.admin("Admin")
 	channel := textChannel(t, ready)
 
-	sent, err := h.store.CreateMessage(ctx, channel.ID, ready.User.ID, "secret")
+	sent, err := h.store.CreateMessage(ctx, channel.ID, nil, ready.User.ID, "secret")
 	if err != nil {
 		t.Fatalf("seed message: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestDeletingAChannelTakesItsMessages(t *testing.T) {
 	admin, ready := h.admin("Admin")
 	channel := textChannel(t, ready)
 
-	sent, err := h.store.CreateMessage(ctx, channel.ID, ready.User.ID, "doomed")
+	sent, err := h.store.CreateMessage(ctx, channel.ID, nil, ready.User.ID, "doomed")
 	if err != nil {
 		t.Fatalf("seed message: %v", err)
 	}

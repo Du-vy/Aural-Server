@@ -265,12 +265,13 @@ member.
   "dmPrivacy": "everyone"  // only on your own entry; see Private conversations
 }
 
-// Channel — "category" holds others; "text" and "voice" are always leaves
+// Channel — "category" holds others; every other type is a leaf
 {
   "id": 3,
   "parentId": 1,           // null at the tree root
   "name": "Lobby",
   "type": "voice",         // category | text | voice
+                           // | announcement | forum | media | calendar
   "topic": "",
   "position": 1,
   "userLimit": 0,          // voice only, 0 means unlimited
@@ -288,10 +289,37 @@ member.
   "managed": "registered"  // "" | everyone | registered | admin
 }
 
+// Post — one entry of an announcement, forum, media or calendar channel
+{
+  "id": 7,
+  "channelId": 5,
+  "userId": 4,             // null once the author's account is gone
+  "author": "Pablo",
+  "title": "Server downtime on Friday",
+  "locked": false,         // closed: no more comments, no more answers
+  "pinned": false,         // floats to the top of its channel
+  "createdAt": 1756600000,
+  "editedAt": null,
+  "body": { /* Message */ },   // the first message of the thread
+  "comments": 3,               // messages under it, body not counted
+  "lastCommentAt": 1756600900, // creation time when nobody has answered
+  "event": {                   // calendar channels only
+    "startsAt": 1756684800,
+    "endsAt": 1756692000,      // absent when no finish was stated
+    "allDay": false,
+    "location": "Meeting room 2"
+  },
+  "rsvp": {                    // travels with an event
+    "going": 4, "maybe": 1, "declined": 0,
+    "own": "going"             // the answer of whoever this frame went to
+  }
+}
+
 // Message
 {
   "id": 12,
   "channelId": 2,
+  "postId": 7,             // absent on a message written into a text channel
   "userId": 4,             // null once the author's account is gone
   "author": "Pablo",       // resolved live from the users table
   "content": "Hello",
@@ -392,6 +420,7 @@ A 64-bit mask. `Administrator` bypasses every other check.
 | 11 | `ManageNicknames` | Change other nicknames |
 | 12 | `ManageMessages` | Delete other people's messages |
 | 13 | `ManageWebhooks` | Create, edit and revoke the webhooks of a channel |
+| 14 | `CreatePosts` | Start an entry in an announcement, forum, media or calendar channel |
 | 16 | `KickUsers` | Disconnect a user |
 | 17 | `MoveUsers` | Move a user between voice channels |
 | 18 | `MuteUsers` | Reserved for voice moderation |
@@ -465,11 +494,16 @@ Every op below needs an authenticated session.
 | `channel.create` | `ManageChannels` on the parent | `{ name, type, parentId?, topic?, position?, userLimit? }`. |
 | `channel.update` | `ManageChannels` on the channel; `ManageRoles` to touch `overwrites` | `{ channelId, name?, topic?, parentId?, position?, userLimit?, overwrites? }`. |
 | `channel.delete` | `ManageChannels` on the channel | `{ channelId }`. Cascades to descendants. |
-| `message.send` | `SendMessages`, plus `AttachFiles` to carry files | `{ channelId, content, attachments? }`. Text channels only. Rate limited. |
-| `message.history` | `ViewChannel` on the channel | `{ channelId, before?, after?, around?, limit? }`. One cursor at a time; `limit` defaults to 50, capped at 100. |
+| `post.create` | `CreatePosts` on the channel, plus `AttachFiles` to carry files | `{ channelId, title, content?, attachments?, event? }`. Post channels only. A media post needs a file; a calendar post needs an `event` and nothing else may carry one. Rate limited on the same bucket as `message.send`. |
+| `post.list` | `ViewChannel` on the channel | `{ channelId, before?, from?, to?, limit? }`. `before` pages backwards by post id; `from`/`to` read a calendar as a window in time, at most a year wide. |
+| `post.update` | Author for `title` and `event`; `ManageMessages` for `locked` and `pinned` | `{ postId, title?, locked?, pinned?, event? }`. The body is a message: it is edited through `message.edit`. |
+| `post.delete` | Author, or `ManageMessages` on the channel | `{ postId }`. Takes the whole thread, and its files, with it. |
+| `post.rsvp` | `ViewChannel` on the channel | `{ postId, response }`. `going`, `maybe`, `declined`, or `""` to withdraw. Calendar posts only, and not on a locked one. |
+| `message.send` | `SendMessages`, plus `AttachFiles` to carry files | `{ channelId, content, postId?, attachments? }`. Without `postId`, a text channel only. With one, a comment on that post, which must be in the channel named and must not be locked. Rate limited. |
+| `message.history` | `ViewChannel` on the channel | `{ channelId, postId?, before?, after?, around?, limit? }`. One cursor at a time; `limit` defaults to 50, capped at 100. With `postId`, reads that post's comments, `before` only, and the body is not among them. |
 | `message.search` | `ViewChannel`, per channel | `{ query?, channelIds?, authorIds?, has?, after?, before?, sort?, limit?, offset? }`. Runs only over the channels the caller may read. Rate limited. |
 | `message.edit` | Author only | `{ messageId, content }`. |
-| `message.delete` | Author, or `ManageMessages` on the channel | `{ messageId }`. |
+| `message.delete` | Author, or `ManageMessages` on the channel | `{ messageId }`. Refused for the body of a post: `post.delete` is the act that was meant. |
 | `dm.list` | — | `{}`. Every private conversation you are in, newest first. |
 | `dm.history` | — | `{ userId, before?, after?, around?, limit? }`. Cursors work as in `message.history`. A thread that does not exist yet returns `conversationId: 0` and no messages. |
 | `dm.send` | `SendDirectMessages`, plus both privacy settings | `{ userId, content }`. Opens the conversation if it is the first thing either has said. Rate limited on the same bucket as `message.send`. |
@@ -937,6 +971,43 @@ survives a restart rather than being whatever the client happened to see live.
 Sending moves your own marker, which is why your own writing is never unread,
 and `dm.read` only ever moves it forwards.
 
+## Posts
+
+Four channel types hold **posts** rather than a stream of messages:
+`announcement`, `forum`, `media` and `calendar`. A post is a title and some
+metadata in front of an ordinary thread.
+
+The body of a post is a `Message` carrying the post's id, and the comments under
+it are messages carrying the same id. There is no second kind of message and no
+second kind of attachment: files, edits, deletion, moderation and rate limits
+all reach a post exactly as they reach a line of a text channel.
+
+That has three consequences worth stating plainly:
+
+- **A channel's timeline never holds its posts' messages.** `message.history`
+  without a `postId` reads the messages of a channel that belong to no post,
+  which in a post channel is none of them. Reading one with a `postId` reads
+  that thread, and the body is not part of the page: it arrives with the post.
+- **The body is deleted with the post, never on its own.** `message.delete`
+  refuses it, because a post whose body went would be a title standing over
+  nothing. `post.delete` takes the whole thread, and its files, together.
+- **Search does not reach posts in v1.** It runs over text channels, which is
+  where it has always run.
+
+The four types differ in what an entry carries and in who may write one, not in
+the ops that reach them:
+
+| Type | An entry is | Made by |
+| --- | --- | --- |
+| `announcement` | A notice everybody may comment on | Denying `CreatePosts` to `@everyone` in an overwrite, leaving `SendMessages` alone |
+| `forum` | A topic anybody may start | The default: `CreatePosts` is in `DefaultEveryone` |
+| `media` | A file, with the words optional | The server refuses an entry with no file |
+| `calendar` | Something that happens at a time | The server requires `event`, and refuses one anywhere else |
+
+Pinned entries travel with the first page of a listing however old they are, and
+take no part in the cursor: paging back never repeats one. A client floats them
+to the top of what it holds.
+
 ## Attachments
 
 A file is posted in two steps. It is uploaded on its own, and the message that
@@ -1019,7 +1090,11 @@ They default to 50 MiB and 5 GiB.
 | `channel.created` | `{ channel }` | Everyone who may see it. |
 | `channel.updated` | `{ channel }` | Everyone who may see it. |
 | `channel.deleted` | `{ channelId, cascaded }` | Everyone. |
-| `message.created` | `{ message }` | Everyone who may see the channel. |
+| `post.created` | `{ post }` | Everyone who may see the channel. |
+| `post.updated` | `{ post }` | Everyone who may see the channel. `rsvp.own` is empty in the broadcast; the caller's own reply carries theirs. |
+| `post.deleted` | `{ postId, channelId }` | Everyone who may see the channel. |
+| `post.rsvp` | `{ postId, channelId, userId, response, rsvp }` | Everyone who may see the channel. The tallies are everybody's and `userId` names whose answer changed, so `rsvp.own` is empty: a client updates its own only when `userId` is its own. |
+| `message.created` | `{ message }` | Everyone who may see the channel. A comment carries `postId`. |
 | `message.updated` | `{ message }` | Everyone who may see the channel. |
 | `message.deleted` | `{ messageId, channelId }` | Everyone who may see the channel. |
 | `dm.created` | `{ conversation, message }` | The two people in the thread, each naming the other. |
