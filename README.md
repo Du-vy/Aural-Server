@@ -8,7 +8,8 @@ Written in Go with no cgo, so a plain `go build` produces a single static binary
 for any target Go supports.
 
 > **Status: v0.5.** Identity, channels, roles, permissions, text messaging,
-> attachments, search and the audio plane are all implemented and tested.
+> private conversations, attachments, search and the audio plane are all
+> implemented and tested.
 
 ## Quick start
 
@@ -108,6 +109,7 @@ leave out falls back to its default. See `config.example.json` for the full file
     "password": "",            // gates the whole server; empty means no gate
     "max_users": 64,
     "allowed_origins": ["*"],  // browser Origin filter on the WebSocket upgrade
+    "allow_direct_messages": true, // private conversations between two members
     "trusted_proxies": []      // whose X-Forwarded-For to believe; empty = nobody
   },
   "registration": {
@@ -171,6 +173,24 @@ rejected at startup, since nobody could ever connect.
 
 `server.name` and `server.description` can also be changed at runtime by an
 administrator, and the change is written back to this file.
+
+### Private conversations
+
+Two members can write to each other outside any channel. A conversation is a
+pair of identities and nothing else, addressed by the other person's id, and it
+carries no files: an upload is bound to the channel it was made for.
+
+Each member decides who may reach them, with `dmPrivacy` — `everyone`,
+`registered` (only members who have claimed an account) or `none`. The setting
+is read from **both** ends of a send, so turning it off stops your own writing
+as well as everybody else's: otherwise somebody who wants no private messages
+could still open a thread nobody may answer. It is never shown to anybody but
+its owner.
+
+Operators have two switches of their own: the `SendDirectMessages` permission
+gates the feature by role, and `server.allow_direct_messages: false` turns it
+off for the whole server. Conversations already written are kept either way, so
+switching it back on loses nothing.
 
 ### Voice
 
@@ -458,6 +478,11 @@ permission, and files that are deleted along with their message.
 read, filtered by author, channel, date and the kind of content a message
 carries, with the conversation either side of each hit. History gained two more
 cursors, `after` and `around`, so a result can be opened where it was written.
+
+**Unreleased** — private conversations: a thread per pair of identities,
+paged like a channel, with a per-member privacy setting read from both ends of
+every send, a read marker the server keeps so an unread badge survives a
+restart, the `SendDirectMessages` permission, and a server-wide switch.
 
 **v0.5 (here)** — the audio plane: Opus over WebRTC, both hosting models,
 per-channel rooms, host election and handover, self and moderated mute and

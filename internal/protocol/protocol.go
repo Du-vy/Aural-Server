@@ -60,6 +60,16 @@ const (
 	OpMessageEdit    = "message.edit"
 	OpMessageDelete  = "message.delete"
 
+	// Private conversations. They belong to a pair of identities rather than
+	// to any channel, so none of the channel ops reaches them and they have
+	// their own small set instead.
+	OpDMList    = "dm.list"    // every conversation this identity is in
+	OpDMHistory = "dm.history" // page through one of them
+	OpDMSend    = "dm.send"
+	OpDMEdit    = "dm.edit"
+	OpDMDelete  = "dm.delete"
+	OpDMRead    = "dm.read" // move your own read marker up
+
 	OpRoleCreate   = "role.create"
 	OpRoleUpdate   = "role.update"
 	OpRoleDelete   = "role.delete"
@@ -95,6 +105,15 @@ const (
 	EvMessageUpdated = "message.updated"
 	EvMessageDeleted = "message.deleted"
 
+	// Every dm event carries userId: the other participant, from the point of
+	// view of whoever it was sent to. The two sides of one conversation
+	// therefore receive the same message under two different names, which is
+	// what saves a client from having to hold a map of conversation ids to
+	// people before it can render the first frame that arrives.
+	EvDMCreated = "dm.created"
+	EvDMUpdated = "dm.updated"
+	EvDMDeleted = "dm.deleted"
+
 	EvRoleCreated = "role.created"
 	EvRoleUpdated = "role.updated"
 	EvRoleDeleted = "role.deleted"
@@ -129,6 +148,8 @@ const (
 	ErrTooLarge           = "too_large"    // one upload exceeded the file ceiling
 	ErrStorageFull        = "storage_full" // the server-wide upload ceiling is reached
 	ErrUploadsDisabled    = "uploads_disabled"
+	ErrDMDisabled         = "dm_disabled"    // this server carries no private messages
+	ErrDMBlocked          = "dm_blocked"     // the other person does not accept them
 	ErrVoiceDisabled      = "voice_disabled" // this server runs no audio plane
 	ErrVoiceFailed        = "voice_failed"   // the media session could not be set up
 )

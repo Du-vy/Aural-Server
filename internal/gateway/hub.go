@@ -198,6 +198,16 @@ func (h *Hub) ServerIdentity() (name, description string) {
 	return h.cfg.Server.Name, h.cfg.Server.Description
 }
 
+// DirectMessagesEnabled reports whether this server carries private
+// conversations at all. It is read on every op behind them as well as
+// advertised in the server preview, so a client that ignores the preview is
+// still refused rather than half served.
+func (h *Hub) DirectMessagesEnabled() bool {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	return h.cfg.Server.AllowDirectMessages
+}
+
 // KlipyAPIKey is the operator's Klipy credential, which only the proxy handler
 // is meant to read. It is deliberately not part of ServerIdentity: that feeds
 // the public server preview, and a secret has no business travelling with it.
@@ -666,6 +676,12 @@ func (h *Hub) MaskUser(viewer *Session, view protocol.User) protocol.User {
 	}
 	if view.ChannelID != nil && !h.SessionCanView(viewer, *view.ChannelID) {
 		view.ChannelID = nil
+	}
+	if viewer.UserID() != view.ID {
+		// What somebody accepts privately is their setting to read and nobody
+		// else's to see. Finding out that a message will not be delivered is
+		// what sending one is for.
+		view.DMPrivacy = ""
 	}
 	return view
 }

@@ -590,6 +590,16 @@ var routes = map[string]route{
 	protocol.OpMessageEdit:    {needsAuth: true, fn: handleMessageEdit},
 	protocol.OpMessageDelete:  {needsAuth: true, fn: handleMessageDelete},
 
+	// Private conversations. Reading one walks its history rather than an
+	// index of it, exactly as a channel does, so it is dispatched off the read
+	// loop for the same reason.
+	protocol.OpDMList:    {needsAuth: true, slow: true, fn: handleDMList},
+	protocol.OpDMHistory: {needsAuth: true, slow: true, fn: handleDMHistory},
+	protocol.OpDMSend:    {needsAuth: true, fn: handleDMSend},
+	protocol.OpDMEdit:    {needsAuth: true, fn: handleDMEdit},
+	protocol.OpDMDelete:  {needsAuth: true, fn: handleDMDelete},
+	protocol.OpDMRead:    {needsAuth: true, fn: handleDMRead},
+
 	protocol.OpRoleCreate:   {needsAuth: true, fn: handleRoleCreate},
 	protocol.OpRoleUpdate:   {needsAuth: true, fn: handleRoleUpdate},
 	protocol.OpRoleDelete:   {needsAuth: true, fn: handleRoleDelete},

@@ -329,6 +329,18 @@ func (h *Hub) buildReady(ctx context.Context, s *Session, sessionToken string) (
 		return protocol.Ready{}, err
 	}
 
+	// A badge is the whole reason to know a private thread exists before
+	// opening it, so the snapshot carries them. A server with private messages
+	// switched off sends none, and the field is absent rather than empty.
+	var conversations []protocol.Conversation
+	if h.DirectMessagesEnabled() {
+		views, failure := h.conversationViews(ctx, s, s.UserID())
+		if failure != nil {
+			return protocol.Ready{}, failure
+		}
+		conversations = views
+	}
+
 	return protocol.Ready{
 		SessionToken: sessionToken,
 		User:         s.view(),
@@ -339,6 +351,8 @@ func (h *Hub) buildReady(ctx context.Context, s *Session, sessionToken string) (
 		Server:       h.serverInfo(),
 		ICEServers:   h.iceServers(),
 		VoiceStates:  h.voiceStatesFor(s),
+
+		Conversations: conversations,
 	}, nil
 }
 

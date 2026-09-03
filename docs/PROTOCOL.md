@@ -114,6 +114,8 @@ never on `message`.
 | `too_large` | One upload exceeded the per-file ceiling. |
 | `storage_full` | The server-wide upload ceiling is reached. |
 | `uploads_disabled` | This server does not accept file uploads. |
+| `dm_disabled` | This server does not carry private conversations. |
+| `dm_blocked` | A privacy setting refuses this private message. |
 
 ## Numbers
 
@@ -228,7 +230,8 @@ client's view of the tree stale.
   "channels":   [Channel], // only the channels the caller may see
   "roles":      [Role],    // the whole role table
   "permissions": "1234",   // the caller's resolved server-wide mask
-  "server":      ServerInfo
+  "server":      ServerInfo,
+  "conversations": [Conversation] // private threads, newest first; absent when off
 }
 ```
 
@@ -254,7 +257,8 @@ member.
   "registered": true,
   "roles": [1, 2],
   "channelId": 3,          // null when in no voice channel
-  "online": true
+  "online": true,
+  "dmPrivacy": "everyone"  // only on your own entry; see Private conversations
 }
 
 // Channel — "category" holds others; "text" and "voice" are always leaves
@@ -292,6 +296,26 @@ member.
   "attachments": []        // absent when the message carries no files
 }
 
+// DirectMessage — one line of a private conversation
+{
+  "id": 4,
+  "conversationId": 2,
+  "userId": 4,             // null once the author's account is gone
+  "author": "Pablo",       // resolved live, exactly as on Message
+  "content": "hello",
+  "createdAt": 1756600000,
+  "editedAt": null
+}
+
+// Conversation — one private thread, as it looks to one of the two in it
+{
+  "id": 2,
+  "userId": 7,             // the OTHER participant, from the reader's side
+  "lastMessageAt": 1756600000,
+  "lastMessage": DirectMessage, // absent until something is said
+  "unread": 3
+}
+
 // Attachment
 {
   "id": 7,
@@ -315,6 +339,7 @@ member.
   "registrationEnabled": true,
   "guestsAllowed": true,
   "voiceMode": "client_host",  // client_host | server_host
+  "directMessages": true,      // whether this server carries private conversations
   "uploads": {
     "enabled": true,
     "maxFileBytes": "52428800",     // decimal strings, for the same reason
@@ -338,6 +363,7 @@ A 64-bit mask. `Administrator` bypasses every other check.
 | 4 | `ChangeNickname` | Change your own nickname |
 | 5 | `Register` | Claim your identity as an account |
 | 6 | `AttachFiles` | Post files alongside a message |
+| 7 | `SendDirectMessages` | Write to another member privately |
 | 8 | `ManageChannels` | Create, edit and delete channels |
 | 9 | `ManageRoles` | Manage roles and channel overwrites |
 | 10 | `ManageServer` | Rename the server |
@@ -409,6 +435,12 @@ Every op below needs an authenticated session.
 | `message.search` | `ViewChannel`, per channel | `{ query?, channelIds?, authorIds?, has?, after?, before?, sort?, limit?, offset? }`. Runs only over the channels the caller may read. Rate limited. |
 | `message.edit` | Author only | `{ messageId, content }`. |
 | `message.delete` | Author, or `ManageMessages` on the channel | `{ messageId }`. |
+| `dm.list` | — | `{}`. Every private conversation you are in, newest first. |
+| `dm.history` | — | `{ userId, before?, after?, around?, limit? }`. Cursors work as in `message.history`. A thread that does not exist yet returns `conversationId: 0` and no messages. |
+| `dm.send` | `SendDirectMessages`, plus both privacy settings | `{ userId, content }`. Opens the conversation if it is the first thing either has said. Rate limited on the same bucket as `message.send`. |
+| `dm.edit` | Author only | `{ messageId, content }`. |
+| `dm.delete` | Author only | `{ messageId }`. There is no moderator in a private conversation. |
+| `dm.read` | — | `{ userId, messageId }`. Moves your own read marker; it never moves backwards. |
 | `role.create` | `ManageRoles` | `{ name, color?, permissions?, hoist? }`. Lands below your rank. |
 | `role.update` | `ManageRoles` | `{ roleId, name?, color?, permissions?, position?, hoist? }`. |
 | `role.delete` | `ManageRoles` | `{ roleId }`. Managed roles cannot be deleted. |
@@ -653,6 +685,57 @@ narrows nothing at all is `bad_request`: a search needs something to look for.
   side of it in its own channel, absent at the edges of a history. They travel
   with the hit because a line of chat rarely means anything alone.
 
+## Private conversations
+
+A conversation is a **pair of identities** and nothing else: no name, no topic,
+no membership, because there is never anybody to add. It is addressed on the
+wire by the other person's `userId`, never by an id the client would first have
+to learn — a name in the member list is all somebody has to start from.
+
+The same thread therefore reaches its two sides under two different names:
+`conversation.userId` is always *the other one*, from the point of view of
+whoever the frame was sent to. That is what lets a client key its conversations
+by person and render the first frame that arrives without holding a map.
+
+Private messages carry no attachments. An upload is bound to the channel it was
+made for, and there is no channel here to bind one to.
+
+### Privacy
+
+Every identity carries `dmPrivacy`, one of:
+
+| Value | Who may write to you |
+| --- | --- |
+| `everyone` | Anybody on this server. The default. |
+| `registered` | Only members who have claimed an account. |
+| `none` | Nobody. |
+
+It is set with `user.update` (`{ "dmPrivacy": "registered" }`), only ever on
+yourself: no permission lets anybody set it for somebody else.
+
+Two rules follow it:
+
+- **It is read from both ends of a send.** A message is refused with
+  `dm_blocked` when the recipient will not hear from the sender *or* when the
+  sender's own setting excludes the recipient. Otherwise somebody who wants no
+  private messages could still open a thread nobody may answer, which is a
+  worse place to be than either answer alone.
+- **It is nobody else's business.** `dmPrivacy` is populated only on your own
+  entry; every other copy of you carries an empty string. Finding out that a
+  message will not be delivered is what sending one is for.
+
+`SendDirectMessages` gates the feature by role, and `server.allow_direct_messages`
+switches it off for the whole server — advertised as `directMessages` in
+`ServerInfo`, and every op behind it then answers `dm_disabled`.
+
+### Unread
+
+The server keeps a **read marker** per participant: the id of the newest line
+that side has seen. `conversation.unread` counts what sits past it, so a badge
+survives a restart rather than being whatever the client happened to see live.
+Sending moves your own marker, which is why your own writing is never unread,
+and `dm.read` only ever moves it forwards.
+
 ## Attachments
 
 A file is posted in two steps. It is uploaded on its own, and the message that
@@ -738,6 +821,9 @@ They default to 50 MiB and 5 GiB.
 | `message.created` | `{ message }` | Everyone who may see the channel. |
 | `message.updated` | `{ message }` | Everyone who may see the channel. |
 | `message.deleted` | `{ messageId, channelId }` | Everyone who may see the channel. |
+| `dm.created` | `{ conversation, message }` | The two people in the thread, each naming the other. |
+| `dm.updated` | `{ userId, message }` | Both, when a line is edited. |
+| `dm.deleted` | `{ userId, conversationId, messageId }` | Both, when a line is removed. |
 | `role.created` / `role.updated` / `role.deleted` | `{ role }` / `{ roleId }` | Everyone. |
 | `server.updated` | `{ server }` | Everyone. |
 | `voice.*` | See [Voice](#voice) | The audio plane. |
@@ -773,6 +859,9 @@ refresh is worth.
   happen to a member who is not connected.
 
 ## Not in version 1
+
+Group conversations, files in a private conversation, and blocking somebody
+outright: `dmPrivacy` is a door held for a class of people, not a list of names.
 
 Bans, per-user permission overwrites, and screen sharing. Video would reuse the
 whole of [Voice](#voice) — the signalling is codec-agnostic — and needs a

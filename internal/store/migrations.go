@@ -186,6 +186,58 @@ var migrations = []string{
 	);
 	CREATE INDEX idx_profile_media_owner ON profile_media(user_id, kind);
 	`,
+	// 8: private conversations.
+	//
+	// A conversation is a pair of identities, held as the lower id and the
+	// higher one rather than as a sender and a recipient: the pair is the
+	// conversation, and storing it ordered is what makes "is there already one
+	// of these" a unique index rather than a search for a row that could have
+	// been written either way round.
+	//
+	// Both ends cascade. An identity that is deleted — a guest swept by the
+	// retention job — takes its conversations with it, because half a private
+	// conversation is not something the other person can reply to.
+	`
+	CREATE TABLE dm_conversations (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_low   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_high  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		-- The newest message each side has read, so a badge survives a restart
+		-- rather than being whatever the client happened to see live.
+		low_read_id     INTEGER NOT NULL DEFAULT 0,
+		high_read_id    INTEGER NOT NULL DEFAULT 0,
+		created_at      INTEGER NOT NULL,
+		last_message_at INTEGER NOT NULL
+	);
+	CREATE UNIQUE INDEX idx_dm_pair ON dm_conversations(user_low, user_high);
+	-- One list per person, most recently spoken in first: the two indexes are
+	-- the two sides somebody's own id can be on.
+	CREATE INDEX idx_dm_low  ON dm_conversations(user_low, last_message_at DESC);
+	CREATE INDEX idx_dm_high ON dm_conversations(user_high, last_message_at DESC);
+
+	CREATE TABLE direct_messages (
+		id              INTEGER PRIMARY KEY AUTOINCREMENT,
+		conversation_id INTEGER NOT NULL REFERENCES dm_conversations(id) ON DELETE CASCADE,
+		-- As in messages: an author who is deleted leaves what they wrote
+		-- behind, attributed to the name captured in author.
+		user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+		author     TEXT    NOT NULL,
+		content    TEXT    NOT NULL,
+		created_at INTEGER NOT NULL,
+		edited_at  INTEGER
+	);
+	CREATE INDEX idx_direct_messages_conversation ON direct_messages(conversation_id, id DESC);
+
+	-- Who may write to you privately: 'everyone', 'registered' (only members
+	-- who have claimed an account), or 'none'. It is read from both sides of a
+	-- send, so turning it off stops the replies as well as the openings.
+	ALTER TABLE users ADD COLUMN dm_privacy TEXT NOT NULL DEFAULT 'everyone';
+
+	-- Existing servers seeded their everyone role before SendDirectMessages
+	-- existed. Granting it here leaves a server that upgrades behaving like a
+	-- fresh one, exactly as the AttachFiles migration did.
+	UPDATE roles SET permissions = permissions | 128 WHERE managed = 'everyone';
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

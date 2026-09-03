@@ -64,6 +64,23 @@ func messageView(m store.Message, attachments []store.Attachment) protocol.Messa
 	return out
 }
 
+// directMessageView converts one stored private line into its wire form.
+//
+// It carries no attachments because a private conversation carries no files:
+// an upload is bound to the channel it was made for, and there is no channel
+// here to bind one to.
+func directMessageView(m store.DirectMessage) protocol.DirectMessage {
+	return protocol.DirectMessage{
+		ID:             m.ID,
+		ConversationID: m.ConversationID,
+		UserID:         m.UserID,
+		Author:         m.Author,
+		Content:        m.Content,
+		CreatedAt:      m.CreatedAt,
+		EditedAt:       m.EditedAt,
+	}
+}
+
 // attachmentView converts a stored attachment into its wire form.
 //
 // The URL is relative and carries the filename as its last segment, so a
@@ -125,6 +142,9 @@ func userView(u store.User, roleIDs []int64, channelID *int64, online bool) prot
 		CustomStatus: u.CustomStatus,
 		Avatar:       u.Avatar,
 		Banner:       u.Banner,
+		// Only ever reaches its own subject: MaskUser clears it for everybody
+		// else, and offlineView never carries one at all.
+		DMPrivacy: u.DMPrivacy,
 	}
 }
 
@@ -140,6 +160,7 @@ func offlineView(u store.User, roleIDs []int64) protocol.User {
 	view := userView(u, roleIDs, nil, false)
 	view.Status = "offline"
 	view.CustomStatus = ""
+	view.DMPrivacy = ""
 	return view
 }
 
@@ -161,6 +182,7 @@ func (h *Hub) serverInfo() protocol.ServerInfo {
 		Voice:               h.voiceInfo(),
 		Uploads:             h.uploadInfo(),
 		KlipyEnabled:        h.KlipyAPIKey() != "",
+		DirectMessages:      h.DirectMessagesEnabled(),
 	}
 }
 

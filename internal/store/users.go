@@ -21,6 +21,10 @@ type User struct {
 	Banner       *string
 	Status       string
 	CustomStatus string
+	// DMPrivacy is who may write to this identity privately: DMEveryone,
+	// DMRegistered or DMNone. It is the user's own setting and nobody else's
+	// business, so it never travels in anybody else's view of them.
+	DMPrivacy    string
 	RegisteredAt *int64
 	CreatedAt    int64
 	LastSeenAt   int64
@@ -29,14 +33,38 @@ type User struct {
 // Registered reports whether the identity has been claimed with credentials.
 func (u User) Registered() bool { return u.Username != nil }
 
+// The three answers to "who may write to me privately". They are checked from
+// both sides of a send, so DMNone stops the replies as well as the openings:
+// somebody who wants no private messages is out of the system, not merely
+// unreachable while still able to write into a thread nobody may answer.
 const (
-	userColumns    = `id, nickname, username, password_hash, avatar, banner, status, custom_status, registered_at, created_at, last_seen_at`
-	userColumnsAsU = `u.id, u.nickname, u.username, u.password_hash, u.avatar, u.banner, u.status, u.custom_status, u.registered_at, u.created_at, u.last_seen_at`
+	DMEveryone   = "everyone"   // anybody on this server
+	DMRegistered = "registered" // only members who have claimed an account
+	DMNone       = "none"       // nobody
+)
+
+// AcceptsDMFrom reports whether this identity takes private messages from
+// another. It is deliberately about the pair rather than about one setting:
+// every send asks it twice, once each way round.
+func (u User) AcceptsDMFrom(other User) bool {
+	switch u.DMPrivacy {
+	case DMNone:
+		return false
+	case DMRegistered:
+		return other.Registered()
+	default:
+		return true
+	}
+}
+
+const (
+	userColumns    = `id, nickname, username, password_hash, avatar, banner, status, custom_status, dm_privacy, registered_at, created_at, last_seen_at`
+	userColumnsAsU = `u.id, u.nickname, u.username, u.password_hash, u.avatar, u.banner, u.status, u.custom_status, u.dm_privacy, u.registered_at, u.created_at, u.last_seen_at`
 )
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Nickname, &u.Username, &u.PasswordHash, &u.Avatar, &u.Banner, &u.Status, &u.CustomStatus, &u.RegisteredAt, &u.CreatedAt, &u.LastSeenAt)
+	err := row.Scan(&u.ID, &u.Nickname, &u.Username, &u.PasswordHash, &u.Avatar, &u.Banner, &u.Status, &u.CustomStatus, &u.DMPrivacy, &u.RegisteredAt, &u.CreatedAt, &u.LastSeenAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, ErrNotFound
 	}
@@ -45,6 +73,9 @@ func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	}
 	if u.Status == "" {
 		u.Status = "online"
+	}
+	if u.DMPrivacy == "" {
+		u.DMPrivacy = DMEveryone
 	}
 	return u, nil
 }
@@ -62,7 +93,10 @@ func (s *Store) CreateGuest(ctx context.Context, nickname string) (User, error) 
 	if err != nil {
 		return User{}, fmt.Errorf("store: create guest: %w", err)
 	}
-	return User{ID: id, Nickname: nickname, Status: "online", CustomStatus: "", CreatedAt: ts, LastSeenAt: ts}, nil
+	return User{
+		ID: id, Nickname: nickname, Status: "online", CustomStatus: "",
+		DMPrivacy: DMEveryone, CreatedAt: ts, LastSeenAt: ts,
+	}, nil
 }
 
 // UserByID looks up one user.
@@ -161,8 +195,9 @@ func (s *Store) SetStatus(ctx context.Context, id int64, status string, customSt
 	return requireOneRow(res, "user")
 }
 
-// UpdateProfile updates nickname, avatar, banner, status, or custom status for a user.
-func (s *Store) UpdateProfile(ctx context.Context, id int64, nickname *string, avatar **string, banner **string, status *string, customStatus *string) (User, error) {
+// UpdateProfile updates nickname, avatar, banner, status, custom status or
+// direct-message privacy for a user. A nil field is left alone.
+func (s *Store) UpdateProfile(ctx context.Context, id int64, nickname *string, avatar **string, banner **string, status *string, customStatus *string, dmPrivacy *string) (User, error) {
 	var sets []string
 	var args []any
 
@@ -185,6 +220,10 @@ func (s *Store) UpdateProfile(ctx context.Context, id int64, nickname *string, a
 	if customStatus != nil {
 		sets = append(sets, "custom_status = ?")
 		args = append(args, *customStatus)
+	}
+	if dmPrivacy != nil {
+		sets = append(sets, "dm_privacy = ?")
+		args = append(args, *dmPrivacy)
 	}
 
 	if len(sets) == 0 {

@@ -47,6 +47,11 @@ type Server struct {
 	// upgrade. ["*"] accepts every origin, which is the sane default for a
 	// self-hosted server reached by address rather than by domain.
 	AllowedOrigins []string `json:"allowed_origins"`
+	// AllowDirectMessages carries private conversations between two members.
+	// Switching it off hides the whole of that interface in every client and
+	// refuses every op behind it; the conversations already written are kept,
+	// so turning it back on is not a loss of history.
+	AllowDirectMessages bool `json:"allow_direct_messages"`
 	// TrustedProxies are the addresses or CIDR ranges whose X-Forwarded-For
 	// header this server believes.
 	//
@@ -377,14 +382,15 @@ const (
 func Default() Config {
 	return Config{
 		Server: Server{
-			Name:           "Aural Server",
-			Description:    "A self-hosted Aural server",
-			Bind:           "0.0.0.0",
-			Port:           DefaultPort,
-			Password:       "",
-			MaxUsers:       64,
-			AllowedOrigins: []string{"*"},
-			TrustedProxies: []string{},
+			Name:                "Aural Server",
+			Description:         "A self-hosted Aural server",
+			Bind:                "0.0.0.0",
+			Port:                DefaultPort,
+			Password:            "",
+			MaxUsers:            64,
+			AllowedOrigins:      []string{"*"},
+			AllowDirectMessages: true,
+			TrustedProxies:      []string{},
 		},
 		Registration: Registration{
 			Enabled:           true,

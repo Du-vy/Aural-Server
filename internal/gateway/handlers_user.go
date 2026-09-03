@@ -30,6 +30,18 @@ func validateStatus(status string) (string, *protocol.Error) {
 	}
 }
 
+// validateDMPrivacy checks who somebody is willing to hear from privately.
+func validateDMPrivacy(raw string) (string, *protocol.Error) {
+	privacy := strings.ToLower(strings.TrimSpace(raw))
+	switch privacy {
+	case store.DMEveryone, store.DMRegistered, store.DMNone:
+		return privacy, nil
+	default:
+		return "", protocol.Errorf(protocol.ErrBadRequest,
+			"direct message privacy must be everyone, registered or none")
+	}
+}
+
 // validateMediaURL accepts only a reference to a file this server stores.
 //
 // An avatar is fetched by every client that renders the member list, so a URL
@@ -86,7 +98,8 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 	if failure != nil {
 		return nil, failure
 	}
-	if req.Nickname == nil && req.Status == nil && req.CustomStatus == nil && req.Avatar == nil && req.Banner == nil {
+	if req.Nickname == nil && req.Status == nil && req.CustomStatus == nil &&
+		req.Avatar == nil && req.Banner == nil && req.DMPrivacy == nil {
 		return nil, protocol.Errorf(protocol.ErrBadRequest, "nothing to update")
 	}
 
@@ -122,7 +135,8 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 		validatedNickname = &nickname
 	}
 
-	if !isSelf && (req.Status != nil || req.CustomStatus != nil || req.Avatar != nil || req.Banner != nil) {
+	if !isSelf && (req.Status != nil || req.CustomStatus != nil || req.Avatar != nil ||
+		req.Banner != nil || req.DMPrivacy != nil) {
 		return nil, protocol.Errorf(protocol.ErrForbidden, "you may only update your own profile details")
 	}
 
@@ -144,6 +158,15 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 		validatedCustomStatus = &cs
 	}
 
+	var validatedDMPrivacy *string
+	if req.DMPrivacy != nil {
+		privacy, failure := validateDMPrivacy(*req.DMPrivacy)
+		if failure != nil {
+			return nil, failure
+		}
+		validatedDMPrivacy = &privacy
+	}
+
 	validatedAvatar, failure := s.hub.validateMediaField(req.Avatar, "avatar")
 	if failure != nil {
 		return nil, failure
@@ -153,7 +176,8 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 		return nil, failure
 	}
 
-	updatedUser, err := s.hub.st.UpdateProfile(ctx, targetID, validatedNickname, validatedAvatar, validatedBanner, validatedStatus, validatedCustomStatus)
+	updatedUser, err := s.hub.st.UpdateProfile(ctx, targetID, validatedNickname,
+		validatedAvatar, validatedBanner, validatedStatus, validatedCustomStatus, validatedDMPrivacy)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, protocol.Errorf(protocol.ErrNotFound, "no such user")

@@ -46,6 +46,10 @@ type ServerInfo struct {
 	// server: it is the operator's, not the client's, and this preview is
 	// unauthenticated.
 	KlipyEnabled bool `json:"klipyEnabled"`
+	// DirectMessages reports that this server carries private conversations.
+	// An operator can switch them off, and a client that is told so hides that
+	// whole interface rather than offering something every send is refused for.
+	DirectMessages bool `json:"directMessages"`
 }
 
 // Uploads tells a client what this server accepts before it sends anything, so
@@ -171,6 +175,12 @@ type User struct {
 	CustomStatus string  `json:"customStatus,omitempty"`
 	Avatar       *string `json:"avatar,omitempty"`
 	Banner       *string `json:"banner,omitempty"`
+	// DMPrivacy is "everyone", "registered" or "none", and is only ever set on
+	// your own entry: what somebody accepts privately is theirs to read and
+	// nobody else's to see. Everybody else's copy of you carries an empty
+	// string, and finding out that a message will not be delivered is what
+	// sending one is for.
+	DMPrivacy string `json:"dmPrivacy,omitempty"`
 }
 
 // Overwrite is a per-channel permission adjustment for one role. Allow and Deny
@@ -226,6 +236,42 @@ type Message struct {
 	Attachments []Attachment `json:"attachments,omitempty"`
 }
 
+// DirectMessage is one line of a private conversation.
+//
+// It is a Message in everything a reader can see, and differs only in what it
+// hangs off: a conversation rather than a channel. The two are separate types
+// for the same reason they are separate tables — a message belongs to one or
+// the other, never to both, and a shared type would carry an empty half
+// through every frame.
+type DirectMessage struct {
+	ID             int64  `json:"id"`
+	ConversationID int64  `json:"conversationId"`
+	UserID         *int64 `json:"userId"` // nil once an author's account is gone
+	Author         string `json:"author"`
+	Content        string `json:"content"`
+	CreatedAt      int64  `json:"createdAt"`
+	EditedAt       *int64 `json:"editedAt"`
+}
+
+// Conversation is one private thread as it looks to one of the two people in
+// it. UserID is therefore the other one: the same row reaches the two sides
+// under two different names, which is what lets a client key its conversations
+// by person without first learning which id it was given.
+type Conversation struct {
+	ID     int64 `json:"id"`
+	UserID int64 `json:"userId"`
+	// LastMessageAt is when the thread was last written in, which is the order
+	// a list of them is kept in. One nobody has written in yet carries the
+	// moment it was opened.
+	LastMessageAt int64 `json:"lastMessageAt"`
+	// LastMessage is the line a list shows under the name. It is absent from a
+	// conversation that has just been opened and not yet written in.
+	LastMessage *DirectMessage `json:"lastMessage,omitempty"`
+	// Unread is how much has arrived since this side last read it. It counts
+	// from a marker the server keeps, so a badge survives a restart.
+	Unread int `json:"unread"`
+}
+
 // Attachment is one file carried by a message.
 //
 // URL is relative to the server root, so a client that reached the server by
@@ -278,6 +324,10 @@ type Ready struct {
 	// identity and at most one voice state, and only while they are in a
 	// channel: folding it into User would put an empty object on everybody.
 	VoiceStates []VoiceState `json:"voiceStates"`
+	// Conversations is every private thread this identity is in, newest first,
+	// with what is waiting in each. It travels in the snapshot because a badge
+	// is the whole reason to know a thread exists before opening it.
+	Conversations []Conversation `json:"conversations,omitempty"`
 }
 
 // --- requests ---------------------------------------------------------------
@@ -355,6 +405,10 @@ type UserUpdateRequest struct {
 	// server stores.
 	Avatar *string `json:"avatar,omitempty"`
 	Banner *string `json:"banner,omitempty"`
+	// DMPrivacy sets who may write to you privately: "everyone", "registered"
+	// or "none". It is your own setting and cannot be changed for anybody else,
+	// whatever permissions the caller holds.
+	DMPrivacy *string `json:"dmPrivacy,omitempty"`
 }
 
 type UserMoveRequest struct {
@@ -506,6 +560,66 @@ type MessageDeleteRequest struct {
 	MessageID int64 `json:"messageId"`
 }
 
+// --- private conversations ---------------------------------------------------
+
+// DMListRequest reads every conversation the caller is in. It takes nothing: a
+// person has as many private threads as they have, and the server bounds the
+// list rather than the caller paging it.
+type DMListRequest struct{}
+
+type DMListResult struct {
+	Conversations []Conversation `json:"conversations"`
+}
+
+// DMHistoryRequest pages through the conversation with one person.
+//
+// It names the person rather than the conversation, because a name in the
+// member list is all a client has to start from: the thread may not exist yet,
+// and asking for its history is a perfectly good way to find that out.
+//
+// The three cursors work exactly as they do in MessageHistoryRequest.
+type DMHistoryRequest struct {
+	UserID int64 `json:"userId"`
+	Before int64 `json:"before,omitempty"`
+	After  int64 `json:"after,omitempty"`
+	Around int64 `json:"around,omitempty"`
+	Limit  int   `json:"limit,omitempty"`
+}
+
+// DMHistoryResult is ordered oldest first, the order it is rendered in. A
+// conversation that has never been opened comes back with a zero id and no
+// messages rather than as an error.
+type DMHistoryResult struct {
+	UserID         int64           `json:"userId"`
+	ConversationID int64           `json:"conversationId"`
+	Messages       []DirectMessage `json:"messages"`
+	HasMore        bool            `json:"hasMore"`
+	HasMoreAfter   bool            `json:"hasMoreAfter"`
+}
+
+// DMSendRequest writes to one person, opening the conversation if this is the
+// first thing either of them has said to the other.
+type DMSendRequest struct {
+	UserID  int64  `json:"userId"`
+	Content string `json:"content"`
+}
+
+type DMEditRequest struct {
+	MessageID int64  `json:"messageId"`
+	Content   string `json:"content"`
+}
+
+type DMDeleteRequest struct {
+	MessageID int64 `json:"messageId"`
+}
+
+// DMReadRequest moves the caller's own read marker in one conversation up to a
+// message they have seen. The marker never moves backwards.
+type DMReadRequest struct {
+	UserID    int64 `json:"userId"`
+	MessageID int64 `json:"messageId"`
+}
+
 type RoleCreateRequest struct {
 	Name        string `json:"name"`
 	Color       string `json:"color,omitempty"`
@@ -568,6 +682,27 @@ type MessageEvent struct {
 type MessageDeletedEvent struct {
 	MessageID int64 `json:"messageId"`
 	ChannelID int64 `json:"channelId"`
+}
+
+// DMCreatedEvent delivers one private line to the two people in it. The
+// conversation travels with it because the receiving side may never have heard
+// of it: the first thing somebody says to you is also how you learn the thread
+// exists.
+type DMCreatedEvent struct {
+	Conversation Conversation  `json:"conversation"`
+	Message      DirectMessage `json:"message"`
+}
+
+// DMUpdatedEvent is an edit. UserID is the other participant, as everywhere.
+type DMUpdatedEvent struct {
+	UserID  int64         `json:"userId"`
+	Message DirectMessage `json:"message"`
+}
+
+type DMDeletedEvent struct {
+	UserID         int64 `json:"userId"`
+	ConversationID int64 `json:"conversationId"`
+	MessageID      int64 `json:"messageId"`
 }
 
 type RoleEvent struct {

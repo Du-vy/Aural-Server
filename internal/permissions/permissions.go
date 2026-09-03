@@ -22,6 +22,10 @@ const (
 	ChangeNickname Permission = 1 << 4
 	Register       Permission = 1 << 5 // claim a guest identity as an account
 	AttachFiles    Permission = 1 << 6 // post files alongside a message
+	// SendDirectMessages covers private conversations, which are between two
+	// people rather than in any channel: no overwrite can reach them, so this
+	// bit is only ever read from the server-wide mask.
+	SendDirectMessages Permission = 1 << 7
 
 	ManageChannels  Permission = 1 << 8
 	ManageRoles     Permission = 1 << 9
@@ -46,29 +50,31 @@ const None Permission = 0
 // order fixes the presentation order used by Names and by the client UI.
 var order = []Permission{
 	ViewChannel, Connect, Speak, SendMessages, ChangeNickname, Register, AttachFiles,
+	SendDirectMessages,
 	ManageChannels, ManageRoles, ManageServer, ManageNicknames, ManageMessages,
 	KickUsers, MoveUsers, MuteUsers, DeafenUsers,
 	Administrator,
 }
 
 var names = map[Permission]string{
-	ViewChannel:     "ViewChannel",
-	Connect:         "Connect",
-	Speak:           "Speak",
-	SendMessages:    "SendMessages",
-	ChangeNickname:  "ChangeNickname",
-	Register:        "Register",
-	AttachFiles:     "AttachFiles",
-	ManageChannels:  "ManageChannels",
-	ManageRoles:     "ManageRoles",
-	ManageServer:    "ManageServer",
-	ManageNicknames: "ManageNicknames",
-	ManageMessages:  "ManageMessages",
-	KickUsers:       "KickUsers",
-	MoveUsers:       "MoveUsers",
-	MuteUsers:       "MuteUsers",
-	DeafenUsers:     "DeafenUsers",
-	Administrator:   "Administrator",
+	ViewChannel:        "ViewChannel",
+	Connect:            "Connect",
+	Speak:              "Speak",
+	SendMessages:       "SendMessages",
+	ChangeNickname:     "ChangeNickname",
+	Register:           "Register",
+	AttachFiles:        "AttachFiles",
+	SendDirectMessages: "SendDirectMessages",
+	ManageChannels:     "ManageChannels",
+	ManageRoles:        "ManageRoles",
+	ManageServer:       "ManageServer",
+	ManageNicknames:    "ManageNicknames",
+	ManageMessages:     "ManageMessages",
+	KickUsers:          "KickUsers",
+	MoveUsers:          "MoveUsers",
+	MuteUsers:          "MuteUsers",
+	DeafenUsers:        "DeafenUsers",
+	Administrator:      "Administrator",
 }
 
 // All is every defined permission, which is what Administrator resolves to.
@@ -81,8 +87,10 @@ var All = func() Permission {
 }()
 
 // DefaultEveryone is what an unconfigured server grants to every connected
-// user, guests included: they can look around, talk, and claim an account.
-const DefaultEveryone = ViewChannel | Connect | Speak | SendMessages | ChangeNickname | Register | AttachFiles
+// user, guests included: they can look around, talk, write to somebody
+// privately, and claim an account.
+const DefaultEveryone = ViewChannel | Connect | Speak | SendMessages | ChangeNickname |
+	Register | AttachFiles | SendDirectMessages
 
 // DefaultRegistered is granted on top of DefaultEveryone once a user claims an
 // account. It is deliberately empty so that a fresh server treats guests and
