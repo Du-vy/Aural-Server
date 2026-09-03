@@ -57,8 +57,13 @@ const (
 // WebSocket (in Hello) and over plain HTTP at GET /info, so a client can preview
 // a server before connecting to it.
 type ServerInfo struct {
-	Name                string `json:"name"`
-	Description         string `json:"description"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// Icon is the path of this server's picture, relative to the server's own
+	// origin exactly as an avatar is, and empty when the server has none. A
+	// client that reads it draws it wherever it would otherwise draw the first
+	// letter of the name.
+	Icon                string `json:"icon,omitempty"`
 	ProtocolVersion     int    `json:"protocolVersion"`
 	SoftwareVersion     string `json:"softwareVersion"`
 	MaxUsers            int    `json:"maxUsers"`
@@ -611,6 +616,10 @@ type ClaimAdminRequest struct {
 type ServerUpdateRequest struct {
 	Name        *string `json:"name,omitempty"`
 	Description *string `json:"description,omitempty"`
+	// Icon is only ever sent empty, to take the picture away. Setting one is
+	// an upload, not a field: the bytes go to POST /upload/server-icon and the
+	// path is the server's answer, never the client's claim.
+	Icon        *string `json:"icon,omitempty"`
 	KlipyAPIKey *string `json:"klipyApiKey,omitempty"`
 	// Voice replaces the whole audio-plane configuration at once. It is not a
 	// per-field patch because the fields constrain one another - a bitrate

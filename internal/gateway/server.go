@@ -94,6 +94,8 @@ func New(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Stor
 	mux.HandleFunc("OPTIONS /upload/avatar", s.handlePreflight)
 	mux.HandleFunc("POST /upload/banner", s.handleBannerUpload)
 	mux.HandleFunc("OPTIONS /upload/banner", s.handlePreflight)
+	mux.HandleFunc("POST /upload/server-icon", s.handleServerIconUpload)
+	mux.HandleFunc("OPTIONS /upload/server-icon", s.handlePreflight)
 	mux.HandleFunc("POST /upload/emoji", s.handleEmojiUpload)
 	mux.HandleFunc("OPTIONS /upload/emoji", s.handlePreflight)
 	mux.HandleFunc("POST /upload/sticker", s.handleStickerUpload)

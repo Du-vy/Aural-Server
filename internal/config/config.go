@@ -39,8 +39,16 @@ type Config struct {
 type Server struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	Bind        string `json:"bind"`
-	Port        int    `json:"port"`
+	// Icon is the public path of this server's picture, empty when it has
+	// none. The storage key and size travel with it because the file lives
+	// under the upload store rather than in a table: the key is what deletes
+	// it when it is replaced, and the size is what the quota is charged on the
+	// next start, which would otherwise forget the bytes it is holding.
+	Icon     string `json:"icon,omitempty"`
+	IconKey  string `json:"icon_key,omitempty"`
+	IconSize int64  `json:"icon_size,omitempty"`
+	Bind     string `json:"bind"`
+	Port     int    `json:"port"`
 	// Password gates the whole server. Empty means no gate.
 	Password string `json:"password"`
 	MaxUsers int    `json:"max_users"`

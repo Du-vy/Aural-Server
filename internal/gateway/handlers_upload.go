@@ -834,3 +834,108 @@ func (s *Server) sweepRetention(ctx context.Context) {
 		}
 	}
 }
+
+// handleServerIconUpload replaces this server's picture.
+//
+//	POST /upload/server-icon
+//	Authorization: Bearer <session token>
+//	Content-Type: multipart/form-data, one part named "file"
+//
+// The icon is not profile media and gets no row: it belongs to the server
+// rather than to whoever uploaded it, and a table keyed by user is the wrong
+// place for something that must outlive that account. It lives in the
+// configuration, which is also what makes it survive a restart, and the size
+// recorded there is what the quota is charged on the next start.
+func (s *Server) handleServerIconUpload(w http.ResponseWriter, r *http.Request) {
+	s.applyCORS(w, r)
+
+	files := s.hub.Files()
+	if files == nil {
+		writeAPIError(w, http.StatusForbidden, protocol.ErrUploadsDisabled,
+			"this server does not accept file uploads")
+		return
+	}
+
+	user, failure := s.authenticateRequest(r)
+	if failure != nil {
+		writeProtocolError(w, failure)
+		return
+	}
+	base, _, err := s.hub.UserPermissions(r.Context(), user)
+	if err != nil {
+		s.log.Error("resolve uploader permissions", slog.Any("error", err))
+		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "could not check permissions")
+		return
+	}
+	if !base.Has(permissions.ManageServer) {
+		writeAPIError(w, http.StatusForbidden, protocol.ErrForbidden,
+			"you are not allowed to manage this server")
+		return
+	}
+	if !s.uploads.allow(user.ID) {
+		writeAPIError(w, http.StatusTooManyRequests, protocol.ErrRateLimited,
+			"you are uploading files too quickly")
+		return
+	}
+
+	part, filename, failure := openUploadPart(r)
+	if failure != nil {
+		writeProtocolError(w, failure)
+		return
+	}
+	defer part.Close()
+
+	if !isAllowedImageFormat(filename) {
+		writeAPIError(w, http.StatusBadRequest, protocol.ErrBadRequest,
+			"unsupported image format; allowed formats are JPG, PNG, WebP, GIF, AVIF, BMP")
+		return
+	}
+
+	// An icon is drawn at the size of an avatar, so it is held to the same
+	// ceiling rather than to one of its own.
+	maxBytes := s.cfg.Uploads.MaxAvatarBytes
+	if maxBytes <= 0 {
+		maxBytes = files.MaxFileBytes()
+	}
+
+	saved, err := files.SaveWithLimit(part, r.ContentLength, maxBytes)
+	switch {
+	case errors.Is(err, uploads.ErrTooLarge):
+		writeAPIError(w, http.StatusRequestEntityTooLarge, protocol.ErrTooLarge,
+			fmt.Sprintf("the server icon may be at most %s", humanBytes(maxBytes)))
+		return
+	case errors.Is(err, uploads.ErrQuotaExceeded):
+		writeAPIError(w, http.StatusInsufficientStorage, protocol.ErrStorageFull,
+			"this server has no storage left for new files")
+		return
+	case err != nil:
+		s.log.Error("store server icon", slog.Any("error", err))
+		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the file could not be stored")
+		return
+	}
+
+	iconURL := uploadPrefix + saved.Key + "/" + url.PathEscape(filename)
+	oldKey, oldSize, err := s.hub.SetServerIcon(iconURL, saved.Key, saved.Size)
+	if err != nil {
+		// Nothing points at the picture, so the bytes go straight back.
+		files.Remove(saved.Key, saved.Size)
+		s.log.Error("save the configuration", slog.Any("error", err))
+		writeAPIError(w, http.StatusInternalServerError, protocol.ErrInternal, "the icon could not be recorded")
+		return
+	}
+	// Only once the new picture is the one in use does the old one go.
+	s.hub.DropServerIcon(oldKey, oldSize)
+
+	info := s.hub.serverInfo()
+	s.hub.Broadcast(protocol.Event(protocol.EvServerUpdated, protocol.ServerUpdatedEvent{Server: info}))
+
+	entry := auditTarget(protocol.AuditTargetServer, 0, info.Name)
+	entry.Action = protocol.AuditServerUpdate
+	entry.ActorID = &user.ID
+	entry.ActorName = user.Nickname
+	entry.Changes = append(entry.Changes, store.AuditChange{Key: "icon", After: "changed"})
+	s.hub.audit(r.Context(), nil, entry)
+
+	s.log.Info("server icon uploaded", slog.Int64("user", user.ID), slog.Int64("bytes", saved.Size))
+	writeJSON(w, http.StatusOK, MediaUploadResult{URL: iconURL})
+}

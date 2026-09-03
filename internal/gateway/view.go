@@ -269,10 +269,11 @@ func offlineView(u store.User, roleIDs []int64, owner bool) protocol.User {
 // serverInfo is the public description handed to clients and to GET /info.
 func (h *Hub) serverInfo() protocol.ServerInfo {
 	cfg := h.cfg
-	name, description := h.ServerIdentity()
+	name, description, icon := h.ServerIdentity()
 	return protocol.ServerInfo{
 		Name:                name,
 		Description:         description,
+		Icon:                icon,
 		ProtocolVersion:     protocol.Version,
 		SoftwareVersion:     buildinfo.Version,
 		MaxUsers:            cfg.Server.MaxUsers,

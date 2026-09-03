@@ -511,8 +511,15 @@ func handleServerUpdate(_ context.Context, s *Session, raw json.RawMessage) (any
 	if !base.Has(permissions.ManageServer) {
 		return nil, protocol.Errorf(protocol.ErrForbidden, "you are not allowed to manage this server")
 	}
-	if req.Name == nil && req.Description == nil && req.KlipyAPIKey == nil && req.Voice == nil {
+	if req.Name == nil && req.Description == nil && req.Icon == nil && req.KlipyAPIKey == nil && req.Voice == nil {
 		return nil, protocol.Errorf(protocol.ErrBadRequest, "nothing to update")
+	}
+	// The only icon this op accepts is no icon. A path the client chose would
+	// name a file it does not own, so setting one is an upload and this field
+	// is the way back to having none.
+	if req.Icon != nil && strings.TrimSpace(*req.Icon) != "" {
+		return nil, protocol.Errorf(protocol.ErrBadRequest,
+			"the server icon is set by uploading one, not by naming a path")
 	}
 
 	var name, description, klipyApiKey string
@@ -559,14 +566,26 @@ func handleServerUpdate(_ context.Context, s *Session, raw json.RawMessage) (any
 		newVoice = &current
 	}
 
-	voiceChanged, err := s.hub.updateServerIdentity(
-		req.Name != nil, name,
-		req.Description != nil, description,
-		req.KlipyAPIKey != nil, klipyApiKey,
-		newVoice,
-	)
-	if err != nil {
-		return nil, internalError(s, "save the configuration", err)
+	if req.Icon != nil {
+		oldKey, oldSize, err := s.hub.SetServerIcon("", "", 0)
+		if err != nil {
+			return nil, internalError(s, "save the configuration", err)
+		}
+		s.hub.DropServerIcon(oldKey, oldSize)
+	}
+
+	var voiceChanged bool
+	if req.Name != nil || req.Description != nil || req.KlipyAPIKey != nil || newVoice != nil {
+		var err error
+		voiceChanged, err = s.hub.updateServerIdentity(
+			req.Name != nil, name,
+			req.Description != nil, description,
+			req.KlipyAPIKey != nil, klipyApiKey,
+			newVoice,
+		)
+		if err != nil {
+			return nil, internalError(s, "save the configuration", err)
+		}
 	}
 
 	info := s.hub.serverInfo()
@@ -579,6 +598,9 @@ func handleServerUpdate(_ context.Context, s *Session, raw json.RawMessage) (any
 	}
 	if req.Description != nil {
 		entry.Changes = append(entry.Changes, store.AuditChange{Key: "description", After: "changed"})
+	}
+	if req.Icon != nil {
+		entry.Changes = append(entry.Changes, store.AuditChange{Key: "icon", After: "removed"})
 	}
 	if req.KlipyAPIKey != nil {
 		// The credential itself never reaches the log. That it was replaced is

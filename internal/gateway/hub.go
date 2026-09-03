@@ -204,6 +204,10 @@ func NewHub(ctx context.Context, cfg *config.Config, cfgPath string, st *store.S
 			return nil, err
 		}
 		used += expressions
+		// The server's own icon is held in the configuration rather than in a
+		// table, so it is counted from there or the ceiling drifts by its size
+		// on every restart.
+		used += cfg.Server.IconSize
 		files, err := uploads.Open(cfg.Uploads.Path,
 			cfg.Uploads.MaxFileBytes, cfg.Uploads.MaxTotalBytes, used)
 		if err != nil {
@@ -243,10 +247,38 @@ func (h *Hub) RemoveFiles(attachments []store.Attachment) {
 }
 
 // ServerIdentity reads the configuration fields that change at runtime.
-func (h *Hub) ServerIdentity() (name, description string) {
+func (h *Hub) ServerIdentity() (name, description, icon string) {
 	h.cfgMu.RLock()
 	defer h.cfgMu.RUnlock()
-	return h.cfg.Server.Name, h.cfg.Server.Description
+	return h.cfg.Server.Name, h.cfg.Server.Description, h.cfg.Server.Icon
+}
+
+// SetServerIcon points the server at a picture and persists the change, giving
+// back whatever it displaced so the caller can unlink those bytes. An empty url
+// takes the picture away.
+//
+// The displaced file is returned rather than removed here for the same reason
+// an avatar's is: it must not go until the new one is the one in use, or a
+// failure to save leaves the configuration naming a file that is gone.
+func (h *Hub) SetServerIcon(url, key string, size int64) (oldKey string, oldSize int64, err error) {
+	h.cfgMu.Lock()
+	oldKey, oldSize = h.cfg.Server.IconKey, h.cfg.Server.IconSize
+	h.cfg.Server.Icon, h.cfg.Server.IconKey, h.cfg.Server.IconSize = url, key, size
+	snapshot := *h.cfg
+	h.cfgMu.Unlock()
+
+	if h.cfgPath == "" {
+		return oldKey, oldSize, nil
+	}
+	return oldKey, oldSize, config.Save(h.cfgPath, snapshot)
+}
+
+// DropServerIcon unlinks a displaced icon and gives its room back to the quota.
+func (h *Hub) DropServerIcon(key string, size int64) {
+	if h.files == nil || key == "" {
+		return
+	}
+	h.files.Remove(key, size)
 }
 
 // DirectMessagesEnabled reports whether this server carries private
