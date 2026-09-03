@@ -20,7 +20,7 @@ const (
 	ManagedNone       = ""
 	ManagedEveryone   = "everyone"   // every connected user, guests included
 	ManagedRegistered = "registered" // every user who has claimed an account
-	ManagedAdmin      = "admin"      // granted by redeeming the owner token
+	ManagedAdmin      = "admin"      // every permission, and only the owner may edit it
 )
 
 // ServerInfo is the public description of a server. It is served both over the
@@ -164,7 +164,12 @@ func (v VoiceState) Deafened() bool { return v.SelfDeaf || v.Deaf }
 // User is a member of the server. Guests are users too: they simply have no
 // username yet.
 type User struct {
-	ID           int64   `json:"id"`
+	ID int64 `json:"id"`
+	// Owner marks the identity that owns this server. It is not a role and no
+	// role produces it: the owner holds every permission and outranks every
+	// role for as long as they own the server, whatever roles they are given
+	// or stripped of.
+	Owner        bool    `json:"owner,omitempty"`
 	Nickname     string  `json:"nickname"`
 	Username     *string `json:"username"` // nil while the user is still a guest
 	Registered   bool    `json:"registered"`

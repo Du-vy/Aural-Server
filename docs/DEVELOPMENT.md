@@ -62,9 +62,9 @@ a **one-time owner token**:
 owner token: xxxxx-xxxxx-xxxxx-xxxxx
 ```
 
-**Keep it.** Redeeming it in the client is what makes you an administrator. It is
-shown once and stored only as a hash, so it cannot be recovered — but it can be
-replaced:
+**Keep it.** Redeeming it in the client is what makes you the owner of the
+server. It is shown once and stored only as a hash, so it cannot be recovered —
+but it can be replaced:
 
 ```sh
 go run ./cmd/aural-server -new-owner-token

@@ -357,7 +357,7 @@ func (s *Server) uploadProfileMedia(w http.ResponseWriter, r *http.Request, kind
 	}
 
 	_, roleIDs, _ := s.hub.UserPermissions(r.Context(), updatedUser)
-	writeJSON(w, http.StatusOK, MediaUploadResult{URL: mediaURL, User: userView(updatedUser, roleIDs, nil, false)})
+	writeJSON(w, http.StatusOK, MediaUploadResult{URL: mediaURL, User: userView(updatedUser, roleIDs, nil, false, s.hub.IsOwner(updatedUser.ID))})
 }
 
 // RemoveProfileMedia unlinks pictures whose rows are already gone and returns

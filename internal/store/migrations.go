@@ -254,6 +254,19 @@ var migrations = []string{
 	CREATE INDEX idx_kicks_user ON kicks(user_id);
 	CREATE INDEX idx_kicks_created ON kicks(created_at DESC);
 	`,
+
+	// 10: server ownership, which used to be nothing but a grant of the admin
+	// role. A server that already had an administrator keeps one as its owner:
+	// the earliest identity holding the role, which on a server whose token was
+	// redeemed once is the identity that redeemed it.
+	`
+	INSERT OR IGNORE INTO meta (key, value)
+	SELECT 'owner_user_id', CAST(ur.user_id AS TEXT)
+	FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+	WHERE r.managed = 'admin'
+	ORDER BY ur.user_id ASC
+	LIMIT 1;
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

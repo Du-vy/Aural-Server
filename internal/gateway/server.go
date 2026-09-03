@@ -321,21 +321,20 @@ func (s *Server) finishSession(session *Session) {
 	s.log.Info("disconnected", slog.Int64("user", userID))
 }
 
-// EnsureOwnerToken mints the one-time token that grants the admin role, unless
-// somebody already holds that role or a token is still outstanding. It returns
-// the token to print exactly once; an empty string means there was nothing to
+// EnsureOwnerToken mints the one-time token that claims the server, unless
+// somebody already owns it or a token is still outstanding. It returns the
+// token to print exactly once; an empty string means there was nothing to
 // issue.
 func EnsureOwnerToken(ctx context.Context, st *store.Store, hub *Hub) (string, error) {
-	adminRoleID := hub.AdminRoleID()
-	if adminRoleID == 0 {
+	if hub.AdminRoleID() == 0 {
 		return "", errors.New("gateway: the managed admin role is missing")
 	}
 
-	admins, err := st.CountUsersWithRole(ctx, adminRoleID)
+	owner, err := st.OwnerUserID(ctx)
 	if err != nil {
 		return "", err
 	}
-	if admins > 0 {
+	if owner != 0 {
 		return "", nil
 	}
 

@@ -31,14 +31,14 @@ and prints a one-time **owner token**:
   ---------------------------------------------------------------
    Owner token: 8Il_1-tbnCy-O1dJI-okAY_
 
-   Redeem it once from a connected client to become this server
-   administrator. It is stored hashed and cannot be shown again;
+   Redeem it once from a connected client to claim ownership.
+   It is stored hashed and cannot be shown again;
    run with -new-owner-token to issue a replacement.
   ---------------------------------------------------------------
 ```
 
-Connect a client to `YOUR-IP:9871` and redeem that token to become the
-administrator. Check the server is up with:
+Connect a client to `YOUR-IP:9871` and redeem that token to become the owner of
+the server. Check the server is up with:
 
 ```sh
 curl http://localhost:9871/info
@@ -406,13 +406,18 @@ Three roles are built in and cannot be deleted:
 | --- | --- | --- |
 | `everyone` | Everyone, guests included | View, Connect, Speak, SendMessages, ChangeNickname, Register, AttachFiles |
 | `Member` | Anyone who has claimed an account | None — a fresh server treats guests and members alike |
-| `Admin` | Whoever redeems the owner token | Administrator |
+| `Admin` | Whoever the owner grants it to | Administrator |
 
 Overwrites inherit down the tree, so denying `ViewChannel` on a category hides
 everything inside it. The role hierarchy is enforced on every write: you can only
 act on roles and users ranked strictly below you, and you can only grant
 permissions you already hold. `Administrator` deliberately does **not** bypass
 the hierarchy, so two administrators cannot remove each other.
+
+Above all of it stands the **owner**, the identity that redeemed the owner
+token. As in Discord, ownership is not a role: it grants every permission and a
+rank above every role, so the owner alone can edit the `Admin` role and the
+administrators holding it cannot — not their own role, and not the owner.
 
 The full permission table and resolution rules are in
 [docs/PROTOCOL.md](docs/PROTOCOL.md#permissions).

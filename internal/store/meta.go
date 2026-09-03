@@ -5,13 +5,21 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 )
 
 // Meta keys held in the meta table.
 const (
-	// MetaOwnerTokenHash holds the hash of the one-time token that grants the
-	// admin role. The row is deleted the moment the token is redeemed.
+	// MetaOwnerTokenHash holds the hash of the one-time token that claims the
+	// server. The row is deleted the moment the token is redeemed.
 	MetaOwnerTokenHash = "owner_token_hash"
+	// MetaOwnerUserID holds the id of the identity that owns this server.
+	//
+	// Ownership is not a role. It is a property of the identity itself, which
+	// is what keeps it out of reach of the role editor: no permission grants
+	// it, no permission takes it away, and the owner keeps every authority
+	// even holding no role at all.
+	MetaOwnerUserID = "owner_user_id"
 )
 
 // Meta reads a value from the key/value table.
@@ -46,13 +54,34 @@ func (s *Store) DeleteMeta(ctx context.Context, key string) error {
 	return nil
 }
 
-// CountUsersWithRole reports how many users hold a role explicitly. It is what
-// tells the server whether anybody has claimed ownership yet.
-func (s *Store) CountUsersWithRole(ctx context.Context, roleID int64) (int, error) {
-	var n int
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM user_roles WHERE role_id = ?`, roleID).Scan(&n); err != nil {
-		return 0, fmt.Errorf("store: count role members: %w", err)
+// OwnerUserID is the identity that owns this server, or zero when nobody has
+// claimed it yet. A stored id that no longer names a user reads as zero too:
+// the account being gone is the same as there being no owner.
+func (s *Store) OwnerUserID(ctx context.Context) (int64, error) {
+	value, err := s.Meta(ctx, MetaOwnerUserID)
+	if errors.Is(err, ErrNotFound) {
+		return 0, nil
 	}
-	return n, nil
+	if err != nil {
+		return 0, err
+	}
+	id, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, nil
+	}
+
+	var exists int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM users WHERE id = ?`, id).Scan(&exists); err != nil {
+		return 0, fmt.Errorf("store: read owner: %w", err)
+	}
+	if exists == 0 {
+		return 0, nil
+	}
+	return id, nil
+}
+
+// SetOwnerUserID records who owns the server, replacing any previous owner.
+func (s *Store) SetOwnerUserID(ctx context.Context, id int64) error {
+	return s.SetMeta(ctx, MetaOwnerUserID, strconv.FormatInt(id, 10))
 }

@@ -360,7 +360,7 @@ func (c *client) guest2(t *testing.T, nickname, serverPassword string) protocol.
 		protocol.AuthGuestRequest{Nickname: nickname, ServerPassword: serverPassword})
 }
 
-func TestOwnerTokenGrantsAdminExactlyOnce(t *testing.T) {
+func TestOwnerTokenClaimsTheServerExactlyOnce(t *testing.T) {
 	h := newHarness(t, nil)
 	ctx := context.Background()
 
@@ -372,19 +372,97 @@ func TestOwnerTokenGrantsAdminExactlyOnce(t *testing.T) {
 		t.Fatal("a fresh server must issue an owner token")
 	}
 
-	admin := h.dial()
-	admin.guest("Pablo")
-	admin.fails(protocol.OpServerClaimAdmin, protocol.ClaimAdminRequest{Token: "wrong"}, protocol.ErrInvalidCredentials)
+	owner := h.dial()
+	ready := owner.guest("Pablo")
+	owner.fails(protocol.OpServerClaimAdmin, protocol.ClaimAdminRequest{Token: "wrong"}, protocol.ErrInvalidCredentials)
 
-	claimed := ok[protocol.UserEvent](admin, protocol.OpServerClaimAdmin, protocol.ClaimAdminRequest{Token: token})
-	if len(claimed.User.Roles) != 2 {
-		t.Fatalf("roles after claiming ownership: got %v", claimed.User.Roles)
+	claimed := ok[protocol.UserEvent](owner, protocol.OpServerClaimAdmin, protocol.ClaimAdminRequest{Token: token})
+	if !claimed.User.Owner {
+		t.Fatalf("claiming did not mark the owner: %+v", claimed.User)
+	}
+	// Ownership is not a role: the claimer is left holding exactly what they
+	// held before, which for a guest is the everyone role alone.
+	if len(claimed.User.Roles) != len(ready.User.Roles) {
+		t.Fatalf("claiming ownership changed the roles held: got %v, want %v",
+			claimed.User.Roles, ready.User.Roles)
+	}
+
+	// It is authority all the same. The snapshot that follows the claim says so.
+	snapshot := owner.waitEvent(protocol.EvReady)
+	var refreshed protocol.Ready
+	if err := json.Unmarshal(snapshot.Data, &refreshed); err != nil {
+		t.Fatalf("decode ready: %v", err)
+	}
+	perms, err := permissions.Parse(refreshed.Permissions)
+	if err != nil {
+		t.Fatalf("parse permissions: %v", err)
+	}
+	if !perms.Has(permissions.Administrator) {
+		t.Fatalf("the owner must hold every permission, got %v", perms.Names())
 	}
 
 	// The token is one-time: a second holder of the same string gets nothing.
 	other := h.dial()
 	other.guest("Other")
 	other.fails(protocol.OpServerClaimAdmin, protocol.ClaimAdminRequest{Token: token}, protocol.ErrForbidden)
+}
+
+// TestOnlyTheOwnerMayEditTheAdminRole pins the difference between owning the
+// server and holding the role that grants every permission: an administrator
+// may do anything the mask allows, but not to the role that granted it and not
+// to the owner.
+func TestOnlyTheOwnerMayEditTheAdminRole(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx := context.Background()
+
+	token, err := gateway.EnsureOwnerToken(ctx, h.store, h.server.Hub())
+	if err != nil {
+		t.Fatalf("ensure owner token: %v", err)
+	}
+
+	owner := h.dial()
+	ownerReady := owner.guest("Owner")
+	claimed := ok[protocol.UserEvent](owner, protocol.OpServerClaimAdmin, protocol.ClaimAdminRequest{Token: token})
+
+	var adminRoleID int64
+	for _, role := range ownerReady.Roles {
+		if role.Managed == protocol.ManagedAdmin {
+			adminRoleID = role.ID
+		}
+	}
+	if adminRoleID == 0 {
+		t.Fatal("no admin role in the snapshot")
+	}
+
+	// The owner hands the admin role out, which is itself a thing only somebody
+	// above that role can do.
+	admin := h.dial()
+	adminReady := admin.guest("Admin")
+	ok[protocol.UserEvent](owner, protocol.OpRoleAssign,
+		protocol.RoleMembershipRequest{UserID: adminReady.User.ID, RoleID: adminRoleID})
+
+	// The administrator may manage roles below them,
+	created := ok[protocol.RoleEvent](admin, protocol.OpRoleCreate, protocol.RoleCreateRequest{Name: "Moderator"})
+	if created.Role.ID == 0 {
+		t.Fatal("an administrator must be able to create a role")
+	}
+	// but not the role that grants them that, nor its holders' owner.
+	admin.fails(protocol.OpRoleUpdate,
+		protocol.RoleUpdateRequest{RoleID: adminRoleID, Name: ptr("Overlord")}, protocol.ErrForbidden)
+	admin.fails(protocol.OpRoleUpdate,
+		protocol.RoleUpdateRequest{RoleID: adminRoleID, Permissions: ptr(permissions.None.String())}, protocol.ErrForbidden)
+	admin.fails(protocol.OpUserKick,
+		protocol.UserKickRequest{UserID: claimed.User.ID}, protocol.ErrForbidden)
+
+	// The owner may, holding no role at all.
+	updated := ok[protocol.RoleEvent](owner, protocol.OpRoleUpdate,
+		protocol.RoleUpdateRequest{RoleID: adminRoleID, Name: ptr("Staff")})
+	if updated.Role.Name != "Staff" {
+		t.Fatalf("the owner could not rename the admin role: %+v", updated.Role)
+	}
+	if _, err := h.store.RoleByManaged(ctx, protocol.ManagedAdmin); err != nil {
+		t.Fatalf("the admin role must survive being edited: %v", err)
+	}
 }
 
 func TestChannelsNeedManageChannels(t *testing.T) {

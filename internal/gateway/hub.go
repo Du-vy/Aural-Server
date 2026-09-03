@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -65,6 +66,9 @@ type Hub struct {
 	everyoneID   int64
 	registeredID int64
 	adminID      int64
+	// ownerID is the identity that owns the server, which is not a role and is
+	// therefore cached beside the role table rather than in it.
+	ownerID int64
 
 	// The audio plane. voiceRooms holds who has media up in each voice
 	// channel, voiceEpochs counts the elections that channel has seen, and
@@ -135,6 +139,9 @@ func NewHub(ctx context.Context, cfg *config.Config, cfgPath string, st *store.S
 	if err := h.ReloadRoles(ctx); err != nil {
 		return nil, err
 	}
+	if err := h.ReloadOwner(ctx); err != nil {
+		return nil, err
+	}
 	if err := h.ReloadChannels(ctx); err != nil {
 		return nil, err
 	}
@@ -176,7 +183,7 @@ func (h *Hub) UserPermissions(ctx context.Context, u store.User) (permissions.Pe
 		return permissions.None, nil, err
 	}
 	roleIDs := h.EffectiveRoleIDs(u, explicit)
-	return h.BasePermissions(roleIDs), roleIDs, nil
+	return h.PermissionsFor(u.ID, roleIDs), roleIDs, nil
 }
 
 // RemoveFiles unlinks stored files and gives their room back to the quota. The
@@ -332,11 +339,46 @@ func (h *Hub) EveryoneRoleID() int64 {
 	return h.everyoneID
 }
 
-// AdminRoleID is the id of the managed role the owner token grants.
+// AdminRoleID is the id of the managed role that carries Administrator.
 func (h *Hub) AdminRoleID() int64 {
 	h.cacheMu.RLock()
 	defer h.cacheMu.RUnlock()
 	return h.adminID
+}
+
+// ReloadOwner refreshes the cached owner. Call it after ownership changes.
+func (h *Hub) ReloadOwner(ctx context.Context) error {
+	id, err := h.st.OwnerUserID(ctx)
+	if err != nil {
+		return err
+	}
+	h.cacheMu.Lock()
+	h.ownerID = id
+	h.cacheMu.Unlock()
+	return nil
+}
+
+// OwnerUserID is the identity that owns the server, or zero when nobody has
+// claimed it yet.
+func (h *Hub) OwnerUserID() int64 {
+	h.cacheMu.RLock()
+	defer h.cacheMu.RUnlock()
+	return h.ownerID
+}
+
+// IsOwner reports whether an identity owns the server.
+//
+// Ownership is a property of the identity rather than a role it holds, exactly
+// as in Discord: it grants every permission and outranks every role, it cannot
+// be edited away in the role editor, and taking every role off the owner
+// changes none of it.
+func (h *Hub) IsOwner(userID int64) bool {
+	if userID == 0 {
+		return false
+	}
+	h.cacheMu.RLock()
+	defer h.cacheMu.RUnlock()
+	return h.ownerID == userID
 }
 
 // SortedRoles lists cached roles lowest position first.
@@ -421,6 +463,15 @@ func (h *Hub) BasePermissions(roleIDs []int64) permissions.Permission {
 	return permissions.Resolve(masks)
 }
 
+// PermissionsFor is the server-wide mask of one identity: what its roles grant,
+// or everything at all when it owns the server.
+func (h *Hub) PermissionsFor(userID int64, roleIDs []int64) permissions.Permission {
+	if h.IsOwner(userID) {
+		return permissions.All
+	}
+	return h.BasePermissions(roleIDs)
+}
+
 // ChannelPermissions applies the overwrites of a channel and of every category
 // above it, outermost first, on top of a server-wide mask. Overwrites therefore
 // inherit down the tree: denying ViewChannel on a category hides everything
@@ -462,6 +513,21 @@ func (h *Hub) ancestorChain(channelID int64) []store.Channel {
 		reversed[i], reversed[j] = reversed[j], reversed[i]
 	}
 	return reversed
+}
+
+// ownerRank sits above every role position. It is what puts the owner out of
+// everybody else's reach: no role can be moved high enough to match it, so no
+// administrator can act on the owner or edit a role the owner sits above.
+const ownerRank = math.MaxInt
+
+// RankOf is the authority one identity has over another and over the role
+// stack. It is the top of their roles, unless they own the server, in which
+// case it is above everything.
+func (h *Hub) RankOf(userID int64, roleIDs []int64) int {
+	if h.IsOwner(userID) {
+		return ownerRank
+	}
+	return h.HighestRolePosition(roleIDs)
 }
 
 // HighestRolePosition is the top of a user's role stack, which is what decides
@@ -631,7 +697,7 @@ func (h *Hub) Members(ctx context.Context, viewer *Session) ([]protocol.User, er
 		if connected[m.ID] {
 			continue
 		}
-		users = append(users, offlineView(m.User, m.RoleIDs))
+		users = append(users, offlineView(m.User, m.RoleIDs, h.IsOwner(m.ID)))
 	}
 	return users, nil
 }
@@ -643,7 +709,7 @@ func (h *Hub) offlineMemberView(ctx context.Context, u store.User) (protocol.Use
 	if err != nil {
 		return protocol.User{}, err
 	}
-	return offlineView(u, roleIDs), nil
+	return offlineView(u, roleIDs, h.IsOwner(u.ID)), nil
 }
 
 // HidesPresence reports whether a status is one that makes a connected user

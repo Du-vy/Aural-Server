@@ -252,6 +252,7 @@ member.
 // User
 {
   "id": 4,
+  "owner": true,           // absent unless this identity owns the server
   "nickname": "Pablo",
   "username": "pablo",     // null while still a guest
   "registered": true,
@@ -377,6 +378,8 @@ A 64-bit mask. `Administrator` bypasses every other check.
 
 ### Resolution
 
+0. If the user owns the server, they hold everything. Stop. Ownership is not a
+   role, so this holds however few roles they have.
 1. If the user holds `Administrator`, they hold everything. Stop.
 2. Union the masks of every role the user holds, including the implicit
    `everyone` role and, for a registered user, the implicit `registered` role.
@@ -393,7 +396,8 @@ category hides everything in it.
 ### Hierarchy
 
 Roles are ordered by `position`; `everyone` is always 0. A user's rank is the
-highest position among their roles. You may only:
+highest position among their roles, and the owner's rank is above every role
+there is. You may only:
 
 - edit, move or delete a role **strictly below** your own rank,
 - grant or revoke a role **strictly below** your own rank,
@@ -403,13 +407,22 @@ Additionally, a permission change may only touch bits you hold yourself. This is
 what stops anyone with `ManageRoles` from promoting themselves.
 
 `Administrator` does **not** bypass the hierarchy — otherwise two administrators
-could remove each other.
+could remove each other. The managed `admin` role is the top of the stack, so
+its holders cannot edit it, move it, or hand it out; the owner, standing above
+it, can do all three.
 
 ## Ownership
 
 A fresh server prints a one-time **owner token** on first start. Redeeming it
-grants the managed `admin` role. The token is stored hashed, is burned on use,
-and can be reissued with `aural-server -new-owner-token`.
+makes the redeeming identity the **owner** of the server. The token is stored
+hashed, is burned on use, and can be reissued with
+`aural-server -new-owner-token` — redeeming a replacement hands the server over,
+which is how an operator recovers from a lost owner account.
+
+Ownership is a property of the identity rather than a role it holds, as in
+Discord. It grants every permission and a rank above every role, it appears
+nowhere in the role editor, and it survives the owner holding no role at all.
+The user object carries `"owner": true` for whoever holds it.
 
 ```jsonc
 { "op": "server.claimAdmin", "d": { "token": "8Il_1-tbnCy-O1dJI-okAY_" } }
@@ -422,7 +435,7 @@ Every op below needs an authenticated session.
 
 | Op | Permission | Notes |
 | --- | --- | --- |
-| `server.claimAdmin` | — | Redeems the one-time owner token. |
+| `server.claimAdmin` | — | Redeems the one-time owner token and makes the caller the owner. Grants no role. |
 | `server.update` | `ManageServer` | `{ name?, description?, klipyApiKey?, voice? }`. Persisted to the configuration file. `voice` replaces the audio plane whole and restarts every call. |
 | `user.update` | `ChangeNickname`, or `ManageNicknames` for others | `{ userId?, nickname }`. Renaming somebody else works while they are offline; the rest of the fields are your own and need a connection. |
 | `user.move` | `Connect` on the destination; `MoveUsers` for others | `{ userId?, channelId }`. `channelId: null` leaves. The target must be connected. |

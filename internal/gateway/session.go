@@ -337,7 +337,7 @@ func (s *Session) refreshPermissions(ctx context.Context) error {
 		return err
 	}
 	roleIDs := s.hub.EffectiveRoleIDs(s.User(), explicit)
-	base := s.hub.BasePermissions(roleIDs)
+	base := s.hub.PermissionsFor(s.UserID(), roleIDs)
 
 	s.mu.Lock()
 	s.roleIDs, s.base = roleIDs, base
@@ -347,9 +347,11 @@ func (s *Session) refreshPermissions(ctx context.Context) error {
 
 // view renders the session as a protocol user.
 func (s *Session) view() protocol.User {
+	owner := s.hub.IsOwner(s.UserID())
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return userView(s.user, s.roleIDs, s.channelID, true)
+	return userView(s.user, s.roleIDs, s.channelID, true, owner)
 }
 
 // --- transport --------------------------------------------------------------

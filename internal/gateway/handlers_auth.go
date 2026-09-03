@@ -255,7 +255,7 @@ func (s *Session) finishAuth(ctx context.Context, user store.User, tokenHash, ra
 		return nil, internalError(s, "load roles", err)
 	}
 	roleIDs := h.EffectiveRoleIDs(user, explicit)
-	s.applyIdentity(user, roleIDs, h.BasePermissions(roleIDs), tokenHash)
+	s.applyIdentity(user, roleIDs, h.PermissionsFor(user.ID, roleIDs), tokenHash)
 
 	// Capacity is checked against the identities already connected, inside the
 	// hub's own lock: somebody reconnecting displaces their own session rather

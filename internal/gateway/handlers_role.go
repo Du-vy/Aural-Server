@@ -41,7 +41,7 @@ func handleRoleCreate(ctx context.Context, s *Session, raw json.RawMessage) (any
 
 	// A new role always lands strictly below its author, so creating one can
 	// never be a route to more authority than the author already has.
-	ceiling := s.hub.HighestRolePosition(roleIDs)
+	ceiling := s.hub.RankOf(s.UserID(), roleIDs)
 	position := s.hub.nextRolePosition()
 	if position >= ceiling {
 		position = ceiling - 1
@@ -87,7 +87,7 @@ func handleRoleUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 	if !ok {
 		return nil, protocol.Errorf(protocol.ErrNotFound, "no such role")
 	}
-	ceiling := s.hub.HighestRolePosition(roleIDs)
+	ceiling := s.hub.RankOf(s.UserID(), roleIDs)
 	if role.Position >= ceiling {
 		return nil, protocol.Errorf(protocol.ErrForbidden, "that role sits at or above your own")
 	}
@@ -132,6 +132,13 @@ func handleRoleUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 		}
 		if *req.Position < 1 {
 			return nil, protocol.Errorf(protocol.ErrBadRequest, "position must be at least 1")
+		}
+		// The owner has no role above them for the ceiling to bound, so the
+		// stack itself bounds them: a position is a place in the hierarchy
+		// rather than an arbitrary number, and the top of it is as far as a
+		// role goes.
+		if *req.Position > s.hub.topRolePosition() {
+			return nil, protocol.Errorf(protocol.ErrBadRequest, "position must not be above the top of the role stack")
 		}
 		if *req.Position >= ceiling {
 			return nil, protocol.Errorf(protocol.ErrForbidden, "you cannot move a role to or above your own")
@@ -179,7 +186,7 @@ func handleRoleDelete(ctx context.Context, s *Session, raw json.RawMessage) (any
 	if role.Managed != protocol.ManagedNone {
 		return nil, protocol.Errorf(protocol.ErrForbidden, "built-in roles cannot be deleted")
 	}
-	if role.Position >= s.hub.HighestRolePosition(roleIDs) {
+	if role.Position >= s.hub.RankOf(s.UserID(), roleIDs) {
 		return nil, protocol.Errorf(protocol.ErrForbidden, "that role sits at or above your own")
 	}
 
@@ -230,7 +237,7 @@ func (s *Session) changeRoleMembership(ctx context.Context, raw json.RawMessage,
 	if role.AutoAssigned() {
 		return nil, protocol.Errorf(protocol.ErrForbidden, "that role is granted automatically and cannot be assigned by hand")
 	}
-	if role.Position >= s.hub.HighestRolePosition(roleIDs) {
+	if role.Position >= s.hub.RankOf(s.UserID(), roleIDs) {
 		return nil, protocol.Errorf(protocol.ErrForbidden, "that role sits at or above your own")
 	}
 	if failure := s.hub.requireOutranksUser(ctx, s, req.UserID); failure != nil {
@@ -317,6 +324,18 @@ func (h *Hub) nextRolePosition() int {
 	return highest + 1
 }
 
+// topRolePosition is the highest position any role sits at, which is the
+// ceiling for whoever has no role above them.
+func (h *Hub) topRolePosition() int {
+	highest := 0
+	for _, r := range h.SortedRoles() {
+		if r.Position > highest {
+			highest = r.Position
+		}
+	}
+	return highest
+}
+
 // requireOutranksUser is the hierarchy check for a target that may be offline,
 // which is what role grants need: the roles of an absent user still matter.
 func (h *Hub) requireOutranksUser(ctx context.Context, actor *Session, targetID int64) *protocol.Error {
@@ -325,7 +344,7 @@ func (h *Hub) requireOutranksUser(ctx context.Context, actor *Session, targetID 
 	}
 
 	_, actorRoles := actor.Permissions()
-	actorHighest := h.HighestRolePosition(actorRoles)
+	actorHighest := h.RankOf(actor.UserID(), actorRoles)
 
 	var targetRoles []int64
 	if target, online := h.SessionForUser(targetID); online {
@@ -345,8 +364,8 @@ func (h *Hub) requireOutranksUser(ctx context.Context, actor *Session, targetID 
 		targetRoles = h.EffectiveRoleIDs(user, explicit)
 	}
 
-	if actorHighest <= h.HighestRolePosition(targetRoles) {
-		return protocol.Errorf(protocol.ErrForbidden, "that user holds a role at or above your own")
+	if actorHighest <= h.RankOf(targetID, targetRoles) {
+		return protocol.Errorf(protocol.ErrForbidden, "that user stands at or above you")
 	}
 	return nil
 }

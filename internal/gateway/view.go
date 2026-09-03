@@ -121,7 +121,10 @@ func overwritesFromView(list []protocol.Overwrite, roleExists func(int64) bool) 
 }
 
 // userView converts a user plus its live presence into the wire form.
-func userView(u store.User, roleIDs []int64, channelID *int64, online bool) protocol.User {
+//
+// owner is passed in rather than read off the user because ownership is not
+// stored on the row: it is a property of the server, which only the hub holds.
+func userView(u store.User, roleIDs []int64, channelID *int64, online, owner bool) protocol.User {
 	ids := roleIDs
 	if ids == nil {
 		ids = []int64{}
@@ -132,6 +135,7 @@ func userView(u store.User, roleIDs []int64, channelID *int64, online bool) prot
 	}
 	return protocol.User{
 		ID:           u.ID,
+		Owner:        owner,
 		Nickname:     u.Nickname,
 		Username:     u.Username,
 		Registered:   u.Registered(),
@@ -156,8 +160,8 @@ func userView(u store.User, roleIDs []int64, channelID *int64, online bool) prot
 // keep changing while the rest of the server believes they are gone — showing
 // the stored value would let a watcher time the change and tell hiding apart
 // from being away.
-func offlineView(u store.User, roleIDs []int64) protocol.User {
-	view := userView(u, roleIDs, nil, false)
+func offlineView(u store.User, roleIDs []int64, owner bool) protocol.User {
+	view := userView(u, roleIDs, nil, false, owner)
 	view.Status = "offline"
 	view.CustomStatus = ""
 	view.DMPrivacy = ""

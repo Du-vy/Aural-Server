@@ -429,8 +429,12 @@ func handleUserKick(ctx context.Context, s *Session, raw json.RawMessage) (any, 
 }
 
 // handleServerClaimAdmin redeems the one-time owner token printed on the first
-// start. It is how a freshly installed server gets its first administrator
-// without shipping a default password.
+// start. It is how a freshly installed server gets its owner without shipping a
+// default password.
+//
+// It grants no role. Ownership is a property of the identity, as in Discord:
+// the owner holds every permission and outranks every role without appearing
+// in the role editor at all, which is what keeps it from being edited away.
 func handleServerClaimAdmin(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
 	req, failure := decode[protocol.ClaimAdminRequest](raw)
 	if failure != nil {
@@ -451,16 +455,16 @@ func handleServerClaimAdmin(ctx context.Context, s *Session, raw json.RawMessage
 		return nil, protocol.Errorf(protocol.ErrInvalidCredentials, "that owner token is not valid")
 	}
 
-	adminRoleID := s.hub.AdminRoleID()
-	if adminRoleID == 0 {
-		return nil, internalError(s, "find the admin role", errors.New("managed admin role is missing"))
-	}
-	if err := s.hub.st.AssignRole(ctx, s.UserID(), adminRoleID); err != nil {
-		return nil, internalError(s, "grant the admin role", err)
+	previous := s.hub.OwnerUserID()
+	if err := s.hub.st.SetOwnerUserID(ctx, s.UserID()); err != nil {
+		return nil, internalError(s, "record the owner", err)
 	}
 	// Burning the token is what makes it one-time.
 	if err := s.hub.st.DeleteMeta(ctx, store.MetaOwnerTokenHash); err != nil {
 		return nil, internalError(s, "burn the owner token", err)
+	}
+	if err := s.hub.ReloadOwner(ctx); err != nil {
+		return nil, internalError(s, "reload the owner", err)
 	}
 	if err := s.refreshPermissions(ctx); err != nil {
 		return nil, internalError(s, "refresh permissions", err)
@@ -469,6 +473,33 @@ func handleServerClaimAdmin(ctx context.Context, s *Session, raw json.RawMessage
 	view := s.view()
 	s.hub.BroadcastUserUpdated(view)
 	s.log.Info("server ownership claimed", slog.Int64("user", s.UserID()))
+
+	// Ownership uncovers every restricted channel at once, so the claimer is
+	// sent a fresh snapshot rather than left with an interface that has not
+	// caught up with what they may now see.
+	ready, err := s.hub.buildReady(ctx, s, "")
+	if err != nil {
+		return nil, internalError(s, "build the state snapshot", err)
+	}
+	s.Send(protocol.Event(protocol.EvReady, ready))
+
+	// A replacement token issued with -new-owner-token hands the server over,
+	// which is how an operator recovers from a lost owner account. The former
+	// owner keeps whatever roles they hold and nothing more, so both what they
+	// may do and everybody's copy of them have to be rebuilt.
+	if previous != 0 && previous != s.UserID() {
+		s.log.Info("server ownership transferred",
+			slog.Int64("from", previous), slog.Int64("to", s.UserID()))
+		s.hub.resyncAll(ctx)
+		s.hub.evictFromUnreachableChannels()
+		if former, online := s.hub.SessionForUser(previous); online {
+			s.hub.BroadcastMemberUpdated(former.view())
+		} else if user, err := s.hub.st.UserByID(ctx, previous); err == nil {
+			if formerView, err := s.hub.offlineMemberView(ctx, user); err == nil {
+				s.hub.BroadcastMemberUpdated(formerView)
+			}
+		}
+	}
 
 	return protocol.UserEvent{User: view}, nil
 }
@@ -558,9 +589,10 @@ func handleServerUpdate(_ context.Context, s *Session, raw json.RawMessage) (any
 
 // --- helpers ----------------------------------------------------------------
 
-// requireOutranks enforces the role hierarchy: you may only act on somebody
-// whose highest role sits below your own. Without it, anyone holding
-// ManageRoles could promote themselves past the people who granted it.
+// requireOutranks enforces the hierarchy: you may only act on somebody who
+// stands below you. Without it, anyone holding ManageRoles could promote
+// themselves past the people who granted it. The owner stands above every
+// role, so nobody may act on them and they may act on anybody.
 func (h *Hub) requireOutranks(actor *Session, targetID int64) *protocol.Error {
 	if actor.UserID() == targetID {
 		return nil
@@ -573,8 +605,8 @@ func (h *Hub) requireOutranks(actor *Session, targetID int64) *protocol.Error {
 
 	_, actorRoles := actor.Permissions()
 	_, targetRoles := target.Permissions()
-	if h.HighestRolePosition(actorRoles) <= h.HighestRolePosition(targetRoles) {
-		return protocol.Errorf(protocol.ErrForbidden, "that user holds a role at or above your own")
+	if h.RankOf(actor.UserID(), actorRoles) <= h.RankOf(targetID, targetRoles) {
+		return protocol.Errorf(protocol.ErrForbidden, "that user stands at or above you")
 	}
 	return nil
 }
