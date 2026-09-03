@@ -168,7 +168,7 @@ func (s *Store) DescendantIDs(ctx context.Context, id int64) ([]int64, error) {
 	}
 	defer rows.Close()
 
-	var out []int64
+	out := make([]int64, 0)
 	for rows.Next() {
 		var child int64
 		if err := rows.Scan(&child); err != nil {

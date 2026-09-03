@@ -225,6 +225,9 @@ func handleChannelDelete(ctx context.Context, s *Session, raw json.RawMessage) (
 	}
 	s.hub.evictFromChannels(removed)
 
+	if cascaded == nil {
+		cascaded = []int64{}
+	}
 	event := protocol.ChannelDeletedEvent{ChannelID: req.ChannelID, Cascaded: cascaded}
 	// The channel is gone, so visibility can no longer be resolved from it:
 	// every client is told, and simply ignores an id it never had.
