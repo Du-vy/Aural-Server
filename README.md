@@ -7,7 +7,7 @@ servers: you run your own, and people reach it by address.
 Written in Go with no cgo, so a plain `go build` produces a single static binary
 for any target Go supports.
 
-> **Status: v0.6.** Identity, channels, roles, permissions, text messaging,
+> **Status: v0.7.** Identity, channels, roles, permissions, text messaging,
 > private conversations, attachments, search, the audio plane and
 > Discord-compatible webhooks are all implemented and tested.
 
