@@ -14,8 +14,10 @@ wss://HOST:PORT/ws     when tls.enabled is set in the server configuration
 ```
 
 The default port is **9871**. A handful of plain HTTP endpoints sit alongside
-the socket. Everything but the first two takes the same bearer session token the
-socket resumes with, in an `Authorization: Bearer <token>` header:
+the socket. Everything but the first two and the webhook routes takes the same
+bearer session token the socket resumes with, in an
+`Authorization: Bearer <token>` header; a webhook carries its credential in its
+own path instead:
 
 | Endpoint  | Purpose                                                              |
 | --------- | -------------------------------------------------------------------- |
@@ -26,6 +28,7 @@ socket resumes with, in an `Authorization: Bearer <token>` header:
 | `GET /attachments/{key}/{filename}` | Serves an uploaded file.                |
 | `GET /unfurl?url=` | Fetches a page and returns its OpenGraph metadata. See [Link previews](#link-previews). |
 | `GET /klipy/{kind}/{action}` | Proxies a GIF or sticker lookup. See [GIFs and stickers](#gifs-and-stickers). |
+| `/api/webhooks/{id}/{token}` and below | Discord's webhook API, so an application already posting to one works here by changing the URL. See [Webhooks](#webhooks). |
 
 Because `GET /info` is unauthenticated, everything it carries is public. No
 credential the operator configures appears in it: the Klipy integration is
@@ -294,7 +297,25 @@ member.
   "content": "Hello",
   "createdAt": 1756600000, // Unix seconds
   "editedAt": null,
-  "attachments": []        // absent when the message carries no files
+  "attachments": [],       // absent when the message carries no files
+  // Both absent on everything a person wrote. See Webhooks.
+  "webhook": { "id": 3, "avatar": "https://..." },
+  "embeds": []             // Discord-shaped cards; snake_case inside
+}
+
+// Webhook — a URL that posts into one channel. Only ever sent to somebody
+// holding ManageWebhooks there, because the token is the whole of its
+// authentication.
+{
+  "id": 3,
+  "channelId": 2,
+  "name": "Buildbot",
+  "avatar": "https://example.com/icon.png", // absent when it has none
+  "token": "kK1...",
+  "url": "/api/webhooks/3/kK1...",  // relative to the server root
+  "creatorId": 4,          // absent once that account is gone
+  "createdAt": 1756600000,
+  "lastUsedAt": 0          // zero until the first delivery
 }
 
 // DirectMessage — one line of a private conversation
@@ -370,6 +391,7 @@ A 64-bit mask. `Administrator` bypasses every other check.
 | 10 | `ManageServer` | Rename the server |
 | 11 | `ManageNicknames` | Change other nicknames |
 | 12 | `ManageMessages` | Delete other people's messages |
+| 13 | `ManageWebhooks` | Create, edit and revoke the webhooks of a channel |
 | 16 | `KickUsers` | Disconnect a user |
 | 17 | `MoveUsers` | Move a user between voice channels |
 | 18 | `MuteUsers` | Reserved for voice moderation |
@@ -458,6 +480,10 @@ Every op below needs an authenticated session.
 | `role.update` | `ManageRoles` | `{ roleId, name?, color?, permissions?, position?, hoist? }`. |
 | `role.delete` | `ManageRoles` | `{ roleId }`. Managed roles cannot be deleted. |
 | `role.assign` / `role.unassign` | `ManageRoles` | `{ userId, roleId }`. The target may be offline. |
+| `webhook.list` | `ManageWebhooks`, per channel | `{ channelId? }`. Omit the channel to read every one the caller may manage. A channel they may not is left out rather than refused. Carries the tokens. |
+| `webhook.create` | `ManageWebhooks` on the channel | `{ channelId, name, avatar? }`. Text channels only, at most 15 per channel. |
+| `webhook.update` | `ManageWebhooks` on both channels | `{ webhookId, name?, avatar?, channelId? }`. Moving one needs the permission where it is going, since that is the same thing as minting one there. |
+| `webhook.delete` | `ManageWebhooks` on the channel | `{ webhookId }`. Revokes the URL; what it posted stays. |
 | `voice.*` | See [Voice](#voice) | The audio plane. |
 
 Three notes on messages:
@@ -581,7 +607,169 @@ to enforce it: the host is told, through the same `voice.state` event everybody
 receives, and a host running modified code could ignore it. That is a real
 difference between the modes and is worth knowing before choosing one.
 
-### Events
+### Webhooks
+
+A webhook is a URL that posts into one text channel with no identity behind it.
+It is what a build server, a monitor or an automation is given so that what it
+has to say arrives in a channel without anybody writing a client.
+
+**The whole surface is Discord's, byte for byte.** The path, the payload, the
+status codes, the error bodies and the rate-limit headers are the ones an
+application posting to a Discord webhook is already written against, so an
+operator who has one of those changes the URL and nothing else. That
+compatibility is the feature; everything odd-looking below follows from it.
+
+### The URL
+
+```
+http(s)://<server>/api/webhooks/{id}/{token}
+```
+
+`webhook.create` returns the path; a client resolves it against the address it
+already reached the server by, exactly as it does an attachment URL. An explicit
+API version is accepted and ignored, so `/api/v10/webhooks/{id}/{token}` — the
+shape some tools rewrite a pasted URL into — reaches the same endpoint.
+
+The token is the whole of the authentication. There is nothing else to present
+and nothing else to check: **anyone holding the URL can post to that channel**,
+which is the same bargain Discord makes and the reason the token is stored as it
+was minted rather than hashed. It has to be readable back out of the settings
+screen every time somebody wires up an integration, and deleting the webhook is
+how it is revoked.
+
+### `POST /api/webhooks/{id}/{token}`
+
+The body is either JSON or `multipart/form-data` with a `payload_json` part and
+one part per file.
+
+| Field | Effect |
+| --- | --- |
+| `content` | The message text. At most 2000 characters, cleaned the same way `message.send` cleans one. |
+| `username` | Overrides the name **this message** is attributed to. The webhook keeps its own. |
+| `avatar_url` | Overrides the picture for this message. Must be `http(s)`. |
+| `embeds` | Up to 10 cards, in Discord's embed shape (see below). |
+| `tts`, `allowed_mentions`, `components`, `poll`, `flags`, `thread_name`, `applied_tags`, `attachments` | Accepted and ignored. |
+
+Anything else in the body is ignored rather than refused, so a payload written
+against a newer Discord still delivers its message.
+
+A delivery must carry **something**: content, a card or a file. One that carries
+none is `400` with Discord's `50006`. Everything else that is over a limit is
+**clamped rather than refused** — a title cut to 256 characters, a colour masked
+into 24 bits, a URL dropped if its scheme is not `http(s)` — because a rejection
+turns a cosmetic overflow into a notification that never arrives.
+
+The reply is `204` with no body, or `200` with the message when `?wait=true` is
+given. That message is in Discord's shape, ids as decimal strings, and the field
+worth reading is `id`: it is what the message endpoints below take.
+
+Files are bound to the message as it is written. There is no pending step and no
+`AttachFiles` check, because a webhook has no session to hold an upload between
+the two and no identity to hold a permission. They are otherwise ordinary
+attachments — same directory, same quota, same URLs, and they die with the
+message.
+
+### `POST /api/webhooks/{id}/{token}/slack` and `/github`
+
+The two payload dialects Discord also accepts on a webhook URL.
+
+`slack` takes a Slack message — `text`, `username`, `icon_url`, and
+`attachments` with their `color`, `title`, `fields` and `footer` — and renders
+each attachment as one card. Slack's `<url|label>` link syntax is rewritten to
+Markdown. It answers with a bare `ok`, which is what tools written against Slack
+check for.
+
+`github` takes GitHub's own event schema and the `X-GitHub-Event` header, and
+renders the event as a card: pushes, issues, comments, pull requests, reviews,
+releases, branches, forks, stars and workflow runs each get their own shape, and
+anything else gets a line naming the event. An event with nothing worth drawing
+is answered `204` rather than refused, because a 4xx shows in the repository as
+a failed hook and earns a retry.
+
+### The message a webhook posted
+
+| Route | Does |
+| --- | --- |
+| `GET /api/webhooks/{id}/{token}` | The webhook object. |
+| `PATCH /api/webhooks/{id}/{token}` | `{ name?, avatar? }`. `avatar` is a URL; this server hosts no picture for a webhook. |
+| `DELETE /api/webhooks/{id}/{token}` | Revokes the URL. |
+| `GET`/`PATCH`/`DELETE /api/webhooks/{id}/{token}/messages/{messageId}` | Read, rewrite or remove one message. |
+
+`PATCH` on a message is a patch: an absent `content` or `embeds` is left alone.
+It is what a status page or a long-running job uses to keep one message current
+instead of posting a hundred, and it is why the execute endpoint bothers to
+answer with an id.
+
+**A webhook may only touch its own messages.** One posted by somebody else — or
+by another webhook — reports `10008 Unknown Message`, exactly as one that does
+not exist. The URL is a way to post, not a moderation credential.
+
+### Rate limits
+
+One bucket per webhook: a burst of 5, refilling at Discord's own ceiling for a
+channel of thirty messages a minute. Every response carries `X-RateLimit-Limit`,
+`-Remaining`, `-Reset`, `-Reset-After` and `-Bucket`; a rejection is `429` with
+`Retry-After` and the body
+
+```json
+{ "message": "You are being rate limited.", "retry_after": 1.234, "global": false }
+```
+
+### Errors
+
+JSON, in Discord's shape rather than this protocol's, because a client library
+switches on the numbers: `{ "message": "...", "code": 10015 }`. The codes raised
+are `10008` unknown message, `10015` unknown webhook, `40005` request too large,
+`50001` missing access, `50006` empty message, `50027` invalid token and `50035`
+invalid form body.
+
+These routes answer any origin. A webhook carries its own credential in its path
+and reads no cookie and no session, so the browser's origin has nothing to do
+with whether a delivery is allowed.
+
+### Managing them
+
+Four ops, listed with the rest in [Operations](#operations). There are **no
+webhook events**, deliberately: a webhook object carries the token that is the
+whole of its authentication, so it is only ever handed to somebody who asked for
+it and holds `ManageWebhooks` in that channel. A screen that shows them re-reads
+the list after every change.
+
+A channel may hold at most 15 webhooks. Deleting one revokes the URL and leaves
+the history alone: what was posted through it keeps the name and picture it was
+posted under, because the history is a record of what was said rather than of
+who may still say it.
+
+### Embeds
+
+`Embed` and everything under it are **Discord's objects, field for field and
+name for name, `snake_case` included** — the one place this protocol does not
+use `camelCase`. Translating them would mean a second specification to keep in
+step with somebody else's, and every field that fell out of step would be one a
+service could send and a reader could not show.
+
+```json
+{
+  "title": "Disk almost full",
+  "description": "`/dev/sda1` is at **91%**",
+  "url": "https://example.com/alert",
+  "timestamp": "2026-09-03T10:00:00Z",
+  "color": 15029579,
+  "footer": { "text": "node-1", "icon_url": "https://…" },
+  "image": { "url": "https://…", "width": 800, "height": 400 },
+  "thumbnail": { "url": "https://…" },
+  "author": { "name": "monitor", "url": "https://…", "icon_url": "https://…" },
+  "fields": [{ "name": "Host", "value": "node-1", "inline": true }]
+}
+```
+
+Limits are Discord's: 10 embeds, a 256-character title, a 4096-character
+description, 25 fields of 256 and 1024, a 2048-character footer and a
+256-character author name. `color` is a 24-bit RGB integer. Descriptions and
+field values are Markdown.
+
+
+## Events
 
 | Event | Payload | Sent to |
 | --- | --- | --- |

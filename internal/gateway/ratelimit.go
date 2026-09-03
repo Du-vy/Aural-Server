@@ -30,6 +30,18 @@ func newRateLimiter(capacity int, perSec float64) *rateLimiter {
 
 // allow takes one token, reporting whether there was one to take.
 func (r *rateLimiter) allow() bool {
+	ok, _, _ := r.take()
+	return ok
+}
+
+// take is allow with the numbers behind the answer: how many tokens are left,
+// and how long until the next one refills.
+//
+// It exists for the one endpoint that has to publish its own limit rather than
+// merely enforce it. A webhook is called by somebody else's software, which
+// backs off by reading the headers a rejection carries, so a bare yes or no is
+// not enough to answer with.
+func (r *rateLimiter) take() (ok bool, remaining int, retryAfter float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -40,10 +52,23 @@ func (r *rateLimiter) allow() bool {
 		r.tokens = r.capacity
 	}
 	if r.tokens < 1 {
-		return false
+		// How long the caller has to wait for the token they just asked for.
+		wait := 0.0
+		if r.perSec > 0 {
+			wait = (1 - r.tokens) / r.perSec
+		}
+		return false, 0, wait
 	}
 	r.tokens--
-	return true
+
+	// The refill is continuous, so "when does the bucket have room again" is
+	// only meaningful once it is empty; while tokens remain the answer is the
+	// time to the next whole one.
+	wait := 0.0
+	if r.perSec > 0 && r.tokens < r.capacity {
+		wait = (1 - r.tokens + float64(int(r.tokens))) / r.perSec
+	}
+	return true, int(r.tokens), wait
 }
 
 // spent reports whether the bucket has been idle for at least idle and has

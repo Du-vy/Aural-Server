@@ -34,6 +34,11 @@ const (
 	// ManageMessages covers other people's messages. Deleting your own needs
 	// no permission at all.
 	ManageMessages Permission = 1 << 12
+	// ManageWebhooks covers creating, editing and deleting the webhooks of a
+	// channel. It is its own bit rather than part of ManageChannels because a
+	// webhook URL is a standing permission to post: handing somebody the right
+	// to mint one is a larger thing than letting them rename a channel.
+	ManageWebhooks Permission = 1 << 13
 
 	KickUsers   Permission = 1 << 16
 	MoveUsers   Permission = 1 << 17
@@ -52,6 +57,7 @@ var order = []Permission{
 	ViewChannel, Connect, Speak, SendMessages, ChangeNickname, Register, AttachFiles,
 	SendDirectMessages,
 	ManageChannels, ManageRoles, ManageServer, ManageNicknames, ManageMessages,
+	ManageWebhooks,
 	KickUsers, MoveUsers, MuteUsers, DeafenUsers,
 	Administrator,
 }
@@ -70,6 +76,7 @@ var names = map[Permission]string{
 	ManageServer:       "ManageServer",
 	ManageNicknames:    "ManageNicknames",
 	ManageMessages:     "ManageMessages",
+	ManageWebhooks:     "ManageWebhooks",
 	KickUsers:          "KickUsers",
 	MoveUsers:          "MoveUsers",
 	MuteUsers:          "MuteUsers",

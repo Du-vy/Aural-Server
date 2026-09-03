@@ -85,6 +85,32 @@ func (s *Store) CreateAttachment(ctx context.Context, a Attachment) (Attachment,
 	return s.AttachmentByID(ctx, id)
 }
 
+// CreatePostedAttachment records a file that already belongs to a message.
+//
+// It is the counterpart of CreateAttachment for a sender that has no session
+// to hold a pending upload between the file and the message: a webhook posts
+// both in one request, so the row is bound the moment it is written and there
+// is never a pending one for the sweep to reclaim.
+func (s *Store) CreatePostedAttachment(ctx context.Context, a Attachment) (Attachment, error) {
+	if a.MessageID == nil {
+		return Attachment{}, fmt.Errorf("store: create posted attachment: no message")
+	}
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO attachments (message_id, user_id, channel_id, storage_key,
+			filename, content_type, size, width, height, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.MessageID, a.UserID, a.ChannelID, a.StorageKey, a.Filename, a.ContentType,
+		a.Size, a.Width, a.Height, now())
+	if err != nil {
+		return Attachment{}, fmt.Errorf("store: create posted attachment: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return Attachment{}, fmt.Errorf("store: create posted attachment: %w", err)
+	}
+	return s.AttachmentByID(ctx, id)
+}
+
 // AttachmentByID loads one attachment.
 func (s *Store) AttachmentByID(ctx context.Context, id int64) (Attachment, error) {
 	return scanAttachment(s.db.QueryRowContext(ctx,

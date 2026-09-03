@@ -602,6 +602,13 @@ var routes = map[string]route{
 	protocol.OpDMDelete:  {needsAuth: true, fn: handleDMDelete},
 	protocol.OpDMRead:    {needsAuth: true, fn: handleDMRead},
 
+	// Webhook management. Listing walks the channel tree the caller may see
+	// and then one query, so it stays on the read loop with the rest.
+	protocol.OpWebhookList:   {needsAuth: true, fn: handleWebhookList},
+	protocol.OpWebhookCreate: {needsAuth: true, fn: handleWebhookCreate},
+	protocol.OpWebhookUpdate: {needsAuth: true, fn: handleWebhookUpdate},
+	protocol.OpWebhookDelete: {needsAuth: true, fn: handleWebhookDelete},
+
 	protocol.OpRoleCreate:   {needsAuth: true, fn: handleRoleCreate},
 	protocol.OpRoleUpdate:   {needsAuth: true, fn: handleRoleUpdate},
 	protocol.OpRoleDelete:   {needsAuth: true, fn: handleRoleDelete},

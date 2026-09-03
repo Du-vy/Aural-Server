@@ -8,8 +8,8 @@ Written in Go with no cgo, so a plain `go build` produces a single static binary
 for any target Go supports.
 
 > **Status: v0.6.** Identity, channels, roles, permissions, text messaging,
-> private conversations, attachments, search and the audio plane are all
-> implemented and tested.
+> private conversations, attachments, search, the audio plane and
+> Discord-compatible webhooks are all implemented and tested.
 
 ## Quick start
 
@@ -361,6 +361,39 @@ Deleting a message deletes the files it carried, on disk and in the database.
 That is the whole of the moderation story: anyone who may delete the message —
 its author, or a holder of `ManageMessages` — takes its files with it.
 
+## Webhooks
+
+A webhook is a URL that posts into one text channel with no account behind it —
+what a build server, a monitor or an automation is given so that what it has to
+say arrives in a channel without anybody writing a client.
+
+**It speaks Discord's webhook API exactly.** The path, the payload, the status
+codes, the error bodies and the rate-limit headers are the ones an application
+posting to a Discord webhook is already written against, so anything you have
+pointed at one works here by changing the URL and nothing else:
+
+```sh
+curl -X POST http://YOUR-SERVER:9871/api/webhooks/3/TOKEN \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"deploy finished","username":"Buildbot",
+       "embeds":[{"title":"v1.4.0","description":"12 commits","color":3061344}]}'
+```
+
+That includes the two dialects Discord also accepts on a webhook URL: GitHub's
+own event schema at `/github`, rendered into a card per event, and Slack's
+message format at `/slack`. A repository or an alerting tool that only knows how
+to talk to one of those needs no adapter either.
+
+The URL is minted from **Server Settings → Integrations**, by anyone holding the
+new `ManageWebhooks` permission in the channel. The token in it is the whole of
+the authentication: **anyone given the URL can post to that channel**, which is
+the same bargain Discord makes, and deleting the webhook is how it is revoked.
+Messages already posted through one stay in the channel, attributed to the name
+and picture they were posted under.
+
+The full surface — every route, every field, the limits and the error codes — is
+in [docs/PROTOCOL.md](docs/PROTOCOL.md#webhooks).
+
 ## How identity works
 
 There is one table of users. **A guest is a user with no username yet.**
@@ -501,8 +534,14 @@ built-in DuckDNS and Cloudflare updating, a certificate obtained and renewed
 over the DNS-01 challenge, reverse-proxy awareness, and retention windows for
 the rows a long-running server would otherwise keep forever.
 
-**Later** — bans, per-user permission overwrites, screen sharing, and Aural
-Hub, a directory for finding public servers.
+**Unreleased** — webhooks: a URL per channel that an outside service posts
+into, speaking Discord's webhook API field for field so that anything already
+pointed at one works by changing nothing but the address. Rich embeds, file
+deliveries, the GitHub and Slack payload dialects, per-webhook rate limits, and
+the `ManageWebhooks` permission.
+
+**Later** — bots and a bot API, bans, per-user permission overwrites, screen
+sharing, and Aural Hub, a directory for finding public servers.
 
 ## License
 

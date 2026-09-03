@@ -65,14 +65,21 @@ func newUserLimiters(burst int, perSec float64) *userLimiters {
 }
 
 func (u *userLimiters) allow(userID int64) bool {
+	ok, _, _ := u.take(userID)
+	return ok
+}
+
+// take is allow with the numbers behind the answer, for the endpoints that
+// publish their limit in the response rather than only enforcing it.
+func (u *userLimiters) take(userID int64) (ok bool, remaining int, retryAfter float64) {
 	u.mu.Lock()
-	limiter, ok := u.by[userID]
-	if !ok {
+	limiter, found := u.by[userID]
+	if !found {
 		limiter = newRateLimiter(u.burst, u.perSec)
 		u.by[userID] = limiter
 	}
 	u.mu.Unlock()
-	return limiter.allow()
+	return limiter.take()
 }
 
 // limiterIdle is how long a bucket must have gone unused before it is dropped.
@@ -758,6 +765,7 @@ func (s *Server) sweepOnce(ctx context.Context) {
 	s.uploads.sweep(limiterIdle)
 	s.unfurls.sweep(limiterIdle)
 	s.klipy.sweep(limiterIdle)
+	s.deliveries.sweep(limiterIdle)
 }
 
 // sweepRetention drops the rows a long-running server would otherwise keep

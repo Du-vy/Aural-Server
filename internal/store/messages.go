@@ -18,6 +18,17 @@ type Message struct {
 	Content   string
 	CreatedAt int64
 	EditedAt  *int64
+	// WebhookID names the webhook that posted the message, and is nil for
+	// everything a person wrote. It is not a foreign key: deleting a webhook
+	// revokes its URL and leaves the history it produced exactly as it was.
+	WebhookID *int64
+	// WebhookAvatar is the picture this one message was posted under. Only a
+	// webhook message ever carries one.
+	WebhookAvatar *string
+	// Embeds is the rich cards the message carries, held as the JSON array
+	// they arrived in. This layer keeps it opaque; the gateway is what knows
+	// its shape.
+	Embeds *string
 }
 
 // messageColumns resolves the author live from the users table, falling back to
@@ -25,13 +36,15 @@ type Message struct {
 // what makes a rename show up throughout the history instead of only on new
 // messages, which matches the identity model: the row is the person.
 const messageColumns = `m.id, m.channel_id, m.user_id,
-	COALESCE(u.nickname, m.author), m.content, m.created_at, m.edited_at`
+	COALESCE(u.nickname, m.author), m.content, m.created_at, m.edited_at,
+	m.webhook_id, m.webhook_avatar, m.embeds`
 
 const messageFrom = ` FROM messages m LEFT JOIN users u ON u.id = m.user_id`
 
 func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 	var m Message
-	err := row.Scan(&m.ID, &m.ChannelID, &m.UserID, &m.Author, &m.Content, &m.CreatedAt, &m.EditedAt)
+	err := row.Scan(&m.ID, &m.ChannelID, &m.UserID, &m.Author, &m.Content, &m.CreatedAt, &m.EditedAt,
+		&m.WebhookID, &m.WebhookAvatar, &m.Embeds)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, ErrNotFound
 	}
@@ -54,6 +67,46 @@ func (s *Store) CreateMessage(ctx context.Context, channelID, userID int64, cont
 	id, err := res.LastInsertId()
 	if err != nil {
 		return Message{}, fmt.Errorf("store: create message: %w", err)
+	}
+	return s.MessageByID(ctx, id)
+}
+
+// CreateWebhookMessage stores a post that arrived through a webhook.
+//
+// It is not CreateMessage with a nil user: the author is captured rather than
+// resolved, because there is no row in users for it to be resolved from. The
+// name and the picture belong to the delivery, so a webhook renamed tomorrow
+// leaves today's messages reading as they did.
+func (s *Store) CreateWebhookMessage(ctx context.Context, m Message) (Message, error) {
+	ts := now()
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO messages (channel_id, user_id, author, content, search_text,
+			created_at, webhook_id, webhook_avatar, embeds)
+		 VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ChannelID, m.Author, m.Content, foldForSearch(m.Content), ts,
+		m.WebhookID, m.WebhookAvatar, m.Embeds)
+	if err != nil {
+		return Message{}, fmt.Errorf("store: create webhook message: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return Message{}, fmt.Errorf("store: create webhook message: %w", err)
+	}
+	return s.MessageByID(ctx, id)
+}
+
+// UpdateWebhookMessage rewrites what a webhook posted, content and embeds
+// together: a delivery that edits a message replaces the whole of it, which is
+// what the endpoint behind it means by an edit.
+func (s *Store) UpdateWebhookMessage(ctx context.Context, id int64, content string, embeds *string) (Message, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE messages SET content = ?, search_text = ?, embeds = ?, edited_at = ? WHERE id = ?`,
+		content, foldForSearch(content), embeds, now(), id)
+	if err != nil {
+		return Message{}, fmt.Errorf("store: edit webhook message: %w", err)
+	}
+	if err := requireOneRow(res, "message"); err != nil {
+		return Message{}, err
 	}
 	return s.MessageByID(ctx, id)
 }

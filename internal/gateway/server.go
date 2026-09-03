@@ -52,6 +52,10 @@ type Server struct {
 	uploads *userLimiters
 	unfurls *userLimiters
 	klipy   *userLimiters
+	// deliveries throttles the webhook endpoints. It is keyed by webhook
+	// rather than by identity, because a webhook has no identity: the URL is
+	// the caller, and it is the URL a sender has to be paced by.
+	deliveries *userLimiters
 	// trustedProxies is server.trusted_proxies, parsed. Empty means no
 	// forwarding header is believed, which is right for a server reached
 	// directly.
@@ -76,6 +80,7 @@ func New(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Stor
 		uploads:        newUserLimiters(uploadBurst, uploadsPerSecond),
 		unfurls:        newUserLimiters(unfurlBurst, unfurlsPerSecond),
 		klipy:          newUserLimiters(klipyBurst, klipyPerSecond),
+		deliveries:     newUserLimiters(deliveryBurst, deliveriesPerSecond),
 		trustedProxies: trusted,
 	}
 
@@ -96,9 +101,17 @@ func New(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Stor
 	mux.HandleFunc("GET /klipy/{kind}/{action}", s.handleKlipy)
 	mux.HandleFunc("OPTIONS /klipy/{kind}/{action}", s.handlePreflight)
 
+	// The webhook API, mounted where Discord mounts its own so that an
+	// application already posting to a Discord webhook needs no change but the
+	// URL.
+	s.registerWebhookRoutes(mux, webhookPrefix)
+
 	s.http = &http.Server{
-		Addr:              cfg.Address(),
-		Handler:           mux,
+		Addr: cfg.Address(),
+		// An explicit API version in the path — /api/v10/webhooks/... — is
+		// normalised away before routing, so both shapes of a pasted Discord
+		// URL reach the same handlers.
+		Handler:           stripAPIVersion(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		// No WriteTimeout: a WebSocket connection is meant to stay open.
 		IdleTimeout: 120 * time.Second,

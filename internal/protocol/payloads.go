@@ -239,6 +239,111 @@ type Message struct {
 	// Attachments are the files posted with the message. They live and die
 	// with it: deleting the message deletes the files.
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// Webhook is set on, and only on, a message that arrived through one. It
+	// is what tells a client to render an application rather than a member who
+	// has since been deleted, which is the other reason UserID is nil.
+	Webhook *MessageWebhook `json:"webhook,omitempty"`
+	// Embeds are the rich cards the message carries. Only a webhook produces
+	// them today; the field is on Message rather than on the webhook half
+	// because an embed belongs to the message, not to its sender.
+	Embeds []Embed `json:"embeds,omitempty"`
+}
+
+// MessageWebhook is the sender of a message that came in through a webhook.
+//
+// The name is already in Message.Author, because that is where every renderer
+// reads a name from. What is here is the rest of what a webhook message needs:
+// which webhook it was, so its own messages can be edited through its URL, and
+// the picture this particular delivery chose.
+type MessageWebhook struct {
+	ID int64 `json:"id"`
+	// Avatar is an absolute URL, or absent. A webhook is an outside service,
+	// so nothing about its picture is hosted here.
+	Avatar *string `json:"avatar,omitempty"`
+}
+
+// Webhook is a URL that posts into one channel with no identity behind it.
+//
+// It is only ever sent to somebody who may manage webhooks in that channel,
+// because Token is the whole of its authentication: anybody holding it can
+// post, and there is nothing else to check.
+type Webhook struct {
+	ID        int64   `json:"id"`
+	ChannelID int64   `json:"channelId"`
+	Name      string  `json:"name"`
+	Avatar    *string `json:"avatar,omitempty"`
+	Token     string  `json:"token"`
+	// URL is the path a delivery is posted to, relative to the server root, so
+	// a client that reached the server by address, by hostname or through a
+	// proxy all build the same working URL from the address they already hold.
+	URL string `json:"url"`
+	// CreatorID is nil once the account that made it is gone. The webhook
+	// keeps working: an integration must not break because an administrator
+	// left.
+	CreatorID *int64 `json:"creatorId,omitempty"`
+	CreatedAt int64  `json:"createdAt"`
+	// LastUsedAt is zero until the first delivery, which is what tells an
+	// administrator whether the other end was ever wired up.
+	LastUsedAt int64 `json:"lastUsedAt"`
+}
+
+// The embed objects below are Discord's, field for field and name for name,
+// snake_case included.
+//
+// That is deliberate and it is the whole point of the feature: an application
+// that already posts to a Discord webhook must work by changing nothing but
+// the URL. Translating these into the camelCase the rest of this protocol uses
+// would mean a second specification to keep in step with somebody else's, and
+// every field that fell out of step would be one a service could send and a
+// reader could not show. They travel through as they arrived.
+
+// Embed is one rich card attached to a message.
+type Embed struct {
+	Title       string `json:"title,omitempty"`
+	Type        string `json:"type,omitempty"`
+	Description string `json:"description,omitempty"`
+	URL         string `json:"url,omitempty"`
+	// Timestamp is an ISO 8601 instant, shown in the footer.
+	Timestamp string `json:"timestamp,omitempty"`
+	// Color is the stripe down the left edge, as a 24-bit RGB integer.
+	Color     *int           `json:"color,omitempty"`
+	Footer    *EmbedFooter   `json:"footer,omitempty"`
+	Image     *EmbedMedia    `json:"image,omitempty"`
+	Thumbnail *EmbedMedia    `json:"thumbnail,omitempty"`
+	Video     *EmbedMedia    `json:"video,omitempty"`
+	Provider  *EmbedProvider `json:"provider,omitempty"`
+	Author    *EmbedAuthor   `json:"author,omitempty"`
+	Fields    []EmbedField   `json:"fields,omitempty"`
+}
+
+type EmbedFooter struct {
+	Text    string `json:"text"`
+	IconURL string `json:"icon_url,omitempty"`
+}
+
+type EmbedMedia struct {
+	URL    string `json:"url,omitempty"`
+	Width  int    `json:"width,omitempty"`
+	Height int    `json:"height,omitempty"`
+}
+
+type EmbedProvider struct {
+	Name string `json:"name,omitempty"`
+	URL  string `json:"url,omitempty"`
+}
+
+type EmbedAuthor struct {
+	Name    string `json:"name"`
+	URL     string `json:"url,omitempty"`
+	IconURL string `json:"icon_url,omitempty"`
+}
+
+// EmbedField is one name/value pair. Inline fields share a row, up to three
+// across.
+type EmbedField struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline,omitempty"`
 }
 
 // DirectMessage is one line of a private conversation.
@@ -624,6 +729,44 @@ type DMDeleteRequest struct {
 type DMReadRequest struct {
 	UserID    int64 `json:"userId"`
 	MessageID int64 `json:"messageId"`
+}
+
+// WebhookListRequest reads the webhooks the caller may manage. A zero
+// ChannelID lists every such channel's, which is what the settings screen asks
+// for; naming one narrows it to that channel.
+type WebhookListRequest struct {
+	ChannelID int64 `json:"channelId,omitempty"`
+}
+
+type WebhookListResult struct {
+	Webhooks []Webhook `json:"webhooks"`
+}
+
+type WebhookCreateRequest struct {
+	ChannelID int64 `json:"channelId"`
+	// Name is what messages posted through the webhook are attributed to,
+	// unless a delivery overrides it.
+	Name string `json:"name"`
+	// Avatar is an absolute http(s) URL, or empty for none.
+	Avatar string `json:"avatar,omitempty"`
+}
+
+// WebhookUpdateRequest is a patch: an absent field is left alone. Moving a
+// webhook to another channel needs the permission in both, since it is the
+// same thing as minting one there.
+type WebhookUpdateRequest struct {
+	WebhookID int64   `json:"webhookId"`
+	Name      *string `json:"name,omitempty"`
+	Avatar    *string `json:"avatar,omitempty"`
+	ChannelID *int64  `json:"channelId,omitempty"`
+}
+
+type WebhookDeleteRequest struct {
+	WebhookID int64 `json:"webhookId"`
+}
+
+type WebhookEvent struct {
+	Webhook Webhook `json:"webhook"`
 }
 
 type RoleCreateRequest struct {

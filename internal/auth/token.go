@@ -50,3 +50,23 @@ func NewOwnerToken() (raw, hash string, err error) {
 	raw = strings.Join(groups, "-")
 	return raw, HashToken(raw), nil
 }
+
+// webhookTokenBytes is the entropy of a webhook token. A webhook URL is
+// unauthenticated by anything else: whoever holds it may post, so the token
+// carries the whole weight and is sized like a session token rather than like
+// the owner token a human has to retype.
+const webhookTokenBytes = 32
+
+// NewWebhookToken mints the secret half of a webhook URL.
+//
+// Unlike a session token it is returned to be stored as it is, not hashed:
+// whoever manages a channel has to be able to read the URL back out of the
+// settings screen every time they wire up an integration, which a hash cannot
+// answer. Revoking one is deleting the webhook.
+func NewWebhookToken() (string, error) {
+	buf := make([]byte, webhookTokenBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("auth: read webhook token entropy: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}

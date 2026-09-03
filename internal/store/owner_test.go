@@ -81,6 +81,20 @@ func TestOwnershipIsBackfilledFromTheAdminRole(t *testing.T) {
 	if _, err := s.db.ExecContext(ctx, `PRAGMA user_version = 9`); err != nil {
 		t.Fatalf("rewind schema version: %v", err)
 	}
+	// Rewinding the counter replays every migration past it, not only the one
+	// under test, so the schema has to be wound back with it. Each migration
+	// added below this one gets a line here.
+	for _, statement := range []string{
+		`DROP INDEX IF EXISTS idx_messages_webhook`,
+		`ALTER TABLE messages DROP COLUMN webhook_id`,
+		`ALTER TABLE messages DROP COLUMN webhook_avatar`,
+		`ALTER TABLE messages DROP COLUMN embeds`,
+		`DROP TABLE IF EXISTS webhooks`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("rewind schema (%s): %v", statement, err)
+		}
+	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

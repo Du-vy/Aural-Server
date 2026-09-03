@@ -267,6 +267,47 @@ var migrations = []string{
 	ORDER BY ur.user_id ASC
 	LIMIT 1;
 	`,
+
+	// 11: webhooks, and the columns a message posted by one needs.
+	//
+	// A webhook is a URL that posts into one channel and nothing else. The
+	// token in that URL is the whole of its authentication, so unlike a session
+	// token it is stored as it was minted rather than hashed: whoever manages
+	// the channel has to be able to read the URL back out of the settings
+	// screen, which is the entire point of the feature. The bound on the damage
+	// is the webhook itself — it can post to one channel, and revoking it is
+	// one delete.
+	`
+	CREATE TABLE webhooks (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		channel_id   INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+		name         TEXT    NOT NULL,
+		-- The default avatar shown for messages this webhook posts, which a
+		-- single message may still override.
+		avatar       TEXT,
+		token        TEXT    NOT NULL UNIQUE,
+		creator_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+		created_at   INTEGER NOT NULL,
+		-- Zero until the first delivery, which is what tells an administrator
+		-- whether an integration was ever wired up at the other end.
+		last_used_at INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX idx_webhooks_channel ON webhooks(channel_id);
+
+	-- Deliberately not a foreign key. A message posted by a webhook keeps the
+	-- name and picture it was posted under for as long as the history does, and
+	-- ON DELETE SET NULL would quietly rewrite every one of them into the shape
+	-- a message left by a deleted account has. Deleting a webhook revokes the
+	-- URL; it does not edit what was already said through it.
+	ALTER TABLE messages ADD COLUMN webhook_id INTEGER;
+	-- The avatar this one message was posted under, which is the webhook's own
+	-- unless the payload overrode it.
+	ALTER TABLE messages ADD COLUMN webhook_avatar TEXT;
+	-- The embeds carried by the message, as the JSON array they arrived in.
+	-- NULL is a message with none, which is nearly all of them.
+	ALTER TABLE messages ADD COLUMN embeds TEXT;
+	CREATE INDEX idx_messages_webhook ON messages(webhook_id) WHERE webhook_id IS NOT NULL;
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

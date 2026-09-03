@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"net/url"
 	"strconv"
 
@@ -57,11 +58,56 @@ func messageView(m store.Message, attachments []store.Attachment) protocol.Messa
 		Content:   m.Content,
 		CreatedAt: m.CreatedAt,
 		EditedAt:  m.EditedAt,
+		Embeds:    decodeEmbeds(m.Embeds),
+	}
+	if m.WebhookID != nil {
+		out.Webhook = &protocol.MessageWebhook{ID: *m.WebhookID, Avatar: m.WebhookAvatar}
 	}
 	for _, a := range attachments {
 		out.Attachments = append(out.Attachments, attachmentView(a))
 	}
 	return out
+}
+
+// decodeEmbeds reads back the JSON array a webhook message stores its cards in.
+//
+// A row that will not decode is rendered as a message with no cards rather
+// than as an error: the words are the message, and one malformed column is not
+// a reason to withhold them.
+func decodeEmbeds(raw *string) []protocol.Embed {
+	if raw == nil || *raw == "" {
+		return nil
+	}
+	var out []protocol.Embed
+	if err := json.Unmarshal([]byte(*raw), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// webhookPath is the URL a delivery is posted to, relative to the server root
+// so that every way of reaching this server builds the same working address.
+//
+// The shape is Discord's, which is the whole point: an application already
+// pointed at one only has to be given this instead.
+func webhookPath(id int64, token string) string {
+	return webhookPrefix + strconv.FormatInt(id, 10) + "/" + token
+}
+
+// webhookView converts a stored webhook into its wire form. It carries the
+// token, so it only ever goes to somebody who may manage it.
+func webhookView(wh store.Webhook) protocol.Webhook {
+	return protocol.Webhook{
+		ID:         wh.ID,
+		ChannelID:  wh.ChannelID,
+		Name:       wh.Name,
+		Avatar:     wh.Avatar,
+		Token:      wh.Token,
+		URL:        webhookPath(wh.ID, wh.Token),
+		CreatorID:  wh.CreatorID,
+		CreatedAt:  wh.CreatedAt,
+		LastUsedAt: wh.LastUsedAt,
+	}
 }
 
 // directMessageView converts one stored private line into its wire form.

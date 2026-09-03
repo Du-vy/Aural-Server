@@ -70,6 +70,15 @@ const (
 	OpDMDelete  = "dm.delete"
 	OpDMRead    = "dm.read" // move your own read marker up
 
+	// Webhooks: URLs that post into one channel without an identity behind
+	// them. There are no webhook events, deliberately — a webhook object
+	// carries the token that is the whole of its authentication, so it is only
+	// ever handed to somebody who asked for it and may manage it.
+	OpWebhookList   = "webhook.list"
+	OpWebhookCreate = "webhook.create"
+	OpWebhookUpdate = "webhook.update"
+	OpWebhookDelete = "webhook.delete"
+
 	OpRoleCreate   = "role.create"
 	OpRoleUpdate   = "role.update"
 	OpRoleDelete   = "role.delete"
