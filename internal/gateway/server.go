@@ -152,6 +152,10 @@ func (s *Server) Run(ctx context.Context) error {
 	// Publishes this server's address to a dynamic DNS provider. It returns
 	// immediately unless the ddns block is switched on.
 	go s.watchDDNS(ctx)
+	// The Discord bridge. It returns immediately on a server with no relay
+	// configured, and never fails the start: a bridge that cannot reach
+	// Discord is a degraded server, not a broken one.
+	go s.hub.discord.Run(ctx)
 
 	if s.cfg.TLS.Enabled {
 		// A certificate this server obtains for itself has to exist before the

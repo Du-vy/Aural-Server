@@ -500,6 +500,81 @@ var migrations = []string{
 	-- administrator says otherwise.
 	UPDATE roles SET permissions = permissions | 32768 WHERE managed = 'everyone';
 	`,
+	// 14: the Discord relay, which carries one text channel in both
+	// directions.
+	//
+	// A link is a pair — one channel here, one channel there — plus the
+	// webhook URL messages go out through. The webhook is Discord's own, minted
+	// in its channel settings, and its id is the load-bearing part: a message
+	// this server relays into Discord arrives back over the gateway carrying
+	// it, which is what tells the relay it is looking at its own echo. That is
+	// the whole loop guard in one direction, and it is an identity rather than
+	// a guess about the content.
+	//
+	// The other direction is the mirror of it. A message that arrived from
+	// Discord is written with source_webhook_id in its webhook_id column, so
+	// the outbound side recognises it by the same kind of tag and does not send
+	// it back where it came from.
+	`
+	CREATE TABLE relay_links (
+		id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+		channel_id         INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+		-- Discord ids are snowflakes: 64-bit values that do not survive a
+		-- JavaScript number, so they are text everywhere, as they are on the
+		-- wire.
+		discord_guild_id   TEXT    NOT NULL DEFAULT '',
+		discord_channel_id TEXT    NOT NULL,
+		-- The two halves of the outgoing webhook URL, kept apart because the
+		-- id is read on every inbound message and the token only on an
+		-- outbound one. Stored as minted, for the same reason the webhooks
+		-- table stores its own that way: an administrator has to be able to
+		-- read the URL back out of the settings screen.
+		webhook_id         TEXT    NOT NULL,
+		webhook_token      TEXT    NOT NULL,
+		-- 'both', 'to_aural' or 'to_discord'. A one-way link is what a
+		-- community announcing into Discord without opening a door back wants.
+		direction          TEXT    NOT NULL DEFAULT 'both',
+		enabled            INTEGER NOT NULL DEFAULT 1,
+		-- Whether files and edits cross with the words. They are separate
+		-- switches because they cost different things: an attachment is
+		-- bandwidth and disk on both sides, an edit is a second call per
+		-- change.
+		relay_attachments  INTEGER NOT NULL DEFAULT 1,
+		relay_edits        INTEGER NOT NULL DEFAULT 1,
+		-- The webhooks row that messages arriving from Discord are written
+		-- under. It is what gives them a name and a picture per message, and
+		-- what the outbound side reads to recognise its own inbound traffic.
+		source_webhook_id  INTEGER,
+		created_at         INTEGER NOT NULL,
+		last_relayed_at    INTEGER NOT NULL DEFAULT 0,
+		-- The last failure, kept so a broken link explains itself in the
+		-- settings screen rather than only in the log.
+		last_error         TEXT    NOT NULL DEFAULT ''
+	);
+	-- One link per channel on each side. Two links pointing at the same Discord
+	-- channel would each relay the other's output, which is a loop the webhook
+	-- guard cannot see because both halves are legitimately ours.
+	CREATE UNIQUE INDEX idx_relay_links_channel ON relay_links(channel_id);
+	CREATE UNIQUE INDEX idx_relay_links_discord ON relay_links(discord_channel_id);
+
+	-- What one message is called on the other side.
+	--
+	-- Deliberately not a foreign key onto messages, for the reason webhook_id
+	-- is not one: the row has to still be readable while the message it names
+	-- is being deleted, which is exactly when the relay needs it. Rows whose
+	-- message is gone are swept.
+	CREATE TABLE relay_messages (
+		aural_id   INTEGER PRIMARY KEY,
+		link_id    INTEGER NOT NULL REFERENCES relay_links(id) ON DELETE CASCADE,
+		discord_id TEXT    NOT NULL,
+		-- 'discord' or 'aural': which side wrote it first. An edit is pushed
+		-- only away from its origin, so a message that came from Discord and
+		-- was edited there is not then pushed back at Discord.
+		origin     TEXT    NOT NULL,
+		created_at INTEGER NOT NULL
+	);
+	CREATE INDEX idx_relay_messages_discord ON relay_messages(link_id, discord_id);
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

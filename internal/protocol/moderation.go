@@ -109,6 +109,13 @@ const (
 	AuditSoundDel       = "sound.delete"
 	AuditAutoModUpdate  = "automod.update"
 	AuditAutoModAction  = "automod.action"
+	// The Discord bridge. Switching it on points the server at an outside
+	// service, and a link hands somebody a standing permission to post into a
+	// channel on it, so both belong in the record moderators read.
+	AuditRelayConfigure = "relay.configure"
+	AuditRelayCreate    = "relay.create"
+	AuditRelayUpdate    = "relay.update"
+	AuditRelayDelete    = "relay.delete"
 )
 
 // The kinds of thing an audit entry can be about.

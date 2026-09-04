@@ -332,7 +332,18 @@ type MessageWebhook struct {
 	// Avatar is an absolute URL, or absent. A webhook is an outside service,
 	// so nothing about its picture is hosted here.
 	Avatar *string `json:"avatar,omitempty"`
+	// Source names where the message came from when it is something more
+	// specific than an application posting to a URL. The only value today is
+	// "discord", set on a message the relay carried across, and it exists so a
+	// client can say so — a message from a person on Discord is not an app,
+	// and badging it as one would misdescribe both.
+	Source string `json:"source,omitempty"`
 }
+
+// The values Source takes.
+const (
+	MessageSourceDiscord = "discord"
+)
 
 // Post is one entry of a channel that holds entries: an announcement, a forum
 // topic, a media item, a calendar event.

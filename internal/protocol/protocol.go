@@ -116,6 +116,16 @@ const (
 	OpWebhookUpdate = "webhook.update"
 	OpWebhookDelete = "webhook.delete"
 
+	// The Discord relay: channel pairs that carry messages between this server
+	// and a Discord one. Every op needs ManageServer — a link carries a
+	// webhook URL, which is a standing permission to post, and points the
+	// server at an outside service on the operator's behalf.
+	OpRelayGet       = "relay.get"       // the whole state: bot, guilds, links
+	OpRelayConfigure = "relay.configure" // switch it on, set the bot token
+	OpRelayCreate    = "relay.create"
+	OpRelayUpdate    = "relay.update"
+	OpRelayDelete    = "relay.delete"
+
 	OpRoleCreate   = "role.create"
 	OpRoleUpdate   = "role.update"
 	OpRoleReorder  = "role.reorder"
@@ -195,6 +205,11 @@ const (
 	EvRoleDeleted = "role.deleted"
 
 	EvServerUpdated = "server.updated"
+
+	// EvRelayUpdated carries the whole relay state after any change to it,
+	// and reaches only the sessions that may manage the server: it names
+	// webhook URLs, which are credentials.
+	EvRelayUpdated = "relay.updated"
 
 	EvVoiceState    = "voice.state"    // somebody's voice state changed
 	EvVoiceSpeaking = "voice.speaking" // somebody started or stopped speaking

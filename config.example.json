@@ -61,6 +61,13 @@
   "integrations": {
     "klipy_api_key": ""
   },
+  "relay": {
+    "enabled": false,
+    "bot_token": "",
+    "public_url": "",
+    "max_attachment_bytes": 8388608,
+    "links": []
+  },
   "ddns": {
     "enabled": false,
     "provider": "",

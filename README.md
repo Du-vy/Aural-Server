@@ -150,6 +150,13 @@ leave out falls back to its default. See `config.example.json` for the full file
     "max_sticker_bytes": 1048576,
     "max_sound_bytes": 4194304
   },
+  "relay": {
+    "enabled": false,          // bridge channels to a Discord server
+    "bot_token": "",           // from the Bot page of a Discord application
+    "public_url": "",          // where Discord fetches relayed avatars from
+    "max_attachment_bytes": 8388608,
+    "links": []                // seed pairs here; the settings screen owns them after
+  },
   "ddns": {
     "enabled": false,          // keep a dynamic DNS record pointing here
     "provider": "",            // duckdns | cloudflare
@@ -520,6 +527,64 @@ and picture they were posted under.
 The full surface — every route, every field, the limits and the error codes — is
 in [docs/PROTOCOL.md](docs/PROTOCOL.md#webhooks).
 
+## The Discord relay
+
+Communities do not move all at once. Some people leave Discord the day a server
+opens here and some never do, and in between there is a stretch — weeks, usually
+— where a conversation split across two applications is the thing that decides
+whether the move sticks.
+
+So a channel here can be bridged to a channel on a Discord server, both ways.
+The people who moved talk here, the people who have not talk there, and neither
+group is talking into a room with nobody in it.
+
+**Messages wear the name and picture of whoever wrote them.** A bridged channel
+reads as the people in it, not as forty messages in a row posted by "Relay Bot".
+Text, files, embeds, edits and deletions all cross; a reply becomes a short
+quote of what it answers; Discord's `<@id>` mentions and `<t:…>` timestamps are
+resolved into the names and dates a reader would have seen.
+
+**Nothing loops.** A message that crosses is tagged by identity on each side —
+the Discord webhook it went out through, and the internal webhook row it came in
+under — so its own echo is recognised exactly rather than guessed at from what
+it says.
+
+**Your rules still apply.** AutoMod screens what arrives from Discord, so a word
+list is not something to be walked around by typing it on the other side.
+Nothing relayed can ping: `@everyone` and anything shaped like a Discord mention
+is defanged on the way out, because people here are not moderated by Discord's
+moderators.
+
+### Setting one up
+
+From **Server Settings → Discord Relay**, which walks through it, or from the
+`relay` block of `config.json` for a container that should come up already
+bridged. In short:
+
+1. Create an application in the [Discord Developer
+   Portal](https://discord.com/developers/applications) and open its **Bot**
+   page. Reset the token and copy it.
+2. On the same page, switch on the **Message Content Intent**. Without it
+   Discord delivers every message with an empty body — this is the one step
+   that produces a bridge which connects happily and carries nothing.
+3. Under **OAuth2 → URL Generator**, tick `bot` and `Read Messages/View
+   Channels`, and open the URL to add the bot to your Discord server.
+4. In each Discord channel you want bridged: **Edit Channel → Integrations →
+   Webhooks → New Webhook**, and copy its URL.
+5. Paste the token and each webhook URL into the settings screen.
+
+The bot needs no permissions beyond reading the channels being bridged, and the
+webhook is what it writes through — Aural never needs anybody's Discord
+password, and the token can be revoked from the Developer Portal at any time.
+
+Each link can run both ways, or only one, and can carry or drop files and edits
+independently. Managing them needs `ManageServer`: a webhook URL is a standing
+permission to post into somebody else's channel.
+
+It costs no new dependency. The Discord gateway is a WebSocket carrying JSON and
+the webhook side is plain HTTP, so `internal/discord` speaks both directly over
+the WebSocket library the server already uses.
+
 ## How identity works
 
 There is one table of users. **A guest is a user with no username yet.**
@@ -591,6 +656,7 @@ internal/auth         Argon2id passwords and opaque session tokens
 internal/permissions  the bitmask and the resolution rules
 internal/uploads      attachment storage on disk, quota, content types, WAV length
 internal/voice        the Opus parameters, and the WebRTC relay
+internal/discord      the Discord gateway and webhook API, for the relay
 internal/publicip     the address the relay advertises: literal, DNS or STUN
 internal/ddns         DuckDNS and Cloudflare: address records and DNS-01
 internal/acme         obtaining and renewing a certificate over DNS-01
@@ -670,6 +736,12 @@ the `ManageWebhooks` permission.
 account, the address and a salted per-server device identifier, an audit log
 of what moderators did, and AutoMod. Plus the things a server carries for its
 own people: custom emoji, stickers, and a soundboard.
+
+**Unreleased** — the Discord relay: channels bridged both ways to a Discord
+server, with each message wearing the name and picture of whoever wrote it,
+files and edits carried across, an exact loop guard on each side, and AutoMod
+applied to what arrives. Built directly on the WebSocket library the server
+already uses, so it costs no new dependency.
 
 **Later** — bots and a bot API, per-user permission overwrites, screen
 sharing, and Aural Hub, a directory for finding public servers.

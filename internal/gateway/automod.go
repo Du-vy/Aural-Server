@@ -598,3 +598,90 @@ func clamp(value, low, high, fallback int) int {
 	}
 	return value
 }
+
+// screenRelayed runs the content rules over a message that arrived from
+// somewhere else.
+//
+// A bridge must not be a hole in the moderation. A word list that only applied
+// to what was typed here would be walked around by typing it on Discord
+// instead, which is a worse outcome than not having the bridge: the rule would
+// look enforced and would not be.
+//
+// It is not screenMessage with a fake session, because the rules divide in
+// two. The ones about content — mentions, capitals, links, words — mean the
+// same thing whoever wrote them, and are applied. The ones about pace — flood
+// and repetition — measure one connection's own history, and a relayed author
+// has no connection here; counting them against a shared queue would let one
+// talkative person on Discord silence everybody else on it. Role exemptions do
+// not apply either, for the plainest of reasons: whoever wrote this holds no
+// roles on this server.
+//
+// It returns the content to store and whether the message was refused outright.
+func (h *Hub) screenRelayed(ctx context.Context, channelID int64, content, author string) (string, bool) {
+	cfg := h.AutoMod()
+	if !cfg.Enabled {
+		return content, false
+	}
+	for _, id := range cfg.ExemptChannels {
+		if id == channelID {
+			return content, false
+		}
+	}
+
+	if rule := cfg.Mentions.AutoModRule; rule.Enabled {
+		if limit := cfg.Mentions.Limit; limit > 0 && countMentions(content) > limit {
+			h.auditRelayAutoMod(ctx, channelID, author, "mentions", protocol.AutoModBlock)
+			return content, true
+		}
+	}
+	if rule := cfg.Caps.AutoModRule; rule.Enabled {
+		if shouting(content, cfg.Caps.Percent, cfg.Caps.MinLength) {
+			h.auditRelayAutoMod(ctx, channelID, author, "caps", protocol.AutoModBlock)
+			return content, true
+		}
+	}
+
+	censored := ""
+	if rule := cfg.Links.AutoModRule; rule.Enabled {
+		masked, found := screenLinks(content, cfg.Links.AllowedDomains, rule.Action)
+		if found {
+			if rule.Action != protocol.AutoModCensor {
+				h.auditRelayAutoMod(ctx, channelID, author, "links", protocol.AutoModBlock)
+				return content, true
+			}
+			content, censored = masked, "links"
+		}
+	}
+	if rule := cfg.Words.AutoModRule; rule.Enabled {
+		masked, found := screenWords(content, cfg.Words.Words, cfg.Words.WholeWord, rule.Action)
+		if found {
+			if rule.Action != protocol.AutoModCensor {
+				h.auditRelayAutoMod(ctx, channelID, author, "words", protocol.AutoModBlock)
+				return content, true
+			}
+			content, censored = masked, "words"
+		}
+	}
+
+	if censored != "" {
+		h.auditRelayAutoMod(ctx, channelID, author, censored, protocol.AutoModCensor)
+	}
+	return content, false
+}
+
+// auditRelayAutoMod records that a rule fired on a relayed message.
+//
+// It names the author as they appeared on the other side, which is the only
+// identity there is: there is no account here to point at, and a log entry that
+// said nothing about who wrote it would be a log entry nobody could act on.
+func (h *Hub) auditRelayAutoMod(ctx context.Context, channelID int64, author, rule, action string) {
+	name := ""
+	if channel, ok := h.Channel(channelID); ok {
+		name = channel.Name
+	}
+	entry := auditTarget(protocol.AuditTargetChannel, channelID, name)
+	entry.Action = protocol.AuditAutoModAction
+	entry.Reason = rule + " (" + action + ", relayed)"
+	entry.Changes = []store.AuditChange{{Key: "author", After: author}}
+	h.audit(ctx, nil, entry)
+}

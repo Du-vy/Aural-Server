@@ -606,6 +606,11 @@ Every op below needs an authenticated session.
 | `webhook.create` | `ManageWebhooks` on the channel | `{ channelId, name, avatar? }`. Text channels only, at most 15 per channel. |
 | `webhook.update` | `ManageWebhooks` on both channels | `{ webhookId, name?, avatar?, channelId? }`. Moving one needs the permission where it is going, since that is the same thing as minting one there. |
 | `webhook.delete` | `ManageWebhooks` on the channel | `{ webhookId }`. Revokes the URL; what it posted stays. |
+| `relay.get` | `ManageServer` | No body. The whole relay state. See [The Discord relay](#the-discord-relay). |
+| `relay.configure` | `ManageServer` | `{ enabled, botToken? }`. Omitting the token keeps the one stored; it is never sent back. |
+| `relay.create` | `ManageServer` | `{ channelId, webhookUrl, discordChannelId?, direction?, attachments, edits }`. The webhook URL is verified against Discord before anything is written. |
+| `relay.update` | `ManageServer` | `{ id, channelId?, webhookUrl?, direction?, enabled?, attachments?, edits? }`. Anything omitted is left as it was. |
+| `relay.delete` | `ManageServer` | `{ id }`. Unpairs the channels; what already crossed stays on both sides. |
 | `voice.*` | See [Voice](#voice) | The audio plane. |
 
 Three notes on messages:
@@ -1366,6 +1371,7 @@ They default to 50 MiB and 5 GiB.
 | `ban.created` / `ban.deleted` | Reaches the sessions holding `BanUsers`. |
 | `audit.entry` | One new line of the log. Reaches the sessions holding `ViewAuditLog`. |
 | `automod.updated` | Reaches the sessions holding `ManageServer`. |
+| `relay.updated` | `{ relay }`, the whole state after any change. Reaches the sessions holding `ManageServer`, and only those: it names webhook URLs, which are credentials. |
 | `expression.created` / `expression.updated` / `expression.deleted` | The custom emoji and stickers. Everybody, since everybody renders them. |
 | `sound.created` / `sound.updated` / `sound.deleted` | The soundboard. |
 | `sound.played` | `{ soundId, userId, channelId }`. Reaches everybody sitting in that voice channel, whether or not they hold a media session. |
@@ -1374,6 +1380,96 @@ When a permission change could add or remove channels from what somebody is
 allowed to see, the affected clients receive a fresh `ready` event rather than a
 patch. Patching that incrementally would cost more bookkeeping than a rare full
 refresh is worth.
+
+## The Discord relay
+
+A relay carries one text channel here to one channel on a Discord server, and
+back. It is for the shape a migration actually takes: a community does not move
+all at once, and for the weeks in between, a conversation split across two
+applications is what decides whether the move sticks.
+
+The two sides are asymmetric in how they are reached and symmetric in what a
+reader sees.
+
+- **Discord to here.** A bot account, connected to Discord's gateway with the
+  `GUILDS`, `GUILD_MESSAGES` and `MESSAGE_CONTENT` intents. The last of those is
+  privileged and off by default; without it Discord delivers every message with
+  an empty body, which is the single most common way this is misconfigured. The
+  message is written as a webhook message — `userId: null`, `webhook` set — so
+  it carries the author's Discord name and picture per message.
+- **Here to Discord.** A Discord webhook, whose URL an administrator mints in
+  that channel's own integration settings. Each delivery overrides `username`
+  and `avatar_url`, so one URL posts as every member of this server.
+
+So a bridged channel reads as the people in it on both ends, rather than as a
+bot repeating them.
+
+### Not looping
+
+The obvious failure is a message crossing, coming back as new, and crossing
+again. It is prevented by an identity on each side rather than by comparing
+content, which would be a guess and would break the moment somebody quoted
+themselves.
+
+- A message this server posts goes through a Discord webhook whose id it knows,
+  because it parsed it out of the URL that was pasted. When that message arrives
+  back over the gateway it carries `webhook_id`, and that field being one of
+  ours is proof it is our own echo.
+- A message arriving from Discord is written under a `webhooks` row the relay
+  owns. When the outbound side finds that row's id in a new message, it is
+  looking at something it wrote itself.
+
+Both are exact, and neither can be defeated by what a message says. A link that
+is switched off still recognises its own echoes, because a message already in
+flight has to be dropped after the bridge stops relaying.
+
+### What crosses
+
+Text, files, embeds, edits and deletions, each way. A reply becomes a one-line
+quote of what it answers, since there is nothing to hang a thread off here.
+Discord's `<@id>`, `<@&id>`, `<#id>`, `<:name:id>` and `<t:unix>` are resolved to
+the names and dates a reader would have seen, because a mention here is the name
+it names rather than an id beside one — see the header of `src/lib/mentions.ts`.
+
+Files are carried as bytes rather than as links, both ways. A Discord attachment
+URL carries a signature that expires, so linking would fill a bridged channel
+with images that stopped loading; and a link the other way would have to be an
+address on this server, which plenty of self-hosted ones do not have.
+
+Nothing pings. Outbound content is posted with `allowed_mentions` suppressing
+everything, and `@everyone`, `@here` and anything shaped like a Discord mention
+are broken with a zero-width character. People on this server are not moderated
+by Discord's moderators, and an unfiltered bridge would hand any one of them
+`@everyone` on a server they are not in.
+
+Comments on posts do not cross: there is no thread on the Discord side to hang
+one off, and no way back.
+
+### Moderation
+
+Automatic moderation applies to what arrives. The rules about content — banned
+words, links, mention counts, capitals — are run over every relayed message, and
+one that a rule refuses is never written. The rules about pace are not: flood
+and repetition measure one connection's own history, and a relayed author has no
+connection here, so counting them against a shared queue would let one talkative
+person on Discord silence everybody else on it.
+
+A bridge that skipped the rules would be worse than no bridge, because the word
+list would look enforced and would not be.
+
+### Configuration
+
+The bot token and the links are set over the protocol, and can also be seeded
+from the `relay` block of the configuration file so a container can be deployed
+already bridged. A link named in the file is matched by its Discord channel, so
+editing the file changes the link it created rather than adding a second one;
+the first edit made from the settings screen clears the file's copy, so a
+restart cannot resurrect a link somebody deleted.
+
+`relay.public_url` is the address Discord fetches relayed avatars from. It is
+guessed from the ACME domain, the dynamic DNS name or the resolved public
+address when it is not set, and an unguessable one costs the per-author pictures
+on the Discord side and nothing else.
 
 ## Presence rules
 

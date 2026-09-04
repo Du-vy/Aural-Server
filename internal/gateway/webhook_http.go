@@ -609,6 +609,11 @@ func (s *Server) postWebhookMessage(ctx context.Context, wh store.Webhook, paylo
 	s.hub.BroadcastChannelEvent(
 		protocol.Event(protocol.EvMessageCreated, protocol.MessageEvent{Message: view}),
 		created.ChannelID)
+	// A webhook delivery into a bridged channel crosses like anything else: an
+	// alert worth posting here is worth posting to the people still reading
+	// the other side. The relay drops the one case that would loop — its own
+	// inbound webhook — by the tag on the row rather than by a check here.
+	s.hub.relayMessage(created, attachments)
 
 	s.log.Info("webhook message delivered",
 		slog.Int64("webhook", wh.ID), slog.Int64("channel", wh.ChannelID),

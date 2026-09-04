@@ -112,6 +112,10 @@ func handleMessageSend(ctx context.Context, s *Session, raw json.RawMessage) (an
 	s.hub.BroadcastChannelEvent(
 		protocol.Event(protocol.EvMessageCreated, protocol.MessageEvent{Message: view}),
 		created.ChannelID)
+	// After the broadcast, and never before it: a bridge is a courtesy to the
+	// people who have not moved off Discord yet, and a slow one must not be
+	// able to delay the message for the people who have.
+	s.hub.relayMessage(created, attachments)
 
 	return protocol.MessageEvent{Message: view}, nil
 }
@@ -499,6 +503,7 @@ func handleMessageEdit(ctx context.Context, s *Session, raw json.RawMessage) (an
 	s.hub.BroadcastChannelEvent(
 		protocol.Event(protocol.EvMessageUpdated, protocol.MessageEvent{Message: view}),
 		updated.ChannelID)
+	s.hub.relayEdit(updated)
 
 	return protocol.MessageEvent{Message: view}, nil
 }
@@ -556,6 +561,7 @@ func handleMessageDelete(ctx context.Context, s *Session, raw json.RawMessage) (
 
 	event := protocol.MessageDeletedEvent{MessageID: existing.ID, ChannelID: existing.ChannelID}
 	s.hub.BroadcastChannelEvent(protocol.Event(protocol.EvMessageDeleted, event), existing.ChannelID)
+	s.hub.relayDelete(existing)
 	if !own {
 		s.log.Info("message deleted by a moderator",
 			slog.Int64("message", existing.ID), slog.Int64("channel", existing.ChannelID))

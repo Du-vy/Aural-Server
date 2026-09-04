@@ -779,6 +779,17 @@ func (s *Server) sweepOnce(ctx context.Context) {
 		s.log.Info("pruned expired link previews", slog.Int64("count", pruned))
 	}
 
+	// What a relayed message is called on the other side outlives the message
+	// itself on purpose — the pairing has to still be readable while the
+	// delete that reads it runs — so the rows a bulk deletion leaves behind
+	// are collected here.
+	if dropped, err := s.st.SweepRelayMessages(ctx, batch); err != nil {
+		s.log.Warn("sweep relayed message pairings", slog.Any("error", err))
+	} else if dropped > 0 {
+		s.log.Debug("dropped relayed message pairings whose message is gone",
+			slog.Int64("count", dropped))
+	}
+
 	s.sweepRetention(ctx)
 
 	// The HTTP limiters keep one bucket per identity that ever used the

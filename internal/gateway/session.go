@@ -690,6 +690,15 @@ var routes = map[string]route{
 	protocol.OpWebhookUpdate: {needsAuth: true, fn: handleWebhookUpdate},
 	protocol.OpWebhookDelete: {needsAuth: true, fn: handleWebhookDelete},
 
+	// The Discord bridge. relay.get and relay.create talk to Discord over
+	// HTTP before they answer, so both are slow ops: they must not hold the
+	// one frame a session is allowed to be processing.
+	protocol.OpRelayGet:       {needsAuth: true, slow: true, fn: handleRelayGet},
+	protocol.OpRelayConfigure: {needsAuth: true, fn: handleRelayConfigure},
+	protocol.OpRelayCreate:    {needsAuth: true, slow: true, fn: handleRelayCreate},
+	protocol.OpRelayUpdate:    {needsAuth: true, slow: true, fn: handleRelayUpdate},
+	protocol.OpRelayDelete:    {needsAuth: true, fn: handleRelayDelete},
+
 	protocol.OpRoleCreate:   {needsAuth: true, fn: handleRoleCreate},
 	protocol.OpRoleUpdate:   {needsAuth: true, fn: handleRoleUpdate},
 	protocol.OpRoleReorder:  {needsAuth: true, fn: handleRoleReorder},

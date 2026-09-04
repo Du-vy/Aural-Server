@@ -28,6 +28,7 @@ type Config struct {
 	Expressions  Expressions  `json:"expressions"`
 	Unfurl       Unfurl       `json:"unfurl"`
 	Integrations Integrations `json:"integrations"`
+	Relay        Relay        `json:"relay"`
 	DDNS         DDNS         `json:"ddns"`
 	Retention    Retention    `json:"retention"`
 	TLS          TLS          `json:"tls"`
@@ -232,6 +233,84 @@ type Unfurl struct {
 type Integrations struct {
 	KlipyAPIKey string `json:"klipy_api_key"`
 }
+
+// Relay bridges channels here to channels on a Discord server.
+//
+// It exists for one situation, which is the common one: a community deciding
+// to move does not move all at once. Somebody has to stay reachable where the
+// rest of them still are, and without a bridge that means one person reading
+// two applications and copying things across by hand until the stragglers give
+// up or the move does.
+//
+// The bot side is a bot account in Discord's developer portal, added to the
+// server with permission to read the channels being bridged, and with the
+// message content intent switched on — without that last one Discord delivers
+// every message with an empty body, which is the single most common way this
+// is misconfigured.
+//
+// The links here are a starting point rather than the record. They are copied
+// into the database the first time the server starts with them, which is what
+// lets a container be deployed already configured; after that the database is
+// what the relay reads, and the settings screen is what edits it. A link the
+// file names is matched by its Discord channel id, so editing the file changes
+// the link it already created rather than making a second one.
+type Relay struct {
+	Enabled bool `json:"enabled"`
+	// BotToken is the token from the Bot page of a Discord application. It is
+	// a password: anybody holding it can act as the bot anywhere it has been
+	// added.
+	BotToken string `json:"bot_token"`
+	// Links are the channel pairs to create on first start.
+	Links []RelayLink `json:"links"`
+	// MaxAttachmentBytes bounds one file carried across, in either direction.
+	// Zero uses the default; a negative number turns file relaying off while
+	// leaving the words flowing.
+	MaxAttachmentBytes int64 `json:"max_attachment_bytes"`
+	// PublicURL is where this server is reachable from the internet, as a
+	// client would type it: https://aural.example.com, no trailing path.
+	//
+	// It is needed for one thing only. A relayed message impersonates its
+	// author, and the picture in that impersonation is a URL Discord fetches
+	// itself — from Discord's network, not from anybody on this server's. A
+	// relative path is meaningless there, and this is the only place the
+	// server can learn an absolute one, because nothing about a bridged
+	// message arrives over HTTP for the address to be read off.
+	//
+	// Leaving it empty is fine and costs only the pictures: the server guesses
+	// from its ACME domain, its dynamic DNS name or its public address, and a
+	// server none of those apply to relays its messages under the webhook's
+	// own avatar instead of each author's.
+	PublicURL string `json:"public_url"`
+}
+
+// RelayLink is one channel pair as the configuration file spells it.
+type RelayLink struct {
+	// ChannelID is the Aural channel, by id. It is an id rather than a name
+	// because names are not unique across categories and a bridge pointed at
+	// the wrong channel is worse than one that refuses to start.
+	ChannelID int64 `json:"channel_id"`
+	// DiscordChannelID is the channel on the other side. Copy it from
+	// Discord with developer mode on, or leave it empty and let the webhook
+	// URL name it: a webhook already belongs to exactly one channel.
+	DiscordChannelID string `json:"discord_channel_id"`
+	// WebhookURL is the Discord webhook messages go out through, minted in
+	// that channel's own integration settings.
+	WebhookURL string `json:"webhook_url"`
+	// Direction is "both", "to_aural" or "to_discord". Empty means both.
+	Direction string `json:"direction"`
+	// Attachments and Edits default to on, which is why they are pointers: a
+	// file that says nothing about them means yes, and only an explicit false
+	// turns one off.
+	Attachments *bool `json:"attachments,omitempty"`
+	Edits       *bool `json:"edits,omitempty"`
+}
+
+// DefaultRelayAttachmentBytes bounds one relayed file.
+//
+// Eight megabytes is what a Discord server with no boosts accepts, so a file
+// under it crosses in both directions and a file over it would have been
+// refused on arrival anyway.
+const DefaultRelayAttachmentBytes = 8 << 20
 
 // DDNS keeps a dynamic DNS record pointing at this server.
 //
@@ -489,6 +568,11 @@ func Default() Config {
 		Integrations: Integrations{
 			KlipyAPIKey: "",
 		},
+		Relay: Relay{
+			Enabled:            false,
+			Links:              []RelayLink{},
+			MaxAttachmentBytes: DefaultRelayAttachmentBytes,
+		},
 		DDNS: DDNS{
 			Enabled:         false,
 			IntervalMinutes: DefaultDDNSInterval,
@@ -641,6 +725,10 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.DDNS.validate(); err != nil {
+		return err
+	}
+
+	if err := c.Relay.validate(); err != nil {
 		return err
 	}
 
@@ -920,6 +1008,55 @@ func (c *Config) ACMEAccountKeyFile() string {
 // validate checks the dynamic DNS block and fills in what it leaves out. A
 // disabled block is not checked at all, so a half-written one can be left in
 // the file while it is being set up.
+// validate fills in the relay's defaults and refuses a block that could not
+// work.
+//
+// A link is checked for shape only. Whether the webhook URL is a webhook, and
+// whether Discord still has it, is a question for the network rather than for
+// a parser, and it is answered by the relay itself where the failure can be
+// reported to an administrator instead of stopping the server.
+func (r *Relay) validate() error {
+	r.BotToken = strings.TrimSpace(r.BotToken)
+	r.PublicURL = strings.TrimSuffix(strings.TrimSpace(r.PublicURL), "/")
+
+	if r.MaxAttachmentBytes == 0 {
+		r.MaxAttachmentBytes = DefaultRelayAttachmentBytes
+	}
+	if r.Links == nil {
+		r.Links = []RelayLink{}
+	}
+	if !r.Enabled {
+		return nil
+	}
+
+	if r.BotToken == "" {
+		return errors.New("relay.bot_token must not be empty while relay.enabled is true")
+	}
+	for i := range r.Links {
+		link := &r.Links[i]
+		link.WebhookURL = strings.TrimSpace(link.WebhookURL)
+		link.DiscordChannelID = strings.TrimSpace(link.DiscordChannelID)
+		link.Direction = strings.ToLower(strings.TrimSpace(link.Direction))
+
+		if link.Direction == "" {
+			link.Direction = "both"
+		}
+		switch link.Direction {
+		case "both", "to_aural", "to_discord":
+		default:
+			return fmt.Errorf("relay.links[%d].direction %q must be \"both\", \"to_aural\" or \"to_discord\"",
+				i, link.Direction)
+		}
+		if link.ChannelID < 1 {
+			return fmt.Errorf("relay.links[%d].channel_id must name an Aural channel", i)
+		}
+		if link.WebhookURL == "" {
+			return fmt.Errorf("relay.links[%d].webhook_url must not be empty", i)
+		}
+	}
+	return nil
+}
+
 func (d *DDNS) validate() error {
 	d.Provider = strings.ToLower(strings.TrimSpace(d.Provider))
 	d.Domain = strings.TrimSpace(d.Domain)

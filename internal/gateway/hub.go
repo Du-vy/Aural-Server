@@ -100,6 +100,12 @@ type Hub struct {
 	// identifier it presents. It is read once at startup and never changes
 	// while the process runs, so it needs no lock.
 	deviceSalt string
+
+	// discord is the bridge to a Discord server, and is nil only before the
+	// hub has finished being built. It is not the relay field above: that one
+	// forwards audio, this one carries text to somebody else's service, and
+	// the two share nothing but a word. See relay.go.
+	discord *discordRelay
 }
 
 // NewHub builds a hub and primes its caches from the database. cfgPath is where
@@ -215,6 +221,11 @@ func NewHub(ctx context.Context, cfg *config.Config, cfgPath string, st *store.S
 		}
 		h.files = files
 	}
+
+	// Built last, because it reads the upload store and the channel cache the
+	// lines above set up. It connects nothing here: Run is what starts it, and
+	// only on a server whose configuration asks for it.
+	h.discord = newDiscordRelay(h)
 	return h, nil
 }
 
