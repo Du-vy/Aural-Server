@@ -112,7 +112,7 @@ func TestPruneStaleGuestsLeavesAccountsAndHistoryAlone(t *testing.T) {
 	if textChannel == 0 {
 		t.Fatal("the seeded database has no text channel to post in")
 	}
-	if _, err := s.CreateMessage(ctx, textChannel, nil, gone.ID, "still here"); err != nil {
+	if _, err := s.CreateMessage(ctx, textChannel, nil, gone.ID, "still here", nil); err != nil {
 		t.Fatalf("CreateMessage: %v", err)
 	}
 

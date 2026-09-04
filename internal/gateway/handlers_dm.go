@@ -87,12 +87,27 @@ func handleDMHistory(ctx context.Context, s *Session, raw json.RawMessage) (any,
 		page, err = s.hub.st.DirectMessagesBefore(ctx, conversation.ID, req.Before, limit)
 		reverseDirect(page)
 	}
-	if err != nil {
-		return nil, internalError(s, "read the conversation", err)
+	var replyIDs []int64
+	for _, m := range page {
+		if m.ReplyToID != nil {
+			replyIDs = append(replyIDs, *m.ReplyToID)
+		}
+	}
+	var replies map[int64]store.DirectMessage
+	if len(replyIDs) > 0 {
+		replies, _ = s.hub.st.RepliesForDirectMessages(ctx, replyIDs)
 	}
 
 	for _, m := range page {
-		result.Messages = append(result.Messages, directMessageView(m))
+		var replyTo *protocol.ReferencedMessage
+		if m.ReplyToID != nil {
+			if target, ok := replies[*m.ReplyToID]; ok {
+				replyTo = referencedDMView(&target, *m.ReplyToID)
+			} else {
+				replyTo = referencedDMView(nil, *m.ReplyToID)
+			}
+		}
+		result.Messages = append(result.Messages, directMessageView(m, replyTo))
 	}
 	if len(page) > 0 {
 		result.HasMore, err = s.hub.st.HasDirectMessagesBefore(ctx, conversation.ID, page[0].ID)
@@ -142,7 +157,25 @@ func handleDMSend(ctx context.Context, s *Session, raw json.RawMessage) (any, *p
 	if err != nil {
 		return nil, internalError(s, "open the conversation", err)
 	}
-	created, err := s.hub.st.CreateDirectMessage(ctx, conversation.ID, s.UserID(), content)
+
+	var replyToID *int64
+	var replyTo *protocol.ReferencedMessage
+	if req.ReplyToID != nil && *req.ReplyToID > 0 {
+		target, err := s.hub.st.DirectMessageByID(ctx, *req.ReplyToID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, protocol.Errorf(protocol.ErrNotFound, "the message you are replying to does not exist")
+			}
+			return nil, internalError(s, "load reply target", err)
+		}
+		if target.ConversationID != conversation.ID {
+			return nil, protocol.Errorf(protocol.ErrBadRequest, "cannot reply to a message from another conversation")
+		}
+		replyToID = req.ReplyToID
+		replyTo = referencedDMView(&target, *req.ReplyToID)
+	}
+
+	created, err := s.hub.st.CreateDirectMessage(ctx, conversation.ID, s.UserID(), content, replyToID)
 	if err != nil {
 		return nil, internalError(s, "store the message", err)
 	}
@@ -154,7 +187,7 @@ func handleDMSend(ctx context.Context, s *Session, raw json.RawMessage) (any, *p
 		return nil, internalError(s, "store the message", err)
 	}
 
-	view := directMessageView(created)
+	view := directMessageView(created, replyTo)
 	own, failure := s.hub.deliverDirectMessage(ctx, s, conversation, view)
 	if failure != nil {
 		return nil, failure
@@ -231,7 +264,16 @@ func handleDMEdit(ctx context.Context, s *Session, raw json.RawMessage) (any, *p
 		return nil, internalError(s, "edit the message", err)
 	}
 
-	view := directMessageView(updated)
+	var replyTo *protocol.ReferencedMessage
+	if updated.ReplyToID != nil {
+		if target, err := s.hub.st.DirectMessageByID(ctx, *updated.ReplyToID); err == nil {
+			replyTo = referencedDMView(&target, *updated.ReplyToID)
+		} else {
+			replyTo = referencedDMView(nil, *updated.ReplyToID)
+		}
+	}
+
+	view := directMessageView(updated, replyTo)
 	s.hub.notifyBothSides(conversation, func(userID int64) protocol.Envelope {
 		return protocol.Event(protocol.EvDMUpdated, protocol.DMUpdatedEvent{
 			UserID:  conversation.PeerOf(userID),
@@ -415,7 +457,7 @@ func (h *Hub) conversationView(
 			return protocol.Conversation{}, internalError(s, "read the conversation", err)
 		}
 		if message, ok := previews[conversation.ID]; ok {
-			rendered := directMessageView(message)
+			rendered := directMessageView(message, nil)
 			view.LastMessage = &rendered
 		}
 	}
@@ -461,7 +503,7 @@ func (h *Hub) conversationViews(ctx context.Context, s *Session, userID int64) (
 			Unread:        unread[c.ID],
 		}
 		if message, ok := previews[c.ID]; ok {
-			rendered := directMessageView(message)
+			rendered := directMessageView(message, nil)
 			view.LastMessage = &rendered
 		}
 		out = append(out, view)

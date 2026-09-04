@@ -216,7 +216,7 @@ func TestHistoryPagesBackwards(t *testing.T) {
 	// why this writes through the store rather than the wire.
 	ctx := context.Background()
 	for i := range 12 {
-		if _, err := h.store.CreateMessage(ctx, channel.ID, nil, 1, string(rune('a'+i))); err != nil {
+		if _, err := h.store.CreateMessage(ctx, channel.ID, nil, 1, string(rune('a'+i)), nil); err != nil {
 			t.Fatalf("seed message %d: %v", i, err)
 		}
 	}
@@ -377,7 +377,7 @@ func TestMessagingNeedsSendMessages(t *testing.T) {
 
 	// Reading is governed by ViewChannel, not by SendMessages, so a muted
 	// member can still follow the conversation.
-	if _, err := h.store.CreateMessage(ctx, channel.ID, nil, ready.User.ID, "still readable"); err != nil {
+	if _, err := h.store.CreateMessage(ctx, channel.ID, nil, ready.User.ID, "still readable", nil); err != nil {
 		t.Fatalf("seed message: %v", err)
 	}
 	page := ok[protocol.MessageHistoryResult](guest, protocol.OpMessageHistory,
@@ -419,7 +419,7 @@ func TestMessagesAreHiddenWithTheirChannel(t *testing.T) {
 	admin, ready := h.admin("Admin")
 	channel := textChannel(t, ready)
 
-	sent, err := h.store.CreateMessage(ctx, channel.ID, nil, ready.User.ID, "secret")
+	sent, err := h.store.CreateMessage(ctx, channel.ID, nil, ready.User.ID, "secret", nil)
 	if err != nil {
 		t.Fatalf("seed message: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestDeletingAChannelTakesItsMessages(t *testing.T) {
 	admin, ready := h.admin("Admin")
 	channel := textChannel(t, ready)
 
-	sent, err := h.store.CreateMessage(ctx, channel.ID, nil, ready.User.ID, "doomed")
+	sent, err := h.store.CreateMessage(ctx, channel.ID, nil, ready.User.ID, "doomed", nil)
 	if err != nil {
 		t.Fatalf("seed message: %v", err)
 	}
@@ -469,4 +469,71 @@ func TestDeletingAChannelTakesItsMessages(t *testing.T) {
 	}
 }
 
+func TestMessageReplies(t *testing.T) {
+	h := newHarness(t, nil)
+
+	alice := h.dial()
+	aliceReady := alice.guest("Alice")
+	channel := textChannel(t, aliceReady)
+
+	bob := h.dial()
+	bob.guest("Bob")
+
+	first := ok[protocol.MessageEvent](alice, protocol.OpMessageSend,
+		protocol.MessageSendRequest{ChannelID: channel.ID, Content: "Hello world"})
+	if first.Message.ID == 0 {
+		t.Fatal("expected message ID")
+	}
+
+	// Bob replies to Alice's message.
+	reply := ok[protocol.MessageEvent](bob, protocol.OpMessageSend,
+		protocol.MessageSendRequest{
+			ChannelID: channel.ID,
+			Content:   "Hello Alice!",
+			ReplyToID: &first.Message.ID,
+		})
+
+	if reply.Message.ReplyToID == nil || *reply.Message.ReplyToID != first.Message.ID {
+		t.Fatalf("expected replyToId=%d, got %v", first.Message.ID, reply.Message.ReplyToID)
+	}
+	if reply.Message.ReplyTo == nil {
+		t.Fatal("expected replyTo snapshot")
+	}
+	if reply.Message.ReplyTo.Author != "Alice" || reply.Message.ReplyTo.Content != "Hello world" {
+		t.Fatalf("unexpected replyTo: %+v", reply.Message.ReplyTo)
+	}
+
+	// Cannot reply to non-existent message
+	bob.fails(protocol.OpMessageSend,
+		protocol.MessageSendRequest{
+			ChannelID: channel.ID,
+			Content:   "Ghost reply",
+			ReplyToID: ptr[int64](999999),
+		}, protocol.ErrNotFound)
+
+	// History returns the reply with snapshot
+	hist := ok[protocol.MessageHistoryResult](alice, protocol.OpMessageHistory,
+		protocol.MessageHistoryRequest{ChannelID: channel.ID})
+	if len(hist.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(hist.Messages))
+	}
+	if hist.Messages[1].ReplyTo == nil || hist.Messages[1].ReplyTo.Author != "Alice" {
+		t.Fatalf("expected history reply snapshot, got %+v", hist.Messages[1].ReplyTo)
+	}
+
+	// When original is deleted, replyTo reports Deleted: true
+	ok[protocol.MessageDeletedEvent](alice, protocol.OpMessageDelete,
+		protocol.MessageDeleteRequest{MessageID: first.Message.ID})
+
+	histAfter := ok[protocol.MessageHistoryResult](bob, protocol.OpMessageHistory,
+		protocol.MessageHistoryRequest{ChannelID: channel.ID})
+	if len(histAfter.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(histAfter.Messages))
+	}
+	if histAfter.Messages[0].ReplyTo == nil || !histAfter.Messages[0].ReplyTo.Deleted {
+		t.Fatalf("expected replyTo.Deleted=true, got %+v", histAfter.Messages[0].ReplyTo)
+	}
+}
+
 func ptr[T any](v T) *T { return &v }
+

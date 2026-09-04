@@ -605,7 +605,16 @@ func (s *Server) postWebhookMessage(ctx context.Context, wh store.Webhook, paylo
 		s.log.Debug("record webhook use", slog.Int64("webhook", wh.ID), slog.Any("error", err))
 	}
 
-	view := messageView(created, attachments)
+	var replyTo *protocol.ReferencedMessage
+	if created.ReplyToID != nil {
+		if target, err := s.st.MessageByID(ctx, *created.ReplyToID); err == nil {
+			replyTo = referencedMessageView(&target, *created.ReplyToID)
+		} else {
+			replyTo = referencedMessageView(nil, *created.ReplyToID)
+		}
+	}
+
+	view := messageView(created, attachments, replyTo)
 	s.hub.BroadcastChannelEvent(
 		protocol.Event(protocol.EvMessageCreated, protocol.MessageEvent{Message: view}),
 		created.ChannelID)
@@ -691,7 +700,15 @@ func (s *Server) handleWebhookMessageFetch(w http.ResponseWriter, r *http.Reques
 		writeDiscordError(w, http.StatusInternalServerError, 0, "500: Internal Server Error")
 		return
 	}
-	writeJSON(w, http.StatusOK, discordMessageView(r, messageView(existing, attachments), wh))
+	var replyTo *protocol.ReferencedMessage
+	if existing.ReplyToID != nil {
+		if target, err := s.st.MessageByID(r.Context(), *existing.ReplyToID); err == nil {
+			replyTo = referencedMessageView(&target, *existing.ReplyToID)
+		} else {
+			replyTo = referencedMessageView(nil, *existing.ReplyToID)
+		}
+	}
+	writeJSON(w, http.StatusOK, discordMessageView(r, messageView(existing, attachments, replyTo), wh))
 }
 
 // handleWebhookMessageEdit rewrites what a webhook posted.
@@ -777,7 +794,16 @@ func (s *Server) handleWebhookMessageEdit(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	view := messageView(updated, attachments)
+	var replyTo *protocol.ReferencedMessage
+	if updated.ReplyToID != nil {
+		if target, err := s.st.MessageByID(r.Context(), *updated.ReplyToID); err == nil {
+			replyTo = referencedMessageView(&target, *updated.ReplyToID)
+		} else {
+			replyTo = referencedMessageView(nil, *updated.ReplyToID)
+		}
+	}
+
+	view := messageView(updated, attachments, replyTo)
 	s.hub.BroadcastChannelEvent(
 		protocol.Event(protocol.EvMessageUpdated, protocol.MessageEvent{Message: view}),
 		updated.ChannelID)

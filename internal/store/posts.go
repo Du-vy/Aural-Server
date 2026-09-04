@@ -121,7 +121,7 @@ func (s *Store) CreatePost(ctx context.Context, p Post, content string) (Post, M
 			return fmt.Errorf("store: create post: %w", err)
 		}
 
-		bodyID, err = insertMessage(ctx, tx, p.ChannelID, &postID, *p.UserID, content, ts)
+		bodyID, err = insertMessage(ctx, tx, p.ChannelID, &postID, *p.UserID, content, nil, ts)
 		if err != nil {
 			return err
 		}

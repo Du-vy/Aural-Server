@@ -69,12 +69,15 @@ type DirectMessage struct {
 	Content   string
 	CreatedAt int64
 	EditedAt  *int64
+	// ReplyToID is set on a message that replies to another line in the same
+	// conversation. NULL is an ordinary message.
+	ReplyToID *int64
 }
 
 // The author is resolved live from the users table, exactly as it is for a
 // channel message, so a rename shows up throughout the conversation.
 const directMessageColumns = `m.id, m.conversation_id, m.user_id,
-	COALESCE(u.nickname, m.author), m.content, m.created_at, m.edited_at`
+	COALESCE(u.nickname, m.author), m.content, m.created_at, m.edited_at, m.reply_to_id`
 
 const directMessageFrom = ` FROM direct_messages m LEFT JOIN users u ON u.id = m.user_id`
 
@@ -94,7 +97,7 @@ func scanConversation(row interface{ Scan(...any) error }) (Conversation, error)
 
 func scanDirectMessage(row interface{ Scan(...any) error }) (DirectMessage, error) {
 	var m DirectMessage
-	err := row.Scan(&m.ID, &m.ConversationID, &m.UserID, &m.Author, &m.Content, &m.CreatedAt, &m.EditedAt)
+	err := row.Scan(&m.ID, &m.ConversationID, &m.UserID, &m.Author, &m.Content, &m.CreatedAt, &m.EditedAt, &m.ReplyToID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DirectMessage{}, ErrNotFound
 	}
@@ -176,14 +179,14 @@ func (s *Store) ConversationsFor(ctx context.Context, userID int64, limit int) (
 // It also moves the sender's own read marker to the message just written.
 // Without that, everything you send counts as something you have not read, and
 // a badge on your own conversation is the one thing it can never mean.
-func (s *Store) CreateDirectMessage(ctx context.Context, conversationID, userID int64, content string) (DirectMessage, error) {
+func (s *Store) CreateDirectMessage(ctx context.Context, conversationID, userID int64, content string, replyToID *int64) (DirectMessage, error) {
 	var created DirectMessage
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		ts := now()
 		res, err := tx.ExecContext(ctx,
-			`INSERT INTO direct_messages (conversation_id, user_id, author, content, created_at)
-			 VALUES (?, ?, (SELECT nickname FROM users WHERE id = ?), ?, ?)`,
-			conversationID, userID, userID, content, ts)
+			`INSERT INTO direct_messages (conversation_id, user_id, author, content, reply_to_id, created_at)
+			 VALUES (?, ?, (SELECT nickname FROM users WHERE id = ?), ?, ?, ?)`,
+			conversationID, userID, userID, content, replyToID, ts)
 		if err != nil {
 			return fmt.Errorf("store: create direct message: %w", err)
 		}
@@ -214,6 +217,46 @@ func (s *Store) CreateDirectMessage(ctx context.Context, conversationID, userID 
 func (s *Store) DirectMessageByID(ctx context.Context, id int64) (DirectMessage, error) {
 	return scanDirectMessage(s.db.QueryRowContext(ctx,
 		`SELECT `+directMessageColumns+directMessageFrom+` WHERE m.id = ?`, id))
+}
+
+// RepliesForDirectMessages loads the referenced direct messages for the given
+// reply IDs in a single query, returning them keyed by their own message ID.
+func (s *Store) RepliesForDirectMessages(ctx context.Context, replyIDs []int64) (map[int64]DirectMessage, error) {
+	if len(replyIDs) == 0 {
+		return map[int64]DirectMessage{}, nil
+	}
+	seen := make(map[int64]struct{}, len(replyIDs))
+	unique := make([]any, 0, len(replyIDs))
+	for _, id := range replyIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, exists := seen[id]; !exists {
+			seen[id] = struct{}{}
+			unique = append(unique, id)
+		}
+	}
+	if len(unique) == 0 {
+		return map[int64]DirectMessage{}, nil
+	}
+
+	query := fmt.Sprintf(`SELECT %s%s WHERE m.id IN (%s)`,
+		directMessageColumns, directMessageFrom, placeholders(len(unique)))
+	rows, err := s.db.QueryContext(ctx, query, unique...)
+	if err != nil {
+		return nil, fmt.Errorf("store: read reply direct messages: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[int64]DirectMessage, len(unique))
+	for rows.Next() {
+		m, err := scanDirectMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[m.ID] = m
+	}
+	return out, rows.Err()
 }
 
 // DirectMessagesBefore reads one page of a conversation, newest first. A zero

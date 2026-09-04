@@ -87,7 +87,24 @@ func handleMessageSend(ctx context.Context, s *Session, raw json.RawMessage) (an
 	}
 	content = verdict.Content
 
-	created, err := s.hub.st.CreateMessage(ctx, req.ChannelID, postID, s.UserID(), content)
+	var replyToID *int64
+	var replyTo *protocol.ReferencedMessage
+	if req.ReplyToID != nil && *req.ReplyToID > 0 {
+		target, err := s.hub.st.MessageByID(ctx, *req.ReplyToID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, protocol.Errorf(protocol.ErrNotFound, "the message you are replying to does not exist")
+			}
+			return nil, internalError(s, "load reply target", err)
+		}
+		if target.ChannelID != req.ChannelID {
+			return nil, protocol.Errorf(protocol.ErrBadRequest, "cannot reply to a message from another channel")
+		}
+		replyToID = req.ReplyToID
+		replyTo = referencedMessageView(&target, *req.ReplyToID)
+	}
+
+	created, err := s.hub.st.CreateMessage(ctx, req.ChannelID, postID, s.UserID(), content, replyToID)
 	if err != nil {
 		return nil, internalError(s, "store the message", err)
 	}
@@ -108,7 +125,7 @@ func handleMessageSend(ctx context.Context, s *Session, raw json.RawMessage) (an
 		return nil, internalError(s, "attach the files", err)
 	}
 
-	view := messageView(created, attachments)
+	view := messageView(created, attachments, replyTo)
 	s.hub.BroadcastChannelEvent(
 		protocol.Event(protocol.EvMessageCreated, protocol.MessageEvent{Message: view}),
 		created.ChannelID)
@@ -499,7 +516,16 @@ func handleMessageEdit(ctx context.Context, s *Session, raw json.RawMessage) (an
 		return nil, internalError(s, "edit the message", err)
 	}
 
-	view := messageView(updated, attachments)
+	var replyTo *protocol.ReferencedMessage
+	if updated.ReplyToID != nil {
+		if target, err := s.hub.st.MessageByID(ctx, *updated.ReplyToID); err == nil {
+			replyTo = referencedMessageView(&target, *updated.ReplyToID)
+		} else {
+			replyTo = referencedMessageView(nil, *updated.ReplyToID)
+		}
+	}
+
+	view := messageView(updated, attachments, replyTo)
 	s.hub.BroadcastChannelEvent(
 		protocol.Event(protocol.EvMessageUpdated, protocol.MessageEvent{Message: view}),
 		updated.ChannelID)
@@ -610,17 +636,38 @@ func reverse(page []store.Message) {
 // query serves the whole run, rather than one per message.
 func (s *Session) messageViews(ctx context.Context, page []store.Message, doing string) ([]protocol.Message, *protocol.Error) {
 	ids := make([]int64, 0, len(page))
+	var replyIDs []int64
 	for _, m := range page {
 		ids = append(ids, m.ID)
+		if m.ReplyToID != nil {
+			replyIDs = append(replyIDs, *m.ReplyToID)
+		}
 	}
 	attachments, err := s.hub.st.AttachmentsForMessages(ctx, ids)
 	if err != nil {
 		return nil, internalError(s, doing, err)
 	}
 
+	var replies map[int64]store.Message
+	if len(replyIDs) > 0 {
+		var err error
+		replies, err = s.hub.st.RepliesForMessages(ctx, replyIDs)
+		if err != nil {
+			return nil, internalError(s, doing, err)
+		}
+	}
+
 	views := make([]protocol.Message, 0, len(page))
 	for _, m := range page {
-		views = append(views, messageView(m, attachments[m.ID]))
+		var replyTo *protocol.ReferencedMessage
+		if m.ReplyToID != nil {
+			if target, ok := replies[*m.ReplyToID]; ok {
+				replyTo = referencedMessageView(&target, *m.ReplyToID)
+			} else {
+				replyTo = referencedMessageView(nil, *m.ReplyToID)
+			}
+		}
+		views = append(views, messageView(m, attachments[m.ID], replyTo))
 	}
 	return views, nil
 }

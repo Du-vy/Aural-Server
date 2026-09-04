@@ -633,6 +633,16 @@ func (r *discordRelay) deliverToAural(ctx context.Context, link store.RelayLink,
 
 	avatar := m.AvatarURL(relayAvatarSize)
 	source := protocol.MessageSourceDiscord
+	var replyToID *int64
+	var replyTo *protocol.ReferencedMessage
+	if m.Referenced != nil {
+		if pair, err := r.st.RelayMessageByDiscord(ctx, link.ID, m.Referenced.ID); err == nil {
+			replyToID = &pair.AuralID
+			if target, err := r.st.MessageByID(ctx, pair.AuralID); err == nil {
+				replyTo = referencedMessageView(&target, pair.AuralID)
+			}
+		}
+	}
 	created, err := r.st.CreateWebhookMessage(ctx, store.Message{
 		ChannelID:     link.ChannelID,
 		Author:        author,
@@ -641,6 +651,7 @@ func (r *discordRelay) deliverToAural(ctx context.Context, link store.RelayLink,
 		WebhookAvatar: &avatar,
 		WebhookSource: &source,
 		Embeds:        encoded,
+		ReplyToID:     replyToID,
 	})
 	if err != nil {
 		r.discardUploads(files)
@@ -667,7 +678,7 @@ func (r *discordRelay) deliverToAural(ctx context.Context, link store.RelayLink,
 		r.log.Warn("record what a relayed message is called on Discord", slog.Any("error", err))
 	}
 
-	view := messageView(created, attachments)
+	view := messageView(created, attachments, replyTo)
 	if view.Webhook != nil {
 		view.Webhook.Source = protocol.MessageSourceDiscord
 	}
@@ -791,7 +802,15 @@ func (r *discordRelay) applyDiscordEdit(ctx context.Context, link store.RelayLin
 	if err != nil {
 		return err
 	}
-	view := messageView(updated, attachments)
+	var replyTo *protocol.ReferencedMessage
+	if updated.ReplyToID != nil {
+		if target, err := r.st.MessageByID(ctx, *updated.ReplyToID); err == nil {
+			replyTo = referencedMessageView(&target, *updated.ReplyToID)
+		} else {
+			replyTo = referencedMessageView(nil, *updated.ReplyToID)
+		}
+	}
+	view := messageView(updated, attachments, replyTo)
 	if view.Webhook != nil {
 		view.Webhook.Source = protocol.MessageSourceDiscord
 	}

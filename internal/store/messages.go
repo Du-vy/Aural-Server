@@ -22,6 +22,9 @@ type Message struct {
 	Content   string
 	CreatedAt int64
 	EditedAt  *int64
+	// ReplyToID is set on a message that replies to another message in the same
+	// channel. NULL is an ordinary message.
+	ReplyToID *int64
 	// WebhookID names the webhook that posted the message, and is nil for
 	// everything a person wrote. It is not a foreign key: deleting a webhook
 	// revokes its URL and leaves the history it produced exactly as it was.
@@ -44,14 +47,14 @@ type Message struct {
 // messages, which matches the identity model: the row is the person.
 const messageColumns = `m.id, m.channel_id, m.post_id, m.user_id,
 	COALESCE(u.nickname, m.author), m.content, m.created_at, m.edited_at,
-	m.webhook_id, m.webhook_avatar, m.webhook_source, m.embeds`
+	m.webhook_id, m.webhook_avatar, m.webhook_source, m.embeds, m.reply_to_id`
 
 const messageFrom = ` FROM messages m LEFT JOIN users u ON u.id = m.user_id`
 
 func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 	var m Message
 	err := row.Scan(&m.ID, &m.ChannelID, &m.PostID, &m.UserID, &m.Author, &m.Content,
-		&m.CreatedAt, &m.EditedAt, &m.WebhookID, &m.WebhookAvatar, &m.WebhookSource, &m.Embeds)
+		&m.CreatedAt, &m.EditedAt, &m.WebhookID, &m.WebhookAvatar, &m.WebhookSource, &m.Embeds, &m.ReplyToID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, ErrNotFound
 	}
@@ -71,11 +74,11 @@ type execer interface {
 // insertMessage writes one message row and returns its id. postID is nil for a
 // line of a text channel and set for the body or a comment of a post.
 func insertMessage(ctx context.Context, q execer, channelID int64, postID *int64,
-	userID int64, content string, ts int64) (int64, error) {
+	userID int64, content string, replyToID *int64, ts int64) (int64, error) {
 	res, err := q.ExecContext(ctx,
-		`INSERT INTO messages (channel_id, post_id, user_id, author, content, search_text, created_at)
-		 VALUES (?, ?, ?, (SELECT nickname FROM users WHERE id = ?), ?, ?, ?)`,
-		channelID, postID, userID, userID, content, foldForSearch(content), ts)
+		`INSERT INTO messages (channel_id, post_id, user_id, author, content, search_text, reply_to_id, created_at)
+		 VALUES (?, ?, ?, (SELECT nickname FROM users WHERE id = ?), ?, ?, ?, ?)`,
+		channelID, postID, userID, userID, content, foldForSearch(content), replyToID, ts)
 	if err != nil {
 		return 0, fmt.Errorf("store: create message: %w", err)
 	}
@@ -90,8 +93,8 @@ func insertMessage(ctx context.Context, q execer, channelID int64, postID *int64
 // non-nil postID makes it a comment on that post rather than a line of the
 // channel timeline.
 func (s *Store) CreateMessage(ctx context.Context, channelID int64, postID *int64,
-	userID int64, content string) (Message, error) {
-	id, err := insertMessage(ctx, s.db, channelID, postID, userID, content, now())
+	userID int64, content string, replyToID *int64) (Message, error) {
+	id, err := insertMessage(ctx, s.db, channelID, postID, userID, content, replyToID, now())
 	if err != nil {
 		return Message{}, err
 	}
@@ -108,10 +111,10 @@ func (s *Store) CreateWebhookMessage(ctx context.Context, m Message) (Message, e
 	ts := now()
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO messages (channel_id, user_id, author, content, search_text,
-			created_at, webhook_id, webhook_avatar, webhook_source, embeds)
-		 VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			created_at, webhook_id, webhook_avatar, webhook_source, embeds, reply_to_id)
+		 VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ChannelID, m.Author, m.Content, foldForSearch(m.Content), ts,
-		m.WebhookID, m.WebhookAvatar, m.WebhookSource, m.Embeds)
+		m.WebhookID, m.WebhookAvatar, m.WebhookSource, m.Embeds, m.ReplyToID)
 	if err != nil {
 		return Message{}, fmt.Errorf("store: create webhook message: %w", err)
 	}
@@ -142,6 +145,46 @@ func (s *Store) UpdateWebhookMessage(ctx context.Context, id int64, content stri
 func (s *Store) MessageByID(ctx context.Context, id int64) (Message, error) {
 	return scanMessage(s.db.QueryRowContext(ctx,
 		`SELECT `+messageColumns+messageFrom+` WHERE m.id = ?`, id))
+}
+
+// RepliesForMessages loads the referenced messages for the given reply IDs in a
+// single query, returning them keyed by their own message ID.
+func (s *Store) RepliesForMessages(ctx context.Context, replyIDs []int64) (map[int64]Message, error) {
+	if len(replyIDs) == 0 {
+		return map[int64]Message{}, nil
+	}
+	seen := make(map[int64]struct{}, len(replyIDs))
+	unique := make([]any, 0, len(replyIDs))
+	for _, id := range replyIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, exists := seen[id]; !exists {
+			seen[id] = struct{}{}
+			unique = append(unique, id)
+		}
+	}
+	if len(unique) == 0 {
+		return map[int64]Message{}, nil
+	}
+
+	query := fmt.Sprintf(`SELECT %s%s WHERE m.id IN (%s)`,
+		messageColumns, messageFrom, placeholders(len(unique)))
+	rows, err := s.db.QueryContext(ctx, query, unique...)
+	if err != nil {
+		return nil, fmt.Errorf("store: read reply messages: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[int64]Message, len(unique))
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[m.ID] = m
+	}
+	return out, rows.Err()
 }
 
 // MessagesBefore reads one page of a channel's history, newest first.

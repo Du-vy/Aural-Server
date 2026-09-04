@@ -97,10 +97,41 @@ func rsvpView(counts store.PostRSVPCounts, own string) protocol.PostRSVPSummary 
 	}
 }
 
+func referencedMessageView(m *store.Message, targetID int64) *protocol.ReferencedMessage {
+	if m == nil {
+		return &protocol.ReferencedMessage{
+			ID:      targetID,
+			Deleted: true,
+		}
+	}
+	return &protocol.ReferencedMessage{
+		ID:        m.ID,
+		ChannelID: m.ChannelID,
+		UserID:    m.UserID,
+		Author:    m.Author,
+		Content:   m.Content,
+	}
+}
+
+func referencedDMView(m *store.DirectMessage, targetID int64) *protocol.ReferencedMessage {
+	if m == nil {
+		return &protocol.ReferencedMessage{
+			ID:      targetID,
+			Deleted: true,
+		}
+	}
+	return &protocol.ReferencedMessage{
+		ID:      m.ID,
+		UserID:  m.UserID,
+		Author:  m.Author,
+		Content: m.Content,
+	}
+}
+
 // messageView converts a stored message and the files it carries into the wire
 // form. A message with no files carries an absent field rather than an empty
 // list, which keeps the common frame the size it has always been.
-func messageView(m store.Message, attachments []store.Attachment) protocol.Message {
+func messageView(m store.Message, attachments []store.Attachment, replyTo *protocol.ReferencedMessage) protocol.Message {
 	out := protocol.Message{
 		ID:        m.ID,
 		ChannelID: m.ChannelID,
@@ -110,6 +141,8 @@ func messageView(m store.Message, attachments []store.Attachment) protocol.Messa
 		Content:   m.Content,
 		CreatedAt: m.CreatedAt,
 		EditedAt:  m.EditedAt,
+		ReplyToID: m.ReplyToID,
+		ReplyTo:   replyTo,
 		Embeds:    decodeEmbeds(m.Embeds),
 	}
 	if m.WebhookID != nil {
@@ -175,7 +208,7 @@ func webhookView(wh store.Webhook) protocol.Webhook {
 // It carries no attachments because a private conversation carries no files:
 // an upload is bound to the channel it was made for, and there is no channel
 // here to bind one to.
-func directMessageView(m store.DirectMessage) protocol.DirectMessage {
+func directMessageView(m store.DirectMessage, replyTo *protocol.ReferencedMessage) protocol.DirectMessage {
 	return protocol.DirectMessage{
 		ID:             m.ID,
 		ConversationID: m.ConversationID,
@@ -184,6 +217,8 @@ func directMessageView(m store.DirectMessage) protocol.DirectMessage {
 		Content:        m.Content,
 		CreatedAt:      m.CreatedAt,
 		EditedAt:       m.EditedAt,
+		ReplyToID:      m.ReplyToID,
+		ReplyTo:        replyTo,
 	}
 }
 

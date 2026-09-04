@@ -585,6 +585,11 @@ var migrations = []string{
 	WHERE id IN (SELECT aural_id FROM relay_messages WHERE origin = 'discord')
 	   OR (webhook_id IS NOT NULL AND webhook_id IN (SELECT source_webhook_id FROM relay_links WHERE source_webhook_id IS NOT NULL));
 	`,
+	// 16: message replies.
+	`
+	ALTER TABLE messages ADD COLUMN reply_to_id INTEGER;
+	ALTER TABLE direct_messages ADD COLUMN reply_to_id INTEGER;
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

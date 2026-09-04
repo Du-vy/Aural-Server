@@ -306,3 +306,40 @@ func TestServerCanCarryNoPrivateMessages(t *testing.T) {
 		protocol.DMSendRequest{UserID: bobReady.User.ID, Content: "hello"}, protocol.ErrDMDisabled)
 	alice.fails(protocol.OpDMList, protocol.DMListRequest{}, protocol.ErrDMDisabled)
 }
+
+func TestDirectMessageReplies(t *testing.T) {
+	h := newHarness(t, nil)
+
+	alice := h.dial()
+	aliceReady := alice.guest("Alice")
+	bob := h.dial()
+	bobReady := bob.guest("Bob")
+
+	first := ok[protocol.DMCreatedEvent](alice, protocol.OpDMSend,
+		protocol.DMSendRequest{UserID: bobReady.User.ID, Content: "Private message"})
+
+	reply := ok[protocol.DMCreatedEvent](bob, protocol.OpDMSend,
+		protocol.DMSendRequest{
+			UserID:    aliceReady.User.ID,
+			Content:   "Private reply",
+			ReplyToID: &first.Message.ID,
+		})
+
+	if reply.Message.ReplyToID == nil || *reply.Message.ReplyToID != first.Message.ID {
+		t.Fatalf("expected replyToId=%d, got %v", first.Message.ID, reply.Message.ReplyToID)
+	}
+	if reply.Message.ReplyTo == nil || reply.Message.ReplyTo.Content != "Private message" {
+		t.Fatalf("unexpected DM replyTo snapshot: %+v", reply.Message.ReplyTo)
+	}
+
+	// History returns DM with snapshot
+	hist := ok[protocol.DMHistoryResult](alice, protocol.OpDMHistory,
+		protocol.DMHistoryRequest{UserID: bobReady.User.ID})
+	if len(hist.Messages) != 2 {
+		t.Fatalf("expected 2 DMs, got %d", len(hist.Messages))
+	}
+	if hist.Messages[1].ReplyTo == nil || hist.Messages[1].ReplyTo.Content != "Private message" {
+		t.Fatalf("expected DM reply snapshot in history, got %+v", hist.Messages[1].ReplyTo)
+	}
+}
+

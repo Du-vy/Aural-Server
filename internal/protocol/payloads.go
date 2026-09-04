@@ -303,6 +303,16 @@ type Role struct {
 // message is very often somebody the client has never seen. It is resolved
 // server-side from the users table, so a rename shows up throughout the
 // history rather than only on new messages.
+// ReferencedMessage is a snapshot of the message a reply points at.
+type ReferencedMessage struct {
+	ID        int64  `json:"id"`
+	ChannelID int64  `json:"channelId,omitempty"`
+	UserID    *int64 `json:"userId,omitempty"`
+	Author    string `json:"author"`
+	Content   string `json:"content"`
+	Deleted   bool   `json:"deleted,omitempty"`
+}
+
 type Message struct {
 	ID        int64  `json:"id"`
 	ChannelID int64  `json:"channelId"`
@@ -316,6 +326,11 @@ type Message struct {
 	Content   string `json:"content"`
 	CreatedAt int64  `json:"createdAt"`
 	EditedAt  *int64 `json:"editedAt"`
+	// ReplyToID is the id of the message this one replies to, or absent.
+	ReplyToID *int64 `json:"replyToId,omitempty"`
+	// ReplyTo carries the referenced message snapshot, so a client has what
+	// it needs to render the preview banner without a second round trip.
+	ReplyTo *ReferencedMessage `json:"replyTo,omitempty"`
 	// Attachments are the files posted with the message. They live and die
 	// with it: deleting the message deletes the files.
 	Attachments []Attachment `json:"attachments,omitempty"`
@@ -507,13 +522,15 @@ type EmbedField struct {
 // the other, never to both, and a shared type would carry an empty half
 // through every frame.
 type DirectMessage struct {
-	ID             int64  `json:"id"`
-	ConversationID int64  `json:"conversationId"`
-	UserID         *int64 `json:"userId"` // nil once an author's account is gone
-	Author         string `json:"author"`
-	Content        string `json:"content"`
-	CreatedAt      int64  `json:"createdAt"`
-	EditedAt       *int64 `json:"editedAt"`
+	ID             int64              `json:"id"`
+	ConversationID int64              `json:"conversationId"`
+	UserID         *int64             `json:"userId"` // nil once an author's account is gone
+	Author         string             `json:"author"`
+	Content        string             `json:"content"`
+	CreatedAt      int64              `json:"createdAt"`
+	EditedAt       *int64             `json:"editedAt"`
+	ReplyToID      *int64             `json:"replyToId,omitempty"`
+	ReplyTo        *ReferencedMessage `json:"replyTo,omitempty"`
 }
 
 // Conversation is one private thread as it looks to one of the two people in
@@ -809,6 +826,8 @@ type MessageSendRequest struct {
 	// comment is a message in that channel, visible to exactly the people the
 	// channel is.
 	PostID int64 `json:"postId,omitempty"`
+	// ReplyToID replies to another message in the same channel.
+	ReplyToID *int64 `json:"replyToId,omitempty"`
 	// Attachments are the ids returned by POST /upload. A message may carry
 	// files with no text of its own, which is the one case where empty content
 	// is accepted.
@@ -965,8 +984,9 @@ type DMHistoryResult struct {
 // DMSendRequest writes to one person, opening the conversation if this is the
 // first thing either of them has said to the other.
 type DMSendRequest struct {
-	UserID  int64  `json:"userId"`
-	Content string `json:"content"`
+	UserID    int64  `json:"userId"`
+	Content   string `json:"content"`
+	ReplyToID *int64 `json:"replyToId,omitempty"`
 }
 
 type DMEditRequest struct {

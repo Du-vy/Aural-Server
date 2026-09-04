@@ -117,7 +117,7 @@ func handlePostCreate(ctx context.Context, s *Session, raw json.RawMessage) (any
 		return nil, internalError(s, "attach the files", err)
 	}
 
-	bodyView := messageView(body, attachments)
+	bodyView := messageView(body, attachments, nil)
 	view := postView(created, &bodyView, store.PostStats{}, store.PostRSVPCounts{}, "")
 	// The tallies are empty and nobody has answered, so this frame is the same
 	// for everybody and can go out as it stands.
