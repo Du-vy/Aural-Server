@@ -11,6 +11,7 @@ import (
 
 	"github.com/aural-chat/aural-server/internal/config"
 	"github.com/aural-chat/aural-server/internal/discord"
+	"github.com/aural-chat/aural-server/internal/protocol"
 	"github.com/aural-chat/aural-server/internal/store"
 )
 
@@ -301,5 +302,47 @@ func TestRelayCacheAndQueuesSurviveConcurrentUse(t *testing.T) {
 	}
 	if delivered.Load() == 0 {
 		t.Fatal("no queued delivery ever ran")
+	}
+}
+
+// TestSanitiseEmbedsKeepsTheKindDiscordUnfurled checks that what Discord made
+// of a link survives into what a client is told.
+//
+// The kind is the whole of the difference between a picture and a card with a
+// picture in the corner of it, and between a video that plays here and a still
+// that does not. A sender's own word for it is not taken beyond the three
+// kinds a client draws differently.
+func TestSanitiseEmbedsKeepsTheKindDiscordUnfurled(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"a bare picture", "image", "image"},
+		{"a looping clip", "gifv", "gifv"},
+		{"a video page", "video", "video"},
+		{"a card an application composed", "rich", "rich"},
+		{"an article", "article", "rich"},
+		{"a kind nobody has heard of", "interstellar", "rich"},
+		{"none given at all", "", "rich"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			out := sanitiseEmbeds([]protocol.Embed{{
+				Type:      tc.in,
+				URL:       "https://example.com/a",
+				Thumbnail: &protocol.EmbedMedia{URL: "https://example.com/a.jpg"},
+			}})
+			if len(out) != 1 {
+				t.Fatalf("embeds: got %d, want 1", len(out))
+			}
+			if out[0].Type != tc.want {
+				t.Fatalf("type: got %q, want %q", out[0].Type, tc.want)
+			}
+		})
 	}
 }

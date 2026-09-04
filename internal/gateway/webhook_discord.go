@@ -218,7 +218,7 @@ func sanitiseEmbeds(in []protocol.Embed) []protocol.Embed {
 			URL:         safeURL(e.URL),
 			Timestamp:   cleanText(e.Timestamp),
 			Color:       clampColor(e.Color),
-			Type:        "rich",
+			Type:        embedKind(e.Type),
 		}
 		if e.Footer != nil && strings.TrimSpace(e.Footer.Text) != "" {
 			clean.Footer = &protocol.EmbedFooter{
@@ -267,6 +267,24 @@ func sanitiseEmbeds(in []protocol.Embed) []protocol.Embed {
 		return nil
 	}
 	return out
+}
+
+// embedKind narrows what a card says it is to the kinds a client draws
+// differently.
+//
+// Discord sets this itself on a link it unfurled — "image" on a bare picture,
+// "gifv" on a Tenor loop, "video" on a YouTube page — and the difference is
+// the whole of how it is drawn: a picture posted as a link is the picture, not
+// a card with the picture tucked in the corner of it. Anything else, including
+// every embed an application composes for a webhook, is a card.
+func embedKind(raw string) string {
+	kind := strings.ToLower(strings.TrimSpace(raw))
+	switch kind {
+	case "image", "gifv", "video":
+		return kind
+	default:
+		return "rich"
+	}
 }
 
 func sanitiseEmbedMedia(m *protocol.EmbedMedia) *protocol.EmbedMedia {

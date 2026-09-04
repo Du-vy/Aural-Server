@@ -1098,6 +1098,13 @@ description, 25 fields of 256 and 1024, a 2048-character footer and a
 256-character author name. `color` is a 24-bit RGB integer. Descriptions and
 field values are Markdown.
 
+`type` says what a card is, and is `"rich"` — an application's own card — for
+everything but the three kinds a client draws differently: `"image"` for a
+picture posted as a link, `"gifv"` for a looping clip, and `"video"` for a page
+that plays one. The relay carries Discord's own word for these across, since it
+is the difference between a picture and a card with a picture tucked in the
+corner of it. Any other value a sender writes becomes `"rich"`.
+
 
 ## Events
 
