@@ -87,6 +87,10 @@ func handleMessageSend(ctx context.Context, s *Session, raw json.RawMessage) (an
 	}
 	content = verdict.Content
 
+	// A reply may only point at a message in the same run as the one being
+	// written: the same channel timeline, or the same post's comments. The
+	// preview a client draws is a link into the list it is already reading,
+	// and a reference out of that list is one it can never follow.
 	var replyToID *int64
 	var replyTo *protocol.ReferencedMessage
 	if req.ReplyToID != nil && *req.ReplyToID > 0 {
@@ -97,8 +101,9 @@ func handleMessageSend(ctx context.Context, s *Session, raw json.RawMessage) (an
 			}
 			return nil, internalError(s, "load reply target", err)
 		}
-		if target.ChannelID != req.ChannelID {
-			return nil, protocol.Errorf(protocol.ErrBadRequest, "cannot reply to a message from another channel")
+		if target.ChannelID != req.ChannelID || !samePost(target.PostID, postID) {
+			return nil, protocol.Errorf(protocol.ErrBadRequest,
+				"cannot reply to a message from somewhere else")
 		}
 		replyToID = req.ReplyToID
 		replyTo = referencedMessageView(&target, *req.ReplyToID)
@@ -516,16 +521,7 @@ func handleMessageEdit(ctx context.Context, s *Session, raw json.RawMessage) (an
 		return nil, internalError(s, "edit the message", err)
 	}
 
-	var replyTo *protocol.ReferencedMessage
-	if updated.ReplyToID != nil {
-		if target, err := s.hub.st.MessageByID(ctx, *updated.ReplyToID); err == nil {
-			replyTo = referencedMessageView(&target, *updated.ReplyToID)
-		} else {
-			replyTo = referencedMessageView(nil, *updated.ReplyToID)
-		}
-	}
-
-	view := messageView(updated, attachments, replyTo)
+	view := messageView(updated, attachments, resolveMessageReply(ctx, s.hub.st, updated.ReplyToID))
 	s.hub.BroadcastChannelEvent(
 		protocol.Event(protocol.EvMessageUpdated, protocol.MessageEvent{Message: view}),
 		updated.ChannelID)
@@ -622,6 +618,15 @@ func dedupe(ids []int64) []int64 {
 		out = append(out, id)
 	}
 	return out
+}
+
+// samePost reports whether two messages belong to the same run: both lines of
+// a channel timeline, or both comments on the same post.
+func samePost(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 // reverse flips a page in place, which is how a query that walked the index

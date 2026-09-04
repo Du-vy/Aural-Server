@@ -87,6 +87,12 @@ func handleDMHistory(ctx context.Context, s *Session, raw json.RawMessage) (any,
 		page, err = s.hub.st.DirectMessagesBefore(ctx, conversation.ID, req.Before, limit)
 		reverseDirect(page)
 	}
+	if err != nil {
+		return nil, internalError(s, "read the conversation", err)
+	}
+
+	// The lines a reply points at are read as one query for the whole page,
+	// rather than one per reply.
 	var replyIDs []int64
 	for _, m := range page {
 		if m.ReplyToID != nil {
@@ -95,7 +101,10 @@ func handleDMHistory(ctx context.Context, s *Session, raw json.RawMessage) (any,
 	}
 	var replies map[int64]store.DirectMessage
 	if len(replyIDs) > 0 {
-		replies, _ = s.hub.st.RepliesForDirectMessages(ctx, replyIDs)
+		replies, err = s.hub.st.RepliesForDirectMessages(ctx, replyIDs)
+		if err != nil {
+			return nil, internalError(s, "read the conversation", err)
+		}
 	}
 
 	for _, m := range page {
@@ -264,16 +273,7 @@ func handleDMEdit(ctx context.Context, s *Session, raw json.RawMessage) (any, *p
 		return nil, internalError(s, "edit the message", err)
 	}
 
-	var replyTo *protocol.ReferencedMessage
-	if updated.ReplyToID != nil {
-		if target, err := s.hub.st.DirectMessageByID(ctx, *updated.ReplyToID); err == nil {
-			replyTo = referencedDMView(&target, *updated.ReplyToID)
-		} else {
-			replyTo = referencedDMView(nil, *updated.ReplyToID)
-		}
-	}
-
-	view := directMessageView(updated, replyTo)
+	view := directMessageView(updated, resolveDMReply(ctx, s.hub.st, updated.ReplyToID))
 	s.hub.notifyBothSides(conversation, func(userID int64) protocol.Envelope {
 		return protocol.Event(protocol.EvDMUpdated, protocol.DMUpdatedEvent{
 			UserID:  conversation.PeerOf(userID),

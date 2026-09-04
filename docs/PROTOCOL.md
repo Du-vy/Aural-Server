@@ -341,6 +341,9 @@ member.
   "content": "Hello",
   "createdAt": 1756600000, // Unix seconds
   "editedAt": null,
+  // Both absent unless the message answers another. See Replies.
+  "replyToId": 11,
+  "replyTo": { /* ReferencedMessage */ },
   "attachments": [],       // absent when the message carries no files
   // Both absent on everything a person wrote. See Webhooks.
   "webhook": { "id": 3, "avatar": "https://..." },
@@ -370,7 +373,21 @@ member.
   "author": "Pablo",       // resolved live, exactly as on Message
   "content": "hello",
   "createdAt": 1756600000,
-  "editedAt": null
+  "editedAt": null,
+  "replyToId": 3,          // both absent unless it answers another line
+  "replyTo": { /* ReferencedMessage */ }
+}
+
+// ReferencedMessage — the message a reply answers, as much of it as the
+// one-line preview above the reply needs. `content` is cut to 512 characters.
+{
+  "id": 11,
+  "channelId": 2,          // absent in a private conversation
+  "userId": 4,             // null once the author's account is gone
+  "author": "Pablo",
+  "content": "the question",
+  "deleted": true          // absent unless the message it names is gone, in
+                           // which case author and content are empty
 }
 
 // Conversation — one private thread, as it looks to one of the two in it
@@ -601,14 +618,14 @@ Every op below needs an authenticated session.
 | `post.update` | Author for `title` and `event`; `ManageMessages` for `locked` and `pinned` | `{ postId, title?, locked?, pinned?, event? }`. The body is a message: it is edited through `message.edit`. |
 | `post.delete` | Author, or `ManageMessages` on the channel | `{ postId }`. Takes the whole thread, and its files, with it. |
 | `post.rsvp` | `ViewChannel` on the channel | `{ postId, response }`. `going`, `maybe`, `declined`, or `""` to withdraw. Calendar posts only, and not on a locked one. |
-| `message.send` | `SendMessages`, plus `AttachFiles` to carry files | `{ channelId, content, postId?, attachments? }`. Without `postId`, a text channel only. With one, a comment on that post, which must be in the channel named and must not be locked. Rate limited. |
+| `message.send` | `SendMessages`, plus `AttachFiles` to carry files | `{ channelId, content, postId?, attachments?, replyToId? }`. Without `postId`, a text channel only. With one, a comment on that post, which must be in the channel named and must not be locked. `replyToId` must name a message in the same run — the same channel timeline, or the same post's comments — and is `bad_request` otherwise, `not_found` when there is no such message. Rate limited. |
 | `message.history` | `ViewChannel` on the channel | `{ channelId, postId?, before?, after?, around?, limit? }`. One cursor at a time; `limit` defaults to 50, capped at 100. With `postId`, reads that post's comments, `before` only, and the body is not among them. |
 | `message.search` | `ViewChannel`, per channel | `{ query?, channelIds?, authorIds?, has?, after?, before?, sort?, limit?, offset? }`. Runs only over the channels the caller may read. Rate limited. |
 | `message.edit` | Author only | `{ messageId, content }`. |
 | `message.delete` | Author, or `ManageMessages` on the channel | `{ messageId }`. Refused for the body of a post: `post.delete` is the act that was meant. |
 | `dm.list` | — | `{}`. Every private conversation you are in, newest first. |
 | `dm.history` | — | `{ userId, before?, after?, around?, limit? }`. Cursors work as in `message.history`. A thread that does not exist yet returns `conversationId: 0` and no messages. |
-| `dm.send` | `SendDirectMessages`, plus both privacy settings | `{ userId, content }`. Opens the conversation if it is the first thing either has said. Rate limited on the same bucket as `message.send`. |
+| `dm.send` | `SendDirectMessages`, plus both privacy settings | `{ userId, content, replyToId? }`. Opens the conversation if it is the first thing either has said. `replyToId` must name a line of that same conversation. Rate limited on the same bucket as `message.send`. |
 | `dm.edit` | Author only | `{ messageId, content }`. |
 | `dm.delete` | Author only | `{ messageId }`. There is no moderator in a private conversation. |
 | `dm.read` | — | `{ userId, messageId }`. Moves your own read marker; it never moves backwards. |
@@ -1140,6 +1157,36 @@ the `voice.connect` reply, both of which are behind an identity.
 | `voice_disabled` | This server carries no audio. |
 | `voice_failed` | The media session could not be set up. |
 
+## Replies
+
+A message may answer another one. `replyToId` on `message.send` and `dm.send`
+names what is being answered, and the message that comes back carries it along
+with `replyTo`: a **ReferencedMessage**, which is the snapshot a client draws
+the line above a reply from.
+
+The snapshot travels with the reply rather than being fetched, so a page of
+history is one round trip however many replies are in it. It is cut to a
+preview's worth of the message it names — 512 characters — because one line is
+all anything renders of it.
+
+- **A reply stays inside its own run.** The target must be in the same channel
+  timeline, or under the same post, or in the same private conversation. A
+  reference out of the list the reader is holding is one they could never
+  follow, so it is refused with `bad_request` rather than stored.
+- **A reply outlives what it answered.** Deleting a message leaves every reply
+  to it standing; the reference comes back with `deleted: true` and an empty
+  author and content. It is marked rather than dropped, because the reply still
+  says it was an answer to something.
+- **Nothing is chained.** `replyTo` carries no `replyTo` of its own. One step
+  back is what a preview shows, and a chain would grow the frame without
+  bound.
+- **A reply reaches the person it answers.** There is nothing on the wire for
+  this — the protocol has no notion of a notification, and a mention is a
+  convention over the words rather than a field. A client reads `replyTo.userId`
+  and treats a reply to that person the way it treats their name written out:
+  the row is marked, the badge counts as a mention, and it is worth a toast.
+  Answering yourself reaches nobody.
+
 ## Search
 
 `message.search` looks through the history of every channel the caller may read.
@@ -1439,8 +1486,12 @@ flight has to be dropped after the bridge stops relaying.
 
 ### What crosses
 
-Text, files, embeds, edits and deletions, each way. A reply becomes a one-line
-quote of what it answers, since there is nothing to hang a thread off here.
+Text, files, embeds, edits, deletions and replies, each way. A Discord reply
+whose message this server already holds arrives as a reply, and is drawn as
+one. Everything else becomes a one-line quote of what it answers: a reply to
+something written before the bridge existed has nothing here to point at, and a
+reply crossing the other way has to be a quote because a webhook cannot post a
+Discord reply at all.
 Discord's `<@id>`, `<@&id>`, `<#id>`, `<:name:id>` and `<t:unix>` are resolved to
 the names and dates a reader would have seen, because a mention here is the name
 it names rather than an id beside one — see the header of `src/lib/mentions.ts`.

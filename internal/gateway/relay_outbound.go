@@ -127,6 +127,9 @@ func (r *discordRelay) deliverToDiscord(ctx context.Context, link store.RelayLin
 	if strings.TrimSpace(content) == "" && len(files) == 0 {
 		return nil
 	}
+	// The quote goes on after the emptiness check, so a message that had
+	// nothing to send stays unsent rather than crossing as a bare header.
+	content = r.outboundReplyQuote(ctx, m) + content
 	content = discord.TruncateRunes(content, maxMessageRunes)
 
 	out := discord.OutboundMessage{
@@ -158,6 +161,32 @@ func (r *discordRelay) deliverToDiscord(ctx context.Context, link store.RelayLin
 	return nil
 }
 
+// outboundReplyQuote renders the header a reply crosses with, or "" for a
+// message that answers nothing.
+//
+// A webhook cannot post a Discord reply: Execute carries no message_reference,
+// and the bridge writes as a webhook by design. So a reply crosses as the same
+// one-line quote the inbound half writes when it has no reply to carry either,
+// and a thread reads the same from both sides. Without it an answer lands on
+// Discord with nothing saying what it answers.
+func (r *discordRelay) outboundReplyQuote(ctx context.Context, m store.Message) string {
+	if m.ReplyToID == nil {
+		return ""
+	}
+	target, err := r.st.MessageByID(ctx, *m.ReplyToID)
+	if err != nil {
+		// The message it answered is gone. The reply is still worth sending;
+		// there is just nothing left to name.
+		return ""
+	}
+	author := discord.EscapeOutbound(oneLine(target.Author))
+	quoted := discord.TruncateRunes(discord.EscapeOutbound(oneLine(target.Content)), quotedReplyRunes)
+	if quoted == "" {
+		return fmt.Sprintf("> replying to %s\n", author)
+	}
+	return fmt.Sprintf("> %s: %s\n", author, quoted)
+}
+
 // pushEdit rewrites the Discord copy of a message edited here.
 func (r *discordRelay) pushEdit(ctx context.Context, link store.RelayLink, m store.Message) error {
 	pair, err := r.st.RelayMessageByAural(ctx, m.ID)
@@ -170,13 +199,16 @@ func (r *discordRelay) pushEdit(ctx context.Context, link store.RelayLink, m sto
 		return nil
 	}
 
-	content := discord.TruncateRunes(discord.EscapeOutbound(m.Content), maxMessageRunes)
+	content := discord.EscapeOutbound(m.Content)
 	if strings.TrimSpace(content) == "" {
 		// Discord refuses an empty message, and a message here can be nothing
 		// but its files. Leaving the copy as it was is better than deleting
 		// what somebody edited rather than removed.
 		return nil
 	}
+	// The copy keeps the header the reply crossed with: an edit changes what
+	// was said, not what it was said in answer to.
+	content = discord.TruncateRunes(r.outboundReplyQuote(ctx, m)+content, maxMessageRunes)
 
 	err = r.restClient().Edit(ctx, link.WebhookID, link.WebhookToken, pair.DiscordID,
 		discord.OutboundMessage{Content: content})

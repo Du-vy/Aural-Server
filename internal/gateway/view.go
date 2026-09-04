@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"net/url"
 	"strconv"
@@ -97,6 +98,16 @@ func rsvpView(counts store.PostRSVPCounts, own string) protocol.PostRSVPSummary 
 	}
 }
 
+// referenceLength is how much of the message a reply points at travels with
+// the reply. A client renders the reference as one line under the author, so
+// carrying the whole of a long message would pay for a preview nobody can
+// read — and pay for it on every frame the reply appears in.
+const referenceLength = 512
+
+// referencedMessageView renders the message a reply points at. A nil m is a
+// target that is gone, which is a state of its own: the reply still says it
+// answered something, and saying so is better than dropping the reference and
+// drawing the reply as an ordinary line.
 func referencedMessageView(m *store.Message, targetID int64) *protocol.ReferencedMessage {
 	if m == nil {
 		return &protocol.ReferencedMessage{
@@ -109,10 +120,12 @@ func referencedMessageView(m *store.Message, targetID int64) *protocol.Reference
 		ChannelID: m.ChannelID,
 		UserID:    m.UserID,
 		Author:    m.Author,
-		Content:   m.Content,
+		Content:   truncateRunes(m.Content, referenceLength),
 	}
 }
 
+// referencedDMView is referencedMessageView for a private conversation, which
+// carries no channel to name.
 func referencedDMView(m *store.DirectMessage, targetID int64) *protocol.ReferencedMessage {
 	if m == nil {
 		return &protocol.ReferencedMessage{
@@ -124,8 +137,34 @@ func referencedDMView(m *store.DirectMessage, targetID int64) *protocol.Referenc
 		ID:      m.ID,
 		UserID:  m.UserID,
 		Author:  m.Author,
-		Content: m.Content,
+		Content: truncateRunes(m.Content, referenceLength),
 	}
+}
+
+// resolveMessageReply reads the snapshot for one message that replies to
+// another. It is what the paths holding a single message use; a page of them
+// goes through messageViews, which reads the whole run in one query.
+func resolveMessageReply(ctx context.Context, st *store.Store, replyToID *int64) *protocol.ReferencedMessage {
+	if replyToID == nil {
+		return nil
+	}
+	target, err := st.MessageByID(ctx, *replyToID)
+	if err != nil {
+		return referencedMessageView(nil, *replyToID)
+	}
+	return referencedMessageView(&target, *replyToID)
+}
+
+// resolveDMReply is resolveMessageReply for a private conversation.
+func resolveDMReply(ctx context.Context, st *store.Store, replyToID *int64) *protocol.ReferencedMessage {
+	if replyToID == nil {
+		return nil
+	}
+	target, err := st.DirectMessageByID(ctx, *replyToID)
+	if err != nil {
+		return referencedDMView(nil, *replyToID)
+	}
+	return referencedDMView(&target, *replyToID)
 }
 
 // messageView converts a stored message and the files it carries into the wire

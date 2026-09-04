@@ -342,4 +342,3 @@ func TestDirectMessageReplies(t *testing.T) {
 		t.Fatalf("expected DM reply snapshot in history, got %+v", hist.Messages[1].ReplyTo)
 	}
 }
-

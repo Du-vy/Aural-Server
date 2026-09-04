@@ -584,7 +584,12 @@ func (r *discordRelay) deliverToAural(ctx context.Context, link store.RelayLink,
 		return err
 	}
 
-	content := r.renderInbound(m)
+	// A Discord reply that points at a message this server already holds is
+	// carried as a reply of its own. The client draws the preview from that,
+	// so the quoted header renderInbound would otherwise write into the body
+	// is left off: one reply, said once.
+	replyToID := r.nativeReply(ctx, link, m)
+	content := r.renderInbound(m, replyToID == nil)
 	embeds := sanitiseEmbeds(m.Embeds)
 
 	// The server's own rules apply to what arrives, exactly as they do to what
@@ -633,16 +638,7 @@ func (r *discordRelay) deliverToAural(ctx context.Context, link store.RelayLink,
 
 	avatar := m.AvatarURL(relayAvatarSize)
 	source := protocol.MessageSourceDiscord
-	var replyToID *int64
-	var replyTo *protocol.ReferencedMessage
-	if m.Referenced != nil {
-		if pair, err := r.st.RelayMessageByDiscord(ctx, link.ID, m.Referenced.ID); err == nil {
-			replyToID = &pair.AuralID
-			if target, err := r.st.MessageByID(ctx, pair.AuralID); err == nil {
-				replyTo = referencedMessageView(&target, pair.AuralID)
-			}
-		}
-	}
+	replyTo := resolveMessageReply(ctx, r.st, replyToID)
 	created, err := r.st.CreateWebhookMessage(ctx, store.Message{
 		ChannelID:     link.ChannelID,
 		Author:        author,
@@ -693,18 +689,48 @@ func (r *discordRelay) deliverToAural(ctx context.Context, link store.RelayLink,
 	return nil
 }
 
+// How much of the message a reply answers travels in the quoted header the
+// bridge writes when it cannot carry the reply as a reply. The point is to
+// identify what is being answered, not to repeat it.
+const quotedReplyRunes = 120
+
+// oneLine folds a message into the single line a blockquote can hold. A
+// newline would end the quote and leave the rest of it standing as body text,
+// so the breaks become spaces rather than being dropped with the other control
+// characters.
+func oneLine(in string) string {
+	return cleanText(strings.ReplaceAll(in, "\n", " "))
+}
+
+// nativeReply returns the id of the Aural message a Discord reply points at,
+// when this server holds a copy of it, and nil otherwise — a reply to
+// something written before the bridge existed, or to something already gone.
+func (r *discordRelay) nativeReply(ctx context.Context, link store.RelayLink, m discord.Message) *int64 {
+	if m.Referenced == nil {
+		return nil
+	}
+	pair, err := r.st.RelayMessageByDiscord(ctx, link.ID, m.Referenced.ID)
+	if err != nil {
+		return nil
+	}
+	return &pair.AuralID
+}
+
 // renderInbound turns a Discord message into the text Aural stores: the ids
-// resolved to names, a quoted header for a reply, and a line naming any
-// stickers, which have no equivalent here.
-func (r *discordRelay) renderInbound(m discord.Message) string {
+// resolved to names, a quoted header for a reply this side cannot carry as
+// one, and a line naming any stickers, which have no equivalent here.
+//
+// quoteReply is false when the reply is being carried as a reply, which is the
+// case whenever the message it answers is one this server already holds.
+func (r *discordRelay) renderInbound(m discord.Message, quoteReply bool) string {
 	var b strings.Builder
 
-	if m.Referenced != nil {
+	if quoteReply && m.Referenced != nil {
 		// A reply is rendered as a one-line quote of what it answers, which is
 		// how a person reading only this side keeps the thread. It is cut
 		// short deliberately: the point is to identify the message, not to
 		// repeat it.
-		quoted := discord.TruncateRunes(cleanText(m.Referenced.Content), 120)
+		quoted := discord.TruncateRunes(oneLine(m.Referenced.Content), quotedReplyRunes)
 		if quoted != "" {
 			fmt.Fprintf(&b, "> %s: %s\n", m.Referenced.DisplayName(), quoted)
 		} else {
@@ -780,7 +806,7 @@ func (r *discordRelay) applyDiscordEdit(ctx context.Context, link store.RelayLin
 		return nil
 	}
 
-	content := r.renderInbound(m)
+	content := r.renderInbound(m, r.nativeReply(ctx, link, m) == nil)
 	verdict, blocked := r.hub.screenRelayed(ctx, link.ChannelID, content, m.DisplayName())
 	if blocked {
 		return nil
@@ -802,15 +828,7 @@ func (r *discordRelay) applyDiscordEdit(ctx context.Context, link store.RelayLin
 	if err != nil {
 		return err
 	}
-	var replyTo *protocol.ReferencedMessage
-	if updated.ReplyToID != nil {
-		if target, err := r.st.MessageByID(ctx, *updated.ReplyToID); err == nil {
-			replyTo = referencedMessageView(&target, *updated.ReplyToID)
-		} else {
-			replyTo = referencedMessageView(nil, *updated.ReplyToID)
-		}
-	}
-	view := messageView(updated, attachments, replyTo)
+	view := messageView(updated, attachments, resolveMessageReply(ctx, r.st, updated.ReplyToID))
 	if view.Webhook != nil {
 		view.Webhook.Source = protocol.MessageSourceDiscord
 	}

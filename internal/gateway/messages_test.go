@@ -535,5 +535,82 @@ func TestMessageReplies(t *testing.T) {
 	}
 }
 
-func ptr[T any](v T) *T { return &v }
+// A reply may only point into the run it is written in. The preview a client
+// draws is a link into the list it is already reading, so a reference out of
+// that list is one it could never follow.
+func TestReplyStaysInsideItsOwnRun(t *testing.T) {
+	h := newHarness(t, nil)
 
+	admin, ready := h.admin("Admin")
+	channel := textChannel(t, ready)
+	other := ok[protocol.ChannelEvent](admin, protocol.OpChannelCreate,
+		protocol.ChannelCreateRequest{Name: "elsewhere", Type: protocol.ChannelText}).Channel
+
+	elsewhere := ok[protocol.MessageEvent](admin, protocol.OpMessageSend,
+		protocol.MessageSendRequest{ChannelID: other.ID, Content: "over here"})
+
+	admin.fails(protocol.OpMessageSend, protocol.MessageSendRequest{
+		ChannelID: channel.ID,
+		Content:   "answering another channel",
+		ReplyToID: &elsewhere.Message.ID,
+	}, protocol.ErrBadRequest)
+
+	// A post's comments are messages in the post's channel, so the channel
+	// alone does not say whether two of them are in the same list.
+	forum := h.postChannel(admin, protocol.ChannelForum, "forum")
+	first := ok[protocol.PostEvent](admin, protocol.OpPostCreate,
+		protocol.PostCreateRequest{ChannelID: forum.ID, Title: "First", Content: "body"}).Post
+	second := ok[protocol.PostEvent](admin, protocol.OpPostCreate,
+		protocol.PostCreateRequest{ChannelID: forum.ID, Title: "Second", Content: "body"}).Post
+
+	comment := ok[protocol.MessageEvent](admin, protocol.OpMessageSend,
+		protocol.MessageSendRequest{ChannelID: forum.ID, PostID: first.ID, Content: "a comment"})
+
+	admin.fails(protocol.OpMessageSend, protocol.MessageSendRequest{
+		ChannelID: forum.ID,
+		PostID:    second.ID,
+		Content:   "answering another post",
+		ReplyToID: &comment.Message.ID,
+	}, protocol.ErrBadRequest)
+
+	// Inside the one post it is an ordinary reply.
+	reply := ok[protocol.MessageEvent](admin, protocol.OpMessageSend,
+		protocol.MessageSendRequest{
+			ChannelID: forum.ID,
+			PostID:    first.ID,
+			Content:   "answering in place",
+			ReplyToID: &comment.Message.ID,
+		})
+	if reply.Message.ReplyTo == nil || reply.Message.ReplyTo.Content != "a comment" {
+		t.Fatalf("unexpected replyTo: %+v", reply.Message.ReplyTo)
+	}
+}
+
+// A reference carries a preview's worth of the message it points at, not the
+// whole of it: the reply is drawn as one line, and the rest would be paid for
+// on every frame it appears in.
+func TestReplyReferenceIsCutToAPreview(t *testing.T) {
+	h := newHarness(t, nil)
+
+	admin, ready := h.admin("Admin")
+	channel := textChannel(t, ready)
+
+	long := strings.Repeat("x", 2000)
+	first := ok[protocol.MessageEvent](admin, protocol.OpMessageSend,
+		protocol.MessageSendRequest{ChannelID: channel.ID, Content: long})
+
+	reply := ok[protocol.MessageEvent](admin, protocol.OpMessageSend,
+		protocol.MessageSendRequest{
+			ChannelID: channel.ID,
+			Content:   "short",
+			ReplyToID: &first.Message.ID,
+		})
+	if reply.Message.ReplyTo == nil {
+		t.Fatal("expected replyTo snapshot")
+	}
+	if n := len([]rune(reply.Message.ReplyTo.Content)); n >= len(long) {
+		t.Fatalf("the reference should be cut to a preview, got %d runes", n)
+	}
+}
+
+func ptr[T any](v T) *T { return &v }

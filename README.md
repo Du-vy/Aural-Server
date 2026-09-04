@@ -540,9 +540,11 @@ group is talking into a room with nobody in it.
 
 **Messages wear the name and picture of whoever wrote them.** A bridged channel
 reads as the people in it, not as forty messages in a row posted by "Relay Bot".
-Text, files, embeds, edits and deletions all cross; a reply becomes a short
-quote of what it answers; Discord's `<@id>` mentions and `<t:…>` timestamps are
-resolved into the names and dates a reader would have seen.
+Text, files, embeds, edits, deletions and replies all cross; a Discord reply to
+a message this server already holds arrives as a reply, and anything else
+becomes a short quote of what it answers; Discord's `<@id>` mentions and
+`<t:…>` timestamps are resolved into the names and dates a reader would have
+seen.
 
 **Nothing loops.** A message that crosses is tagged by identity on each side —
 the Discord webhook it went out through, and the internal webhook row it came in

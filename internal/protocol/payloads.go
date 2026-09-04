@@ -296,14 +296,12 @@ type Role struct {
 	Managed     string `json:"managed"`
 }
 
-// Message is one post in a text channel.
+// ReferencedMessage is a snapshot of the message a reply points at: enough to
+// draw the one-line preview above the reply, and no more. Content is cut to a
+// preview's worth, because that is all anything renders of it.
 //
-// Author is carried alongside UserID because a client only knows the users who
-// are currently connected: presence is not persisted, so the author of an old
-// message is very often somebody the client has never seen. It is resolved
-// server-side from the users table, so a rename shows up throughout the
-// history rather than only on new messages.
-// ReferencedMessage is a snapshot of the message a reply points at.
+// Deleted marks a reference whose target is gone. The reply still says it
+// answered something, so the reference is kept and marked rather than dropped.
 type ReferencedMessage struct {
 	ID        int64  `json:"id"`
 	ChannelID int64  `json:"channelId,omitempty"`
@@ -313,6 +311,13 @@ type ReferencedMessage struct {
 	Deleted   bool   `json:"deleted,omitempty"`
 }
 
+// Message is one post in a text channel.
+//
+// Author is carried alongside UserID because a client only knows the users who
+// are currently connected: presence is not persisted, so the author of an old
+// message is very often somebody the client has never seen. It is resolved
+// server-side from the users table, so a rename shows up throughout the
+// history rather than only on new messages.
 type Message struct {
 	ID        int64  `json:"id"`
 	ChannelID int64  `json:"channelId"`
