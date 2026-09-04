@@ -113,7 +113,15 @@ func messageView(m store.Message, attachments []store.Attachment) protocol.Messa
 		Embeds:    decodeEmbeds(m.Embeds),
 	}
 	if m.WebhookID != nil {
-		out.Webhook = &protocol.MessageWebhook{ID: *m.WebhookID, Avatar: m.WebhookAvatar}
+		var source string
+		if m.WebhookSource != nil {
+			source = *m.WebhookSource
+		}
+		out.Webhook = &protocol.MessageWebhook{
+			ID:     *m.WebhookID,
+			Avatar: m.WebhookAvatar,
+			Source: source,
+		}
 	}
 	for _, a := range attachments {
 		out.Attachments = append(out.Attachments, attachmentView(a))

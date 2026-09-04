@@ -632,12 +632,14 @@ func (r *discordRelay) deliverToAural(ctx context.Context, link store.RelayLink,
 	}
 
 	avatar := m.AvatarURL(relayAvatarSize)
+	source := protocol.MessageSourceDiscord
 	created, err := r.st.CreateWebhookMessage(ctx, store.Message{
 		ChannelID:     link.ChannelID,
 		Author:        author,
 		Content:       content,
 		WebhookID:     &webhookID,
 		WebhookAvatar: &avatar,
+		WebhookSource: &source,
 		Embeds:        encoded,
 	})
 	if err != nil {

@@ -29,6 +29,9 @@ type Message struct {
 	// WebhookAvatar is the picture this one message was posted under. Only a
 	// webhook message ever carries one.
 	WebhookAvatar *string
+	// WebhookSource names where the message came from when it is something more
+	// specific than an application posting to a URL (e.g. "discord").
+	WebhookSource *string
 	// Embeds is the rich cards the message carries, held as the JSON array
 	// they arrived in. This layer keeps it opaque; the gateway is what knows
 	// its shape.
@@ -41,14 +44,14 @@ type Message struct {
 // messages, which matches the identity model: the row is the person.
 const messageColumns = `m.id, m.channel_id, m.post_id, m.user_id,
 	COALESCE(u.nickname, m.author), m.content, m.created_at, m.edited_at,
-	m.webhook_id, m.webhook_avatar, m.embeds`
+	m.webhook_id, m.webhook_avatar, m.webhook_source, m.embeds`
 
 const messageFrom = ` FROM messages m LEFT JOIN users u ON u.id = m.user_id`
 
 func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 	var m Message
 	err := row.Scan(&m.ID, &m.ChannelID, &m.PostID, &m.UserID, &m.Author, &m.Content,
-		&m.CreatedAt, &m.EditedAt, &m.WebhookID, &m.WebhookAvatar, &m.Embeds)
+		&m.CreatedAt, &m.EditedAt, &m.WebhookID, &m.WebhookAvatar, &m.WebhookSource, &m.Embeds)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, ErrNotFound
 	}
@@ -105,10 +108,10 @@ func (s *Store) CreateWebhookMessage(ctx context.Context, m Message) (Message, e
 	ts := now()
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO messages (channel_id, user_id, author, content, search_text,
-			created_at, webhook_id, webhook_avatar, embeds)
-		 VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)`,
+			created_at, webhook_id, webhook_avatar, webhook_source, embeds)
+		 VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ChannelID, m.Author, m.Content, foldForSearch(m.Content), ts,
-		m.WebhookID, m.WebhookAvatar, m.Embeds)
+		m.WebhookID, m.WebhookAvatar, m.WebhookSource, m.Embeds)
 	if err != nil {
 		return Message{}, fmt.Errorf("store: create webhook message: %w", err)
 	}

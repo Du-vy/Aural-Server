@@ -575,6 +575,16 @@ var migrations = []string{
 	);
 	CREATE INDEX idx_relay_messages_discord ON relay_messages(link_id, discord_id);
 	`,
+	// 15: webhook source on messages, so relayed messages keep their attribution
+	// across restarts and history fetches.
+	`
+	ALTER TABLE messages ADD COLUMN webhook_source TEXT;
+
+	UPDATE messages
+	SET webhook_source = 'discord'
+	WHERE id IN (SELECT aural_id FROM relay_messages WHERE origin = 'discord')
+	   OR (webhook_id IS NOT NULL AND webhook_id IN (SELECT source_webhook_id FROM relay_links WHERE source_webhook_id IS NOT NULL));
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own
