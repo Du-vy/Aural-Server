@@ -63,8 +63,16 @@ type ServerInfo struct {
 	// origin exactly as an avatar is, and empty when the server has none. A
 	// client that reads it draws it wherever it would otherwise draw the first
 	// letter of the name.
-	Icon                string `json:"icon,omitempty"`
+	Icon string `json:"icon,omitempty"`
+	// ProtocolVersion is the newest revision this server speaks, and
+	// MinProtocolVersion the oldest it still accepts. A client talks to it when
+	// the two ranges overlap; see protocol.Version for why this is a range.
+	//
+	// MinProtocolVersion is absent from a server older than the range, and a
+	// client that finds it missing reads it as equal to ProtocolVersion, which
+	// is exactly what those servers accept.
 	ProtocolVersion     int    `json:"protocolVersion"`
+	MinProtocolVersion  int    `json:"minProtocolVersion"`
 	SoftwareVersion     string `json:"softwareVersion"`
 	MaxUsers            int    `json:"maxUsers"`
 	OnlineUsers         int    `json:"onlineUsers"`

@@ -606,6 +606,9 @@ func TestInfoEndpointDescribesTheServer(t *testing.T) {
 	if info.ProtocolVersion != protocol.Version {
 		t.Fatalf("protocol version: got %d, want %d", info.ProtocolVersion, protocol.Version)
 	}
+	if info.MinProtocolVersion != protocol.MinVersion {
+		t.Fatalf("min protocol version: got %d, want %d", info.MinProtocolVersion, protocol.MinVersion)
+	}
 	if info.VoiceMode != protocol.VoiceModeServerHost {
 		t.Fatalf("voice mode: got %q", info.VoiceMode)
 	}

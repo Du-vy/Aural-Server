@@ -12,9 +12,22 @@ package protocol
 
 import "encoding/json"
 
-// Version is the protocol revision. A client refuses to talk to a server that
-// reports a different major revision. It is bumped on any breaking change.
-const Version = 1
+// Version is the newest protocol revision this build speaks, and MinVersion the
+// oldest it still accepts from a client. Version is bumped on any breaking
+// change; MinVersion is raised only when carrying the older revision genuinely
+// stops being possible.
+//
+// They are a range rather than a single number because the two sides of an
+// Aural conversation are updated by different people. Servers are self-hosted,
+// so an operator pulls a new image when they get round to it, while a client
+// updates itself. Under a rule of strict equality the first breaking change
+// would cut every client off from every server that had not been pulled yet.
+// A range is what lets the two move independently: both ends advertise theirs,
+// and they talk as long as the ranges overlap.
+const (
+	Version    = 1
+	MinVersion = 1
+)
 
 // Envelope is the single JSON frame exchanged over the WebSocket.
 type Envelope struct {

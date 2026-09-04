@@ -283,6 +283,7 @@ func (h *Hub) serverInfo() protocol.ServerInfo {
 		Description:         description,
 		Icon:                icon,
 		ProtocolVersion:     protocol.Version,
+		MinProtocolVersion:  protocol.MinVersion,
 		SoftwareVersion:     buildinfo.Version,
 		MaxUsers:            cfg.Server.MaxUsers,
 		OnlineUsers:         h.OnlineCount(),

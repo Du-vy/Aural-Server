@@ -148,8 +148,21 @@ travel as plain JSON numbers.
 }
 ```
 
-A client should compare `server.protocolVersion` against its own and refuse to
-continue on a mismatch.
+Both sides advertise a **range** of revisions rather than a single one. The
+server sends `server.protocolVersion` (the newest it speaks) and
+`server.minProtocolVersion` (the oldest it still accepts); the client holds the
+same pair for itself. They talk when the two ranges overlap, and the revision
+in use is the newest both ends can speak.
+
+A client should refuse to continue only when there is no overlap: the server is
+newer than anything the client understands, or older than anything it still
+supports. `minProtocolVersion` is absent from a server older than this rule, and
+a client that finds it missing should read it as equal to `protocolVersion`.
+
+The point of the range is that the two sides are updated by different people. A
+server is self-hosted, so it moves when its operator pulls a new image, while a
+client updates itself. Strict equality would mean the first breaking change cut
+every client off from every server whose operator had not pulled yet.
 
 At most **six** authentication attempts are allowed on one connection; the
 seventh closes the socket.
@@ -384,7 +397,8 @@ member.
 {
   "name": "Aural Server",
   "description": "",
-  "protocolVersion": 1,
+  "protocolVersion": 1,       // newest revision this server speaks
+  "minProtocolVersion": 1,    // oldest it still accepts
   "softwareVersion": "0.5.0",
   "maxUsers": 64,
   "onlineUsers": 3,
