@@ -131,6 +131,28 @@ func (s *Store) UpdateRole(ctx context.Context, r Role) error {
 	return requireOneRow(res, "role")
 }
 
+// ReorderRoles rewrites the whole stack in one transaction.
+//
+// `ordered` is bottom-up and holds every role that has a position to argue
+// about; positions are assigned 1 upwards in that order, leaving 0 to the
+// everyone role that sits beneath all of them. Renumbering rather than
+// patching is what keeps the stack contiguous and free of the ties that make
+// two roles' relative authority depend on their row ids.
+func (s *Store) ReorderRoles(ctx context.Context, ordered []int64) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		for i, id := range ordered {
+			res, err := tx.ExecContext(ctx, `UPDATE roles SET position = ? WHERE id = ?`, i+1, id)
+			if err != nil {
+				return fmt.Errorf("store: reorder roles: %w", err)
+			}
+			if err := requireOneRow(res, "role"); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // DeleteRole removes a role and, by cascade, every grant of it.
 func (s *Store) DeleteRole(ctx context.Context, id int64) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM roles WHERE id = ? AND managed = ''`, id)

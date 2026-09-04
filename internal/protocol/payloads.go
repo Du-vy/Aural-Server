@@ -90,6 +90,19 @@ type ServerInfo struct {
 	// to know how long a sound may be, and the picker has to know when there
 	// is no slot left.
 	Expressions ExpressionLimits `json:"expressions"`
+	// Registration is what this server will accept as a username and password.
+	// It travels for the same reason the upload limits do: a client that knows
+	// the policy says so under the field, and refuses in the form rather than
+	// after a round trip that can only answer in the server's language.
+	Registration RegistrationLimits `json:"registration"`
+}
+
+// RegistrationLimits is the account policy a client validates against before
+// it sends anything.
+type RegistrationLimits struct {
+	MinPasswordLength int `json:"minPasswordLength"`
+	MinUsernameLength int `json:"minUsernameLength"`
+	MaxUsernameLength int `json:"maxUsernameLength"`
 }
 
 // ExpressionLimits is the ceiling on what a server carries for its own people.
@@ -1005,6 +1018,24 @@ type RoleUpdateRequest struct {
 	Permissions *string `json:"permissions,omitempty"`
 	Position    *int    `json:"position,omitempty"`
 	Hoist       *bool   `json:"hoist,omitempty"`
+}
+
+// RoleReorderRequest restacks the hierarchy in one move.
+//
+// RoleIDs is the whole stack from the bottom up, minus the everyone role,
+// which is always beneath everything and is not addressable here. Sending the
+// complete order rather than one role and a number is what makes this atomic:
+// positions are only meaningful relative to each other, so a reorder is one
+// decision about the whole stack and is accepted or refused as one.
+type RoleReorderRequest struct {
+	RoleIDs []int64 `json:"roleIds"`
+}
+
+// RoleReorderResult is the stack as it stands afterwards, bottom-up, so a
+// client that guessed wrong about the everyone role or a managed one is
+// corrected by the reply rather than by the next reload.
+type RoleReorderResult struct {
+	Roles []Role `json:"roles"`
 }
 
 type RoleDeleteRequest struct {

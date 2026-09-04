@@ -287,6 +287,11 @@ func (h *Hub) serverInfo() protocol.ServerInfo {
 		KlipyEnabled:        h.KlipyAPIKey() != "",
 		DirectMessages:      h.DirectMessagesEnabled(),
 		Expressions:         h.expressionLimits(),
+		Registration: protocol.RegistrationLimits{
+			MinPasswordLength: cfg.Registration.MinPasswordLength,
+			MinUsernameLength: cfg.Registration.MinUsernameLength,
+			MaxUsernameLength: cfg.Registration.MaxUsernameLength,
+		},
 	}
 }
 

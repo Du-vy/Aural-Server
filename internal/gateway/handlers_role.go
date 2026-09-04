@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"strconv"
+	"strings"
 
 	"github.com/aural-chat/aural-server/internal/permissions"
 	"github.com/aural-chat/aural-server/internal/protocol"
@@ -185,6 +186,138 @@ func handleRoleUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 	}
 
 	return protocol.RoleEvent{Role: view}, nil
+}
+
+// handleRoleReorder restacks the hierarchy in one move.
+//
+// A reorder is one decision about the whole stack, so it is validated and
+// written as one: positions mean nothing on their own, and applying half of a
+// requested order would leave a hierarchy nobody asked for.
+//
+// The check is made on where each role sits in the order rather than on the
+// number recorded against it, because the write renumbers everything to sit
+// contiguously — a role that has not moved relative to its neighbours has not
+// moved, whatever integer it ends up with.
+func handleRoleReorder(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
+	req, failure := decode[protocol.RoleReorderRequest](raw)
+	if failure != nil {
+		return nil, failure
+	}
+
+	base, roleIDs := s.Permissions()
+	if !base.Has(permissions.ManageRoles) {
+		return nil, protocol.Errorf(protocol.ErrForbidden, "you are not allowed to manage roles")
+	}
+
+	// The everyone role is beneath everything by definition and is not part of
+	// the stack being ordered.
+	current := make([]store.Role, 0)
+	for _, r := range s.hub.SortedRoles() {
+		if r.Managed != protocol.ManagedEveryone {
+			current = append(current, r)
+		}
+	}
+	if len(req.RoleIDs) != len(current) {
+		return nil, protocol.Errorf(protocol.ErrBadRequest,
+			"a reorder must name every role exactly once")
+	}
+
+	wasAt := make(map[int64]int, len(current))
+	for i, r := range current {
+		wasAt[r.ID] = i
+	}
+	nowAt := make(map[int64]int, len(req.RoleIDs))
+	for i, id := range req.RoleIDs {
+		if _, ok := wasAt[id]; !ok {
+			return nil, protocol.Errorf(protocol.ErrBadRequest,
+				"a reorder must name every role exactly once")
+		}
+		if _, seen := nowAt[id]; seen {
+			return nil, protocol.Errorf(protocol.ErrBadRequest,
+				"a reorder must name every role exactly once")
+		}
+		nowAt[id] = i
+	}
+
+	// Where the caller's own authority stops, as an index into the same order.
+	// Everything from there up is at or above them and is not theirs to move,
+	// nor a gap to move anything else into.
+	ceiling := len(current)
+	if rank := s.hub.RankOf(s.UserID(), roleIDs); !s.hub.IsOwner(s.UserID()) {
+		ceiling = 0
+		for i, r := range current {
+			if r.Position < rank {
+				ceiling = i + 1
+			}
+		}
+	}
+	for id, to := range nowAt {
+		from := wasAt[id]
+		if from == to {
+			continue
+		}
+		if from >= ceiling || to >= ceiling {
+			return nil, protocol.Errorf(protocol.ErrForbidden,
+				"you cannot move a role to or above your own")
+		}
+	}
+
+	if err := s.hub.st.ReorderRoles(ctx, req.RoleIDs); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, protocol.Errorf(protocol.ErrNotFound, "no such role")
+		}
+		return nil, internalError(s, "reorder the roles", err)
+	}
+	if err := s.hub.ReloadRoles(ctx); err != nil {
+		return nil, internalError(s, "reload roles", err)
+	}
+
+	// Every position has been rewritten, so every role is news to a client.
+	views := make([]protocol.Role, 0, len(req.RoleIDs))
+	for _, id := range req.RoleIDs {
+		role, ok := s.hub.Role(id)
+		if !ok {
+			continue
+		}
+		view := roleView(role)
+		views = append(views, view)
+		s.hub.Broadcast(protocol.Event(protocol.EvRoleUpdated, protocol.RoleEvent{Role: view}))
+	}
+
+	entry := auditTarget(protocol.AuditTargetRole, 0, "")
+	entry.Action = protocol.AuditRoleUpdate
+	entry.Changes = changed(nil, "order", orderOf(current), orderOf(rolesInOrder(s.hub, req.RoleIDs)))
+	s.hub.audit(ctx, s, entry)
+
+	// The hierarchy decides what everybody may do, so everybody's view of it
+	// has to be rebuilt — the same resync a permission edit causes.
+	s.hub.resyncAll(ctx)
+	s.hub.evictFromUnreachableChannels()
+
+	s.log.Info("roles reordered", slog.Int("roles", len(req.RoleIDs)))
+
+	return protocol.RoleReorderResult{Roles: views}, nil
+}
+
+// rolesInOrder resolves ids to the roles they name, skipping any that have
+// gone. Only the audit log reads it.
+func rolesInOrder(h *Hub, ids []int64) []store.Role {
+	out := make([]store.Role, 0, len(ids))
+	for _, id := range ids {
+		if role, ok := h.Role(id); ok {
+			out = append(out, role)
+		}
+	}
+	return out
+}
+
+// orderOf names a stack bottom-up, which is how a reorder reads in the log.
+func orderOf(roles []store.Role) string {
+	names := make([]string, 0, len(roles))
+	for _, r := range roles {
+		names = append(names, r.Name)
+	}
+	return strings.Join(names, " < ")
 }
 
 // handleRoleDelete removes an unmanaged role the caller outranks.

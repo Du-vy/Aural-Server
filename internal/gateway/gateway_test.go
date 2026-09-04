@@ -619,3 +619,79 @@ func TestUnauthenticatedOpsAreRejected(t *testing.T) {
 		protocol.ChannelCreateRequest{Name: "Nope", Type: protocol.ChannelVoice}, protocol.ErrUnauthorized)
 	c.fails("nonsense.op", struct{}{}, protocol.ErrBadRequest)
 }
+
+// A reorder is a decision about the whole stack, so it is refused as a whole
+// when any part of it reaches at or above the caller — including the case that
+// matters most, an administrator lifting a role of their own above the one
+// that grants them the authority to try.
+func TestRoleReorderRespectsTheHierarchy(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx := context.Background()
+
+	token, err := gateway.EnsureOwnerToken(ctx, h.store, h.server.Hub())
+	if err != nil {
+		t.Fatalf("ensure owner token: %v", err)
+	}
+
+	owner := h.dial()
+	ownerReady := owner.guest("Owner")
+
+	var adminRoleID int64
+	for _, role := range ownerReady.Roles {
+		if role.Managed == protocol.ManagedAdmin {
+			adminRoleID = role.ID
+		}
+	}
+	ok[protocol.UserEvent](owner, protocol.OpServerClaimAdmin, protocol.ClaimAdminRequest{Token: token})
+
+	admin := h.dial()
+	adminReady := admin.guest("Admin")
+	ok[protocol.UserEvent](owner, protocol.OpRoleAssign,
+		protocol.RoleMembershipRequest{UserID: adminReady.User.ID, RoleID: adminRoleID})
+
+	lower := ok[protocol.RoleEvent](admin, protocol.OpRoleCreate, protocol.RoleCreateRequest{Name: "Lower"})
+	upper := ok[protocol.RoleEvent](admin, protocol.OpRoleCreate, protocol.RoleCreateRequest{Name: "Upper"})
+
+	// The stack, bottom-up, as it stands: the managed registered role, then the
+	// two just created, then admin at the top.
+	stack := make([]int64, 0, 4)
+	for _, role := range h.server.Hub().SortedRoles() {
+		if role.Managed != protocol.ManagedEveryone {
+			stack = append(stack, role.ID)
+		}
+	}
+	if len(stack) != 4 || stack[3] != adminRoleID {
+		t.Fatalf("unexpected starting stack: %v", stack)
+	}
+
+	// Swapping two roles below the administrator is theirs to do.
+	swapped := []int64{stack[0], upper.Role.ID, lower.Role.ID, adminRoleID}
+	result := ok[protocol.RoleReorderResult](admin, protocol.OpRoleReorder,
+		protocol.RoleReorderRequest{RoleIDs: swapped})
+	if len(result.Roles) != 4 {
+		t.Fatalf("a reorder must report the whole stack: %+v", result.Roles)
+	}
+	if result.Roles[1].ID != upper.Role.ID || result.Roles[2].ID != lower.Role.ID {
+		t.Fatalf("the stack was not reordered: %+v", result.Roles)
+	}
+	if result.Roles[1].Position >= result.Roles[2].Position {
+		t.Fatalf("positions must follow the order asked for: %+v", result.Roles)
+	}
+
+	// Lifting a role over the one that grants the authority to ask is not.
+	admin.fails(protocol.OpRoleReorder, protocol.RoleReorderRequest{
+		RoleIDs: []int64{stack[0], upper.Role.ID, adminRoleID, lower.Role.ID},
+	}, protocol.ErrForbidden)
+
+	// Nor is naming a stack that is not the stack.
+	admin.fails(protocol.OpRoleReorder,
+		protocol.RoleReorderRequest{RoleIDs: []int64{lower.Role.ID, lower.Role.ID, upper.Role.ID, adminRoleID}},
+		protocol.ErrBadRequest)
+	admin.fails(protocol.OpRoleReorder,
+		protocol.RoleReorderRequest{RoleIDs: []int64{lower.Role.ID, upper.Role.ID}}, protocol.ErrBadRequest)
+
+	// The owner sits above every role and may move the admin role itself.
+	ok[protocol.RoleReorderResult](owner, protocol.OpRoleReorder, protocol.RoleReorderRequest{
+		RoleIDs: []int64{stack[0], adminRoleID, upper.Role.ID, lower.Role.ID},
+	})
+}

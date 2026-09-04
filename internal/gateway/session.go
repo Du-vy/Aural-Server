@@ -692,6 +692,7 @@ var routes = map[string]route{
 
 	protocol.OpRoleCreate:   {needsAuth: true, fn: handleRoleCreate},
 	protocol.OpRoleUpdate:   {needsAuth: true, fn: handleRoleUpdate},
+	protocol.OpRoleReorder:  {needsAuth: true, fn: handleRoleReorder},
 	protocol.OpRoleDelete:   {needsAuth: true, fn: handleRoleDelete},
 	protocol.OpRoleAssign:   {needsAuth: true, fn: handleRoleAssign},
 	protocol.OpRoleUnassign: {needsAuth: true, fn: handleRoleUnassign},

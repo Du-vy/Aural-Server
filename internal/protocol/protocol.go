@@ -118,6 +118,7 @@ const (
 
 	OpRoleCreate   = "role.create"
 	OpRoleUpdate   = "role.update"
+	OpRoleReorder  = "role.reorder"
 	OpRoleDelete   = "role.delete"
 	OpRoleAssign   = "role.assign"
 	OpRoleUnassign = "role.unassign"
