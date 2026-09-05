@@ -114,7 +114,7 @@ type discordRelay struct {
 	// queues are the per-link delivery goroutines. One per link keeps the
 	// order of a channel intact — messages arrive in the order they were sent
 	// — while stopping one slow link from holding up the others.
-	queues map[int64]chan relayJob
+	queues map[int64]*relayQueue
 	// stopped is closed when the relay shuts down, which is what releases the
 	// queue goroutines.
 	stopped chan struct{}
@@ -137,7 +137,7 @@ func newDiscordRelay(hub *Hub) *discordRelay {
 		byDiscord:       map[string]store.RelayLink{},
 		ownWebhooks:     map[string]struct{}{},
 		inboundWebhooks: map[int64]struct{}{},
-		queues:          map[int64]chan relayJob{},
+		queues:          map[int64]*relayQueue{},
 		stopped:         make(chan struct{}),
 	}
 }
@@ -285,9 +285,11 @@ func (r *discordRelay) setLinks(links []store.RelayLink) {
 	byDiscord := make(map[string]store.RelayLink, len(links))
 	own := make(map[string]struct{}, len(links))
 	inbound := make(map[int64]struct{}, len(links))
+	live := make(map[int64]struct{}, len(links))
 	for _, l := range links {
 		byChannel[l.ChannelID] = l
 		byDiscord[l.DiscordChannelID] = l
+		live[l.ID] = struct{}{}
 		// The guard sets deliberately ignore l.Enabled. A link switched off
 		// stops relaying, but a message already in flight through it must
 		// still be recognised as ours rather than picked up as new traffic.
@@ -300,6 +302,10 @@ func (r *discordRelay) setLinks(links []store.RelayLink) {
 	r.mu.Lock()
 	r.byChannel, r.byDiscord = byChannel, byDiscord
 	r.ownWebhooks, r.inboundWebhooks = own, inbound
+	// A link that is switched off keeps its worker: it is still a link, and
+	// the queue is what carries the deliveries already accepted for it. Only a
+	// link that is gone from the table altogether has nothing left to deliver.
+	r.retireQueuesLocked(live)
 	r.mu.Unlock()
 }
 
@@ -433,6 +439,17 @@ func (r *discordRelay) restClient() *discord.REST {
 
 // --- queues -----------------------------------------------------------------
 
+// relayQueue is one link's pending deliveries and the worker draining them.
+//
+// retired is closed when the link the queue belonged to is gone, which is what
+// releases that worker. It is per-queue rather than one flag for the relay
+// because links come and go independently: an administrator repointing one
+// must not disturb the others.
+type relayQueue struct {
+	jobs    chan relayJob
+	retired chan struct{}
+}
+
 // enqueue hands one delivery to a link's worker.
 //
 // It never blocks. The Discord read loop calls this, and a blocked handler
@@ -442,30 +459,77 @@ func (r *discordRelay) enqueue(linkID int64, job relayJob) {
 	r.mu.Lock()
 	queue, ok := r.queues[linkID]
 	if !ok {
-		queue = make(chan relayJob, relayQueueDepth)
+		queue = &relayQueue{
+			jobs:    make(chan relayJob, relayQueueDepth),
+			retired: make(chan struct{}),
+		}
 		r.queues[linkID] = queue
 		go r.drain(queue)
 	}
 	r.mu.Unlock()
 
 	select {
-	case queue <- job:
+	case queue.jobs <- job:
 	default:
 		r.log.Warn("relay queue is full, dropping a message",
 			slog.Int64("link", linkID), slog.Int("depth", relayQueueDepth))
 	}
 }
 
+// retireQueues releases the workers of links that no longer exist.
+//
+// A queue is created on the first delivery for a link and was never taken away
+// again, so every link an administrator removed left a goroutine and its
+// buffer behind for the life of the process. Link ids are never reused, so
+// repointing a bridge a few times a year leaked one apiece — slowly, but
+// without a ceiling.
+//
+// live is the set of links that still exist. r.mu is held by the caller.
+func (r *discordRelay) retireQueuesLocked(live map[int64]struct{}) {
+	for linkID, queue := range r.queues {
+		if _, kept := live[linkID]; kept {
+			continue
+		}
+		delete(r.queues, linkID)
+		close(queue.retired)
+	}
+}
+
 // drain runs one link's deliveries, one at a time and in order.
-func (r *discordRelay) drain(queue chan relayJob) {
+//
+// What is already queued is delivered before the worker goes, on either way
+// out: those are messages somebody sent, and the link being reconfigured
+// underneath them is not a reason to drop them. What it will not do is wait
+// for more.
+func (r *discordRelay) drain(queue *relayQueue) {
+	run := func(job relayJob) {
+		ctx, cancel := context.WithTimeout(context.Background(), relayDeliveryTimeout)
+		defer cancel()
+		job(ctx)
+	}
+
 	for {
 		select {
 		case <-r.stopped:
+			r.flush(queue, run)
 			return
-		case job := <-queue:
-			ctx, cancel := context.WithTimeout(context.Background(), relayDeliveryTimeout)
-			job(ctx)
-			cancel()
+		case <-queue.retired:
+			r.flush(queue, run)
+			return
+		case job := <-queue.jobs:
+			run(job)
+		}
+	}
+}
+
+// flush delivers whatever is already on a queue and returns.
+func (r *discordRelay) flush(queue *relayQueue, run func(relayJob)) {
+	for {
+		select {
+		case job := <-queue.jobs:
+			run(job)
+		default:
+			return
 		}
 	}
 }

@@ -628,6 +628,7 @@ var routes = map[string]route{
 
 	protocol.OpServerClaimAdmin: {needsAuth: true, fn: handleServerClaimAdmin},
 	protocol.OpServerUpdate:     {needsAuth: true, fn: handleServerUpdate},
+	protocol.OpServerMetrics:    {needsAuth: true, slow: true, fn: handleServerMetrics},
 
 	protocol.OpUserUpdate: {needsAuth: true, fn: handleUserUpdate},
 	protocol.OpUserMove:   {needsAuth: true, fn: handleUserMove},

@@ -590,6 +590,32 @@ var migrations = []string{
 	ALTER TABLE messages ADD COLUMN reply_to_id INTEGER;
 	ALTER TABLE direct_messages ADD COLUMN reply_to_id INTEGER;
 	`,
+	// 17: indexes on the foreign keys that point at a user.
+	//
+	// SQLite enforces ON DELETE by looking for the deleted parent in every
+	// child table, and a child column with no index behind it is looked for by
+	// scanning the whole of that table — once per row deleted. Every one of
+	// these columns was in exactly that state, so removing a guest meant a full
+	// pass over messages, over direct_messages and over attachments, and the
+	// retention sweep removes them in batches.
+	//
+	// It is not a slow query in some rarely used corner: the database takes one
+	// connection at a time, so for as long as the sweep runs nothing else on the
+	// server can read or write. On a database of two hundred thousand messages
+	// the quarter-hourly sweep held it for seven seconds; with these it holds it
+	// for a tenth of one.
+	//
+	// The two columns that already carry a partial index — messages.post_id and
+	// bans.user_id — are deliberately left alone. SQLite can prove that
+	// "post_id = ?" implies "post_id IS NOT NULL", so the partial index it has
+	// is the index the foreign key needs.
+	`
+	CREATE INDEX IF NOT EXISTS idx_messages_user        ON messages(user_id);
+	CREATE INDEX IF NOT EXISTS idx_direct_messages_user ON direct_messages(user_id);
+	CREATE INDEX IF NOT EXISTS idx_attachments_user     ON attachments(user_id);
+	CREATE INDEX IF NOT EXISTS idx_posts_user           ON posts(user_id);
+	CREATE INDEX IF NOT EXISTS idx_post_rsvps_user      ON post_rsvps(user_id);
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

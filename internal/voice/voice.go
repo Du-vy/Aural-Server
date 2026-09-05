@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/aural-chat/aural-server/internal/protocol"
@@ -51,6 +52,11 @@ const (
 // rtcpDrainBuffer is large enough for any RTCP compound packet. The reads exist
 // to keep the interceptor chain fed, not to look at what arrives.
 const rtcpDrainBuffer = 1500
+
+// receiveMTU is the size of the buffer one RTP packet is read into. It is
+// pion's own default for the same thing, and an Opus packet is a small
+// fraction of it.
+const receiveMTU = 1500
 
 // Settings is the audio plane as the relay needs it. It is a plain value so a
 // reconfiguration is a comparison and a swap rather than a lock discipline.
@@ -890,18 +896,43 @@ func (pub *publication) detachAll() map[int64]*sink {
 // ends. It is the only hot path in the server, so it allocates nothing per
 // packet and takes exactly one read lock.
 //
+// Reading into a buffer of its own is what makes the first half of that true.
+// TrackRemote.ReadRTP, the obvious call, allocates a receive buffer and a
+// packet on every call — at fifty packets a second per publisher, a room of
+// ten people is a thousand allocations a second and most of a megabyte, all of
+// it garbage, all of it in the one loop that must not be interrupted by a
+// collection. Reading and unmarshalling into the same two values instead costs
+// nothing per packet.
+//
+// It is only safe because every write below is synchronous: Unmarshal points
+// packet.Payload straight into buf, and pion's SRTP session marshals header
+// and payload into a pooled buffer of its own before encrypting, so nothing
+// downstream is still holding either by the time the next packet overwrites
+// them. rtp.Header.Unmarshal reuses its CSRC and extension slices for the same
+// reason, so the packet is meant to be filled in over and over.
+//
 // A muted publisher and a deafened subscriber are both handled by not writing
 // the packet. The gap that leaves in the sequence numbers is what the far end's
 // concealment is for, and it is the same gap a lost packet leaves.
 func (pub *publication) forward(remote *webrtc.TrackRemote, log *slog.Logger) {
 	owner := pub.owner
+	buf := make([]byte, receiveMTU)
+	var packet rtp.Packet
+
 	for {
-		packet, _, err := remote.ReadRTP()
+		n, _, err := remote.Read(buf)
 		if err != nil {
 			// The peer connection closed, which is the ordinary way out.
 			return
 		}
 		if owner.muted.Load() {
+			continue
+		}
+		if err := packet.Unmarshal(buf[:n]); err != nil {
+			// A packet that will not parse is one packet, not a reason to stop
+			// carrying the rest of somebody's audio.
+			log.Debug("read voice packet",
+				slog.Int64("from", owner.userID), slog.Any("error", err))
 			continue
 		}
 
@@ -910,7 +941,7 @@ func (pub *publication) forward(remote *webrtc.TrackRemote, log *slog.Logger) {
 			if s.peer.deafened.Load() {
 				continue
 			}
-			if err := s.track.WriteRTP(packet); err != nil {
+			if err := s.track.WriteRTP(&packet); err != nil {
 				// One subscriber's transport going away must not stop the
 				// others hearing anything; the peer's own state change is what
 				// removes it.

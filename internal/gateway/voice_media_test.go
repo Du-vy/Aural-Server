@@ -406,6 +406,125 @@ func TestServerHostedRelayCarriesAudioBothWays(t *testing.T) {
 	}
 }
 
+// speakPattern sends packets whose payload says which packet it is, so that a
+// listener can tell intact audio from audio that arrived scrambled.
+func speakPattern(track *webrtc.TrackLocalStaticSample, mark byte, done <-chan struct{}) {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	var seq byte
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			payload := make([]byte, 80)
+			for i := range payload {
+				payload[i] = mark ^ seq
+			}
+			seq++
+			_ = track.WriteSample(media.Sample{Data: payload, Duration: 20 * time.Millisecond})
+		}
+	}
+}
+
+// hearIntact reads packets and requires every one of them to still say what it
+// said when it was sent: one byte repeated the whole way across.
+func hearIntact(t *testing.T, c *rtcClient, want int) (streamID string, packets int) {
+	t.Helper()
+
+	var remote *webrtc.TrackRemote
+	select {
+	case remote = <-c.arrived:
+	case <-time.After(20 * time.Second):
+		t.Fatal("no audio arrived")
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for packets < want {
+		if err := remote.SetReadDeadline(deadline); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
+		packet, _, err := remote.ReadRTP()
+		if err != nil {
+			break
+		}
+		if len(packet.Payload) == 0 {
+			t.Fatalf("packet %d arrived with no payload", packets)
+		}
+		for i, b := range packet.Payload {
+			if b != packet.Payload[0] {
+				t.Fatalf("packet %d was corrupted: byte %d is %#x, want %#x",
+					packets, i, b, packet.Payload[0])
+			}
+		}
+		packets++
+	}
+	return remote.StreamID(), packets
+}
+
+// TestServerHostedRelayDeliversAudioIntactToEveryListener is the guard on the
+// forwarding loop reusing its buffer.
+//
+// That loop reads every packet into one buffer and unmarshals it into one
+// packet, over and over, which is only safe while every write it hands the
+// payload to has finished with it before the next packet lands. Two listeners
+// on one speaker is what makes that a real question: if a write were not
+// synchronous, the second listener is who would hear the next packet's bytes.
+//
+// So the payload is checked rather than counted. It carries one byte repeated,
+// changing packet to packet, so a payload built from two different packets is
+// a payload that does not match itself.
+func TestServerHostedRelayDeliversAudioIntactToEveryListener(t *testing.T) {
+	if testing.Short() {
+		t.Skip("the relay test brings up three real peer connections")
+	}
+
+	h := newHarness(t, serverHosted)
+
+	var channelID int64
+	for _, ch := range h.server.Hub().SortedChannels() {
+		if ch.Type == protocol.ChannelVoice {
+			channelID = ch.ID
+			break
+		}
+	}
+	if channelID == 0 {
+		t.Fatal("the seed has no voice channel")
+	}
+
+	// Alice speaks; Bob and Carol both listen to her, which is the fan-out the
+	// shared buffer has to survive.
+	alice := dialRTC(t, h, "Alice")
+	alice.request(t, protocol.OpUserMove, protocol.UserMoveRequest{ChannelID: &channelID}, nil)
+	aliceTrack := alice.openMedia(t, channelID)
+
+	done := make(chan struct{})
+	defer close(done)
+	go speakPattern(aliceTrack, 0xA5, done)
+
+	bob := dialRTC(t, h, "Bob")
+	bob.request(t, protocol.OpUserMove, protocol.UserMoveRequest{ChannelID: &channelID}, nil)
+	bob.openMedia(t, channelID)
+
+	carol := dialRTC(t, h, "Carol")
+	carol.request(t, protocol.OpUserMove, protocol.UserMoveRequest{ChannelID: &channelID}, nil)
+	carol.openMedia(t, channelID)
+
+	for _, listener := range []struct {
+		name string
+		c    *rtcClient
+	}{{"bob", bob}, {"carol", carol}} {
+		stream, packets := hearIntact(t, listener.c, 25)
+		if want := voice.StreamID(alice.userID); stream != want {
+			t.Fatalf("%s heard stream %q, want %q", listener.name, stream, want)
+		}
+		if packets < 25 {
+			t.Fatalf("%s heard %d packets, want at least 25", listener.name, packets)
+		}
+	}
+}
+
 func TestServerHostedRelayStopsAMutedParticipant(t *testing.T) {
 	if testing.Short() {
 		t.Skip("the relay test brings up two real peer connections")

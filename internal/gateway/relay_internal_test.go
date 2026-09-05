@@ -30,7 +30,7 @@ func relayForTest() *discordRelay {
 		byDiscord:       map[string]store.RelayLink{},
 		ownWebhooks:     map[string]struct{}{},
 		inboundWebhooks: map[int64]struct{}{},
-		queues:          map[int64]chan relayJob{},
+		queues:          map[int64]*relayQueue{},
 		stopped:         make(chan struct{}),
 	}
 	inbound := int64(7)
@@ -302,6 +302,68 @@ func TestRelayCacheAndQueuesSurviveConcurrentUse(t *testing.T) {
 	}
 	if delivered.Load() == 0 {
 		t.Fatal("no queued delivery ever ran")
+	}
+}
+
+// TestRetiredLinksReleaseTheirWorkers covers what happens to a link's delivery
+// queue when the link itself goes.
+//
+// A queue is built on the first delivery and used to be kept for the life of
+// the process, worker and buffer alike. Link ids are never reused, so every
+// bridge an administrator removed left one behind — a slow leak, but one with
+// no ceiling on a server whose owner keeps repointing it.
+//
+// What must not happen in fixing that is losing a message somebody already
+// sent, so a retired queue delivers what it is holding before it goes.
+func TestRetiredLinksReleaseTheirWorkers(t *testing.T) {
+	r := relayForTest()
+	defer close(r.stopped)
+
+	// Block the worker on its first job so the rest queue up behind it, which
+	// is what makes "delivers what it is holding" a real question rather than
+	// a race the test happens to win.
+	release := make(chan struct{})
+	var delivered atomic.Int64
+	r.enqueue(1, func(context.Context) { <-release })
+	for range 5 {
+		r.enqueue(1, func(context.Context) { delivered.Add(1) })
+	}
+
+	r.mu.Lock()
+	_, held := r.queues[1]
+	r.mu.Unlock()
+	if !held {
+		t.Fatal("enqueueing did not build a queue for the link")
+	}
+
+	// The link is gone from the table. Everything else stays.
+	r.setLinks(nil)
+
+	r.mu.Lock()
+	_, stillHeld := r.queues[1]
+	r.mu.Unlock()
+	if stillHeld {
+		t.Error("a link that no longer exists kept its queue")
+	}
+
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for delivered.Load() < 5 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := delivered.Load(); got != 5 {
+		t.Errorf("delivered %d of the 5 messages already queued", got)
+	}
+
+	// A delivery for a link that came back gets a fresh queue rather than the
+	// retired one, whose worker has gone.
+	r.enqueue(1, func(context.Context) { delivered.Add(1) })
+	deadline = time.Now().Add(2 * time.Second)
+	for delivered.Load() < 6 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := delivered.Load(); got != 6 {
+		t.Errorf("a queue rebuilt after retirement did not run: delivered %d", got)
 	}
 }
 

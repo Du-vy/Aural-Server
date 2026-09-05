@@ -367,7 +367,12 @@ func (r *REST) callMultipart(ctx context.Context, method, endpoint string,
 	// The body is built into memory rather than streamed. A relayed message
 	// carries at most a handful of files, each bounded by the configured
 	// ceiling, and buffering is what makes a retry after a 429 possible at all.
-	build := func() (io.Reader, string, error) {
+	//
+	// It is built once and handed out as a bytes.Reader per attempt. The bytes
+	// are the whole of every file the delivery carries, so reading the buffer
+	// out into a second slice would hold two copies of them at the same time
+	// for nothing.
+	build := func() ([]byte, string, error) {
 		var buf bytes.Buffer
 		w := multipart.NewWriter(&buf)
 
@@ -398,19 +403,15 @@ func (r *REST) callMultipart(ctx context.Context, method, endpoint string,
 		if err := w.Close(); err != nil {
 			return nil, "", err
 		}
-		return &buf, w.FormDataContentType(), nil
+		return buf.Bytes(), w.FormDataContentType(), nil
 	}
 
-	reader, contentType, err := build()
-	if err != nil {
-		return err
-	}
-	buffered, err := io.ReadAll(reader)
+	body, contentType, err := build()
 	if err != nil {
 		return err
 	}
 	return r.call(ctx, method, endpoint, func() (io.Reader, error) {
-		return bytes.NewReader(buffered), nil
+		return bytes.NewReader(body), nil
 	}, contentType, out, false)
 }
 

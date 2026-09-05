@@ -486,6 +486,16 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 	var contentType string
 	var modTime time.Time
 
+	// Emoji, stickers and soundboard clips are answered from memory. They are
+	// the files a client asks for most and the ones the database used to be
+	// asked about last, so they are asked about first: the hub reloads those
+	// tables on every write, which makes its copy the same answer the query
+	// would have given.
+	if name, kind, at, cached := s.hub.StoredFileByKey(key); cached {
+		s.serveStoredFile(w, r, files, key, name, kind, time.Unix(at, 0))
+		return
+	}
+
 	attachment, err := s.st.AttachmentByStorageKey(r.Context(), key)
 	switch {
 	case err == nil:
@@ -500,8 +510,9 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 			contentType = uploads.ContentType(picture.Filename)
 			modTime = time.Unix(picture.CreatedAt, 0)
 		} else if name, kind, at, eErr := s.st.FileByStorageKey(r.Context(), key); eErr == nil {
-			// A custom emoji, a sticker or a soundboard clip, which live in
-			// their own tables for the same reason avatars do.
+			// A custom emoji, a sticker or a soundboard clip whose row the hub
+			// has not caught up with, which is the window between an upload
+			// being recorded and the cache being reloaded.
 			filename = name
 			contentType = kind
 			modTime = time.Unix(at, 0)
@@ -513,6 +524,16 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+
+	s.serveStoredFile(w, r, files, key, filename, contentType, modTime)
+}
+
+// serveStoredFile writes one stored file back, whichever table named it. It is
+// shared so that the answer for an emoji, which is resolved from the hub's
+// cache, cannot drift from the answer for an attachment, which is resolved
+// from a row.
+func (s *Server) serveStoredFile(w http.ResponseWriter, r *http.Request,
+	files *uploads.Store, key, filename, contentType string, modTime time.Time) {
 
 	file, info, err := files.Open(key)
 	if err != nil {

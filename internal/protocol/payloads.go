@@ -1331,3 +1331,94 @@ type VoiceResetEvent struct {
 	ChannelID int64  `json:"channelId"`
 	Reason    string `json:"reason"`
 }
+
+// ServerMetricsRequest asks the server for live telemetry and storage breakdown.
+type ServerMetricsRequest struct {
+	Force bool `json:"force,omitempty"`
+}
+
+// StorageCountSize pairs a resource count with total bytes.
+type StorageCountSize struct {
+	Count int   `json:"count"`
+	Bytes int64 `json:"bytes"`
+}
+
+// ServerStorageBreakdown details disk usage across attachments, profiles, expressions, and database.
+type ServerStorageBreakdown struct {
+	TotalBytes  int64 `json:"totalBytes"`
+	HostTotal   int64 `json:"hostTotal"`
+	HostFree    int64 `json:"hostFree"`
+	Attachments struct {
+		Videos StorageCountSize `json:"videos"`
+		Images StorageCountSize `json:"images"`
+		Audio  StorageCountSize `json:"audio"`
+		Files  StorageCountSize `json:"files"`
+		Total  StorageCountSize `json:"total"`
+	} `json:"attachments"`
+	Profiles struct {
+		Avatars StorageCountSize `json:"avatars"`
+		Banners StorageCountSize `json:"banners"`
+		Total   StorageCountSize `json:"total"`
+	} `json:"profiles"`
+	Expressions struct {
+		Emojis   StorageCountSize `json:"emojis"`
+		Stickers StorageCountSize `json:"stickers"`
+		Sounds   StorageCountSize `json:"sounds"`
+		Total    StorageCountSize `json:"total"`
+	} `json:"expressions"`
+	ServerMedia struct {
+		IconBytes int64 `json:"iconBytes"`
+	} `json:"serverMedia"`
+	Database struct {
+		SizeBytes int64 `json:"sizeBytes"`
+	} `json:"database"`
+}
+
+// ServerCPUMetrics details processor utilization.
+type ServerCPUMetrics struct {
+	ProcessPercent float64 `json:"processPercent"`
+	SystemPercent  float64 `json:"systemPercent"`
+	Cores          int     `json:"cores"`
+}
+
+// ServerMemoryMetrics details process and system RAM usage in bytes.
+type ServerMemoryMetrics struct {
+	ProcessRSS       int64   `json:"processRss"`
+	ProcessHeapAlloc int64   `json:"processHeapAlloc"`
+	ProcessHeapSys   int64   `json:"processHeapSys"`
+	SystemTotal      int64   `json:"systemTotal"`
+	SystemUsed       int64   `json:"systemUsed"`
+	SystemFree       int64   `json:"systemFree"`
+	SystemPercent    float64 `json:"systemPercent"`
+}
+
+// ServerActivityMetrics snapshots user activity and data entity counts.
+type ServerActivityMetrics struct {
+	ActiveConnections int `json:"activeConnections"`
+	OnlineUsers       int `json:"onlineUsers"`
+	VoiceUsers        int `json:"voiceUsers"`
+	ActiveVoiceRooms  int `json:"activeVoiceRooms"`
+	RegisteredUsers   int `json:"registeredUsers"`
+	TotalChannels     int `json:"totalChannels"`
+	TotalMessages     int `json:"totalMessages"`
+}
+
+// ServerSystemInfo details the environment and versioning.
+type ServerSystemInfo struct {
+	UptimeSeconds int64  `json:"uptimeSeconds"`
+	StartedAt     int64  `json:"startedAt"`
+	Goroutines    int    `json:"goroutines"`
+	GoVersion     string `json:"goVersion"`
+	OS            string `json:"os"`
+	Arch          string `json:"arch"`
+	ServerVersion string `json:"serverVersion"`
+}
+
+// ServerMetrics is the payload returned by OpServerMetrics.
+type ServerMetrics struct {
+	CPU      ServerCPUMetrics       `json:"cpu"`
+	Memory   ServerMemoryMetrics    `json:"memory"`
+	Storage  ServerStorageBreakdown `json:"storage"`
+	Activity ServerActivityMetrics  `json:"activity"`
+	System   ServerSystemInfo       `json:"system"`
+}

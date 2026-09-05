@@ -116,6 +116,32 @@ func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error
 	return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
 }
 
+// unfurlClient is shared across requests, like the Klipy proxy's.
+//
+// Building one per request meant the pool settings below never applied: every
+// unfurl dialled and shook hands afresh, and the transport it was left with
+// held its idle connection — and the goroutines reading it — for a further
+// IdleConnTimeout with nothing able to reach it again.
+//
+// Its dialler is what keeps this endpoint from being a way to reach the inside
+// of the operator's network, so it is the one field that must not be shared
+// with any other client here.
+var unfurlClient = &http.Client{
+	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		DialContext:           safeDialContext,
+		ResponseHeaderTimeout: 4 * time.Second,
+		MaxIdleConns:          20,
+		IdleConnTimeout:       30 * time.Second,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return fmt.Errorf("too many redirects")
+		}
+		return nil
+	},
+}
+
 // handleUnfurl fetches a webpage and extracts OpenGraph metadata without CORS restrictions.
 //
 //	GET /unfurl?url=<target_url>
@@ -171,22 +197,6 @@ func (s *Server) handleUnfurl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			DialContext:           safeDialContext,
-			ResponseHeaderTimeout: 4 * time.Second,
-			MaxIdleConns:          20,
-			IdleConnTimeout:       30 * time.Second,
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return fmt.Errorf("too many redirects")
-			}
-			return nil
-		},
-	}
-
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, protocol.ErrBadRequest, "failed to build request")
@@ -198,7 +208,7 @@ func (s *Server) handleUnfurl(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9,es;q=0.8")
 
-	resp, err := client.Do(req)
+	resp, err := unfurlClient.Do(req)
 	if err != nil {
 		s.log.Debug("unfurl request failed", slog.String("url", target), slog.Any("error", err))
 		writeAPIError(w, http.StatusBadGateway, "unfurl_failed", "could not fetch target url")

@@ -15,6 +15,7 @@ import (
 	"github.com/aural-chat/aural-server/internal/protocol"
 	"github.com/aural-chat/aural-server/internal/publicip"
 	"github.com/aural-chat/aural-server/internal/store"
+	"github.com/aural-chat/aural-server/internal/system"
 	"github.com/aural-chat/aural-server/internal/uploads"
 	"github.com/aural-chat/aural-server/internal/voice"
 )
@@ -72,6 +73,12 @@ type Hub struct {
 	// and only an administrator ever writes one.
 	expressions map[int64]store.Expression
 	sounds      map[int64]store.Sound
+	// expressionKeys and soundKeys index the two caches above by the storage
+	// key their files are served under, which is what an incoming download
+	// names them by. They hold ids rather than copies so that the record above
+	// stays the only one.
+	expressionKeys map[string]int64
+	soundKeys      map[string]int64
 	// automod is the rule set every message is screened against, which is the
 	// hottest read on the server: it is consulted on the way in to every
 	// single send.
@@ -106,23 +113,35 @@ type Hub struct {
 	// forwards audio, this one carries text to somebody else's service, and
 	// the two share nothing but a word. See relay.go.
 	discord *discordRelay
+
+	// telemetry gathers live runtime, memory, and CPU metrics.
+	telemetry *system.Collector
+
+	// storageMu guards the cached storage breakdown so repeated queries
+	// by client polls do not repeatedly scan the database.
+	storageMu       sync.Mutex
+	cachedStorage   protocol.ServerStorageBreakdown
+	cachedStorageAt time.Time
 }
 
 // NewHub builds a hub and primes its caches from the database. cfgPath is where
 // runtime configuration changes are written back.
 func NewHub(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Store, log *slog.Logger) (*Hub, error) {
 	h := &Hub{
-		cfg:         cfg,
-		cfgPath:     cfgPath,
-		st:          st,
-		log:         log,
-		sessions:    map[int64]*Session{},
-		byUser:      map[int64]*Session{},
-		voiceRooms:  map[int64]*voiceRoom{},
-		voiceEpochs: map[int64]int64{},
-		expressions: map[int64]store.Expression{},
-		sounds:      map[int64]store.Sound{},
-		automod:     protocol.DefaultAutoMod(),
+		cfg:            cfg,
+		cfgPath:        cfgPath,
+		st:             st,
+		log:            log,
+		sessions:       map[int64]*Session{},
+		byUser:         map[int64]*Session{},
+		voiceRooms:     map[int64]*voiceRoom{},
+		voiceEpochs:    map[int64]int64{},
+		expressions:    map[int64]store.Expression{},
+		sounds:         map[int64]store.Sound{},
+		expressionKeys: map[string]int64{},
+		soundKeys:      map[string]int64{},
+		automod:        protocol.DefaultAutoMod(),
+		telemetry:      system.NewCollector(),
 	}
 
 	// Minted on the first start and kept: a salt that changed on restart would
@@ -410,12 +429,14 @@ func (h *Hub) ReloadExpressions(ctx context.Context) error {
 		return err
 	}
 	byID := make(map[int64]store.Expression, len(list))
+	byKey := make(map[string]int64, len(list))
 	for _, e := range list {
 		byID[e.ID] = e
+		byKey[e.StorageKey] = e.ID
 	}
 
 	h.cacheMu.Lock()
-	h.expressions = byID
+	h.expressions, h.expressionKeys = byID, byKey
 	h.cacheMu.Unlock()
 	return nil
 }
@@ -427,14 +448,41 @@ func (h *Hub) ReloadSounds(ctx context.Context) error {
 		return err
 	}
 	byID := make(map[int64]store.Sound, len(list))
+	byKey := make(map[string]int64, len(list))
 	for _, s := range list {
 		byID[s.ID] = s
+		byKey[s.StorageKey] = s.ID
 	}
 
 	h.cacheMu.Lock()
-	h.sounds = byID
+	h.sounds, h.soundKeys = byID, byKey
 	h.cacheMu.Unlock()
 	return nil
+}
+
+// StoredFileByKey is what an emoji, a sticker or a soundboard clip is called
+// and what type it carries, answered from the caches the hub already holds.
+//
+// It exists because those three are served over the same download route as an
+// attachment, and that route used to find them by asking the database three
+// times: once for an attachment, once for a picture, and only then for these.
+// An emoji is the most frequently drawn file on the server and was paying the
+// most for it, for a row the hub reloads on every write anyway.
+func (h *Hub) StoredFileByKey(key string) (filename, contentType string, createdAt int64, ok bool) {
+	h.cacheMu.RLock()
+	defer h.cacheMu.RUnlock()
+
+	if id, indexed := h.expressionKeys[key]; indexed {
+		if e, held := h.expressions[id]; held {
+			return e.Filename, e.ContentType, e.CreatedAt, true
+		}
+	}
+	if id, indexed := h.soundKeys[key]; indexed {
+		if s, held := h.sounds[id]; held {
+			return s.Filename, s.ContentType, s.CreatedAt, true
+		}
+	}
+	return "", "", 0, false
 }
 
 // Sound returns a cached soundboard clip.
@@ -976,4 +1024,117 @@ func (h *Hub) BroadcastUserPresence(was string, view protocol.User) {
 			s.Send(protocol.Event(protocol.EvUserUpdated, protocol.UserEvent{User: h.MaskUser(s, view)}))
 		}
 	}
+}
+
+// CollectMetrics gathers live resource usage, activity, and cached storage breakdown.
+func (h *Hub) CollectMetrics(ctx context.Context, force bool) (protocol.ServerMetrics, error) {
+	// Storage breakdown with 20s cache
+	h.storageMu.Lock()
+	now := time.Now()
+	var storage protocol.ServerStorageBreakdown
+	if !force && !h.cachedStorageAt.IsZero() && now.Sub(h.cachedStorageAt) < 20*time.Second {
+		storage = h.cachedStorage
+		h.storageMu.Unlock()
+	} else {
+		h.storageMu.Unlock()
+		bd, err := h.st.StorageBreakdown(ctx)
+		if err != nil {
+			return protocol.ServerMetrics{}, err
+		}
+
+		diskPath := h.cfg.Uploads.Path
+		if diskPath == "" {
+			diskPath = "."
+		}
+		disk := h.telemetry.Disk(diskPath)
+
+		storage.TotalBytes = bd.TotalBytes + h.cfg.Server.IconSize
+		storage.HostTotal = disk.TotalBytes
+		storage.HostFree = disk.FreeBytes
+
+		storage.Attachments.Videos = protocol.StorageCountSize{Count: bd.Attachments.Videos.Count, Bytes: bd.Attachments.Videos.Bytes}
+		storage.Attachments.Images = protocol.StorageCountSize{Count: bd.Attachments.Images.Count, Bytes: bd.Attachments.Images.Bytes}
+		storage.Attachments.Audio = protocol.StorageCountSize{Count: bd.Attachments.Audio.Count, Bytes: bd.Attachments.Audio.Bytes}
+		storage.Attachments.Files = protocol.StorageCountSize{Count: bd.Attachments.Files.Count, Bytes: bd.Attachments.Files.Bytes}
+		storage.Attachments.Total = protocol.StorageCountSize{Count: bd.Attachments.Total.Count, Bytes: bd.Attachments.Total.Bytes}
+
+		storage.Profiles.Avatars = protocol.StorageCountSize{Count: bd.Profiles.Avatars.Count, Bytes: bd.Profiles.Avatars.Bytes}
+		storage.Profiles.Banners = protocol.StorageCountSize{Count: bd.Profiles.Banners.Count, Bytes: bd.Profiles.Banners.Bytes}
+		storage.Profiles.Total = protocol.StorageCountSize{Count: bd.Profiles.Total.Count, Bytes: bd.Profiles.Total.Bytes}
+
+		storage.Expressions.Emojis = protocol.StorageCountSize{Count: bd.Expressions.Emojis.Count, Bytes: bd.Expressions.Emojis.Bytes}
+		storage.Expressions.Stickers = protocol.StorageCountSize{Count: bd.Expressions.Stickers.Count, Bytes: bd.Expressions.Stickers.Bytes}
+		storage.Expressions.Sounds = protocol.StorageCountSize{Count: bd.Expressions.Sounds.Count, Bytes: bd.Expressions.Sounds.Bytes}
+		storage.Expressions.Total = protocol.StorageCountSize{Count: bd.Expressions.Total.Count, Bytes: bd.Expressions.Total.Bytes}
+
+		storage.ServerMedia.IconBytes = h.cfg.Server.IconSize
+		storage.Database.SizeBytes = bd.DatabaseBytes
+
+		h.storageMu.Lock()
+		h.cachedStorage = storage
+		h.cachedStorageAt = now
+		h.storageMu.Unlock()
+	}
+
+	// Activity
+	h.mu.RLock()
+	onlineUsers := len(h.byUser)
+	activeConns := len(h.sessions)
+	h.mu.RUnlock()
+
+	voiceUsers := 0
+	activeVoiceRooms := 0
+	h.voiceMu.Lock()
+	for _, room := range h.voiceRooms {
+		if len(room.members) > 0 {
+			activeVoiceRooms++
+			voiceUsers += len(room.members)
+		}
+	}
+	h.voiceMu.Unlock()
+
+	stats, _ := h.st.Stats(ctx)
+
+	activity := protocol.ServerActivityMetrics{
+		ActiveConnections: activeConns,
+		OnlineUsers:       onlineUsers,
+		VoiceUsers:        voiceUsers,
+		ActiveVoiceRooms:  activeVoiceRooms,
+		RegisteredUsers:   stats.RegisteredUsers,
+		TotalChannels:     stats.TotalChannels,
+		TotalMessages:     stats.TotalMessages,
+	}
+
+	// Telemetry
+	cpu := h.telemetry.CPU()
+	mem := h.telemetry.Memory()
+	sys := h.telemetry.SystemInfo()
+
+	return protocol.ServerMetrics{
+		CPU: protocol.ServerCPUMetrics{
+			ProcessPercent: cpu.ProcessPercent,
+			SystemPercent:  cpu.SystemPercent,
+			Cores:          cpu.Cores,
+		},
+		Memory: protocol.ServerMemoryMetrics{
+			ProcessRSS:       mem.ProcessRSS,
+			ProcessHeapAlloc: mem.ProcessHeapAlloc,
+			ProcessHeapSys:   mem.ProcessHeapSys,
+			SystemTotal:      mem.SystemTotal,
+			SystemUsed:       mem.SystemUsed,
+			SystemFree:       mem.SystemFree,
+			SystemPercent:    mem.SystemPercent,
+		},
+		Storage:  storage,
+		Activity: activity,
+		System: protocol.ServerSystemInfo{
+			UptimeSeconds: sys.UptimeSeconds,
+			StartedAt:     sys.StartedAt,
+			Goroutines:    sys.Goroutines,
+			GoVersion:     sys.GoVersion,
+			OS:            sys.OS,
+			Arch:          sys.Arch,
+			ServerVersion: sys.ServerVersion,
+		},
+	}, nil
 }

@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -18,16 +17,26 @@ const (
 	flushInterval      = 250 * time.Millisecond
 )
 
-// AsyncFileWriter is a high-performance, non-blocking asynchronous file sink
-// with buffered writes and periodic flushing to minimize disk I/O latency.
+// AsyncFileWriter is an asynchronous file sink with buffered writes and
+// periodic flushing, so that a log line costs the caller a copy and a channel
+// send rather than a disk write. It only blocks when the queue is genuinely
+// full, which means the disk has fallen a whole queue behind.
 type AsyncFileWriter struct {
 	file      *os.File
 	writer    *bufio.Writer
 	queue     chan []byte
 	done      chan struct{}
 	closeOnce sync.Once
-	closed    atomic.Bool
 	err       error
+
+	// mu is held for reading by every Write and for writing by Close, which is
+	// what makes closing the queue safe. Without it a Write that had already
+	// passed the closed check could be left sending on a channel Close had
+	// since shut, which panics — and the goroutines that outlive the listener
+	// (a slow read dispatched off a session's read loop, a relay delivery, a
+	// pion callback) are exactly the ones still logging while Close runs.
+	mu     sync.RWMutex
+	closed bool
 }
 
 // NewAsyncFileWriter creates an asynchronous file writer for the target path.
@@ -85,15 +94,19 @@ func (w *AsyncFileWriter) worker() {
 	}
 }
 
-// Write enqueues a log slice to be written asynchronously to disk.
+// Write enqueues a log slice to be written asynchronously to disk. Writing to
+// a closed writer reports io.ErrClosedPipe rather than panicking.
 func (w *AsyncFileWriter) Write(p []byte) (n int, err error) {
-	if w.closed.Load() {
-		return 0, io.ErrClosedPipe
-	}
+	// Copied before the lock: slog hands back the record buffer as soon as
+	// this returns, so the queue cannot hold the caller's slice.
 	cp := make([]byte, len(p))
 	copy(cp, p)
 
-	// Enqueue write
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.closed {
+		return 0, io.ErrClosedPipe
+	}
 	w.queue <- cp
 	return len(p), nil
 }
@@ -102,8 +115,15 @@ func (w *AsyncFileWriter) Write(p []byte) (n int, err error) {
 func (w *AsyncFileWriter) Close() error {
 	var closeErr error
 	w.closeOnce.Do(func() {
-		w.closed.Store(true)
+		// Taking the lock for writing waits out the Writes already in flight —
+		// a full queue is drained by the worker, which takes no lock — and
+		// stops the ones that have not started, so nothing is left sending on
+		// the channel by the time it is closed.
+		w.mu.Lock()
+		w.closed = true
 		close(w.queue)
+		w.mu.Unlock()
+
 		<-w.done
 		if w.err != nil {
 			closeErr = w.err

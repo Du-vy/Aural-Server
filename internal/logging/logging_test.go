@@ -3,6 +3,7 @@ package logging
 import (
 	"bytes"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -94,6 +95,51 @@ func TestAsyncFileWriter(t *testing.T) {
 		if !strings.Contains(content, strings.TrimSpace(line)) {
 			t.Errorf("missing %q in log file content: %s", line, content)
 		}
+	}
+}
+
+// TestAsyncFileWriterWritesDuringClose covers the shutdown ordering the server
+// actually has: the goroutines that outlive the listener — a slow read
+// dispatched off a session's read loop, a relay delivery, a pion callback —
+// are still logging while main closes the sink. A Write that passed the closed
+// check and then sent on a channel Close had shut would take the process down
+// with it, which is the one failure a logger must not have.
+func TestAsyncFileWriterWritesDuringClose(t *testing.T) {
+	writer, err := NewAsyncFileWriter(filepath.Join(t.TempDir(), "test.log"))
+	if err != nil {
+		t.Fatalf("NewAsyncFileWriter: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 200 {
+				// Both outcomes are correct: accepted before the close, or
+				// refused after it. Neither may panic.
+				if _, err := writer.Write([]byte("still going\n")); err != nil &&
+					!errors.Is(err, io.ErrClosedPipe) {
+					t.Errorf("Write: %v", err)
+					return
+				}
+			}
+		}()
+	}
+
+	close(start)
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	wg.Wait()
+
+	if _, err := writer.Write([]byte("after close\n")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Errorf("Write after Close = %v, want io.ErrClosedPipe", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
 	}
 }
 

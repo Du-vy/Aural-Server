@@ -58,6 +58,7 @@ const (
 
 	OpServerClaimAdmin = "server.claimAdmin" // redeem the one-time owner token
 	OpServerUpdate     = "server.update"     // rename / re-describe the server
+	OpServerMetrics    = "server.metrics"    // query live server metrics & storage breakdown
 
 	OpUserUpdate = "user.update" // change own nickname
 	OpUserMove   = "user.move"   // move self (or another user) between channels
