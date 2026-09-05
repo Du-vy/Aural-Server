@@ -616,6 +616,55 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS idx_posts_user           ON posts(user_id);
 	CREATE INDEX IF NOT EXISTS idx_post_rsvps_user      ON post_rsvps(user_id);
 	`,
+	// 18: read markers on channels, so an unread badge survives the client
+	// being closed.
+	//
+	// This is the same shape the private threads have carried since they were
+	// written — a marker per participant, and a count of what sits past it —
+	// moved onto channels. Until now a channel's badge lived only in the
+	// client's memory, so quitting was indistinguishable from reading
+	// everything.
+	//
+	// Two pieces are needed rather than one. The table is where a marker goes
+	// once somebody has read a channel. The column on users is what a channel
+	// they have never opened counts from, and it is the answer to the question
+	// a bare table cannot answer: a missing row has to mean "read" for the
+	// history that predates this member, and "unread" for a channel created
+	// after they arrived, which is one meaning too many for the absence of a
+	// row. So the absence means "count from the member's epoch", the epoch is
+	// the newest message that existed when they first appeared, and both
+	// readings fall out of it — a year of history from before somebody joined
+	// starts read, and a channel opened last week starts unread to the first
+	// line.
+	//
+	// Existing members are stamped with the newest message there is, which is
+	// what makes this upgrade quiet: nobody logs in the morning after to a
+	// server-wide wall of badges for conversations they read months ago.
+	`
+	CREATE TABLE channel_reads (
+		user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		channel_id   INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+		-- The newest message this member has seen here. It only ever moves
+		-- forwards, so paging back through old lines cannot bring back a badge
+		-- that reading has already cleared.
+		last_read_id INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (user_id, channel_id)
+	);
+	-- user_id leads the primary key's own index, so only the other half of it
+	-- needs one — for the reason migration 17 gives, deleting a channel looks
+	-- for its rows here and would otherwise scan the table to find them.
+	CREATE INDEX idx_channel_reads_channel ON channel_reads(channel_id);
+
+	ALTER TABLE users ADD COLUMN unread_epoch INTEGER NOT NULL DEFAULT 0;
+	UPDATE users SET unread_epoch = (SELECT COALESCE(MAX(id), 0) FROM messages);
+
+	-- A post's title is scanned for mentions along with its body, and the body
+	-- is a message row the title hangs off. Reading the two together walks
+	-- from the message to the post that owns it, which is the direction this
+	-- column has never been indexed in.
+	CREATE INDEX IF NOT EXISTS idx_posts_root_message ON posts(root_message_id)
+		WHERE root_message_id IS NOT NULL;
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

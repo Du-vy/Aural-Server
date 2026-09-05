@@ -392,6 +392,15 @@ func (h *Hub) buildReady(ctx context.Context, s *Session, sessionToken string) (
 		conversations = views
 	}
 
+	// What is waiting in each channel, for the same reason a conversation
+	// carries its badge: a client that has just connected cannot otherwise
+	// tell a channel somebody read last night from one that has been busy
+	// since, and before this the answer lived only in that client's memory.
+	unread, mentions, failure := h.channelUnread(ctx, s, visible)
+	if failure != nil {
+		return protocol.Ready{}, failure
+	}
+
 	// The custom emoji travel with the snapshot rather than being fetched:
 	// a message cannot be rendered without them, and `:shrug:` in the very
 	// first line of history has to resolve before anything is drawn.
@@ -417,10 +426,69 @@ func (h *Hub) buildReady(ctx context.Context, s *Session, sessionToken string) (
 		ICEServers:   h.iceServers(),
 		VoiceStates:  h.voiceStatesFor(s),
 
-		Conversations: conversations,
-		Expressions:   expressions,
-		Sounds:        sounds,
+		Conversations:  conversations,
+		Unread:         unread,
+		UnreadMentions: mentions,
+		Expressions:    expressions,
+		Sounds:         sounds,
 	}, nil
+}
+
+// maxUnreadMentions bounds the unread text one snapshot carries.
+//
+// The counts are exact however much is waiting; this is only the sample the
+// client scans to decide which of those badges name it. A member returning to
+// a busy weekend should be handed the shape of it at the door, not the whole
+// of it, and a channel with more waiting than this reaches keeps its count and
+// loses only the highlight on its oldest end.
+const maxUnreadMentions = 200
+
+// channelUnread is what is waiting for one session across the channels it can
+// see, and the newest of that text for the client to look for its own name in.
+func (h *Hub) channelUnread(ctx context.Context, s *Session, visible []store.Channel) (
+	[]protocol.ChannelUnread, []protocol.UnreadMention, *protocol.Error) {
+	// Categories and voice channels hold no messages, so they are left out
+	// before the query rather than counted as zero by it.
+	ids := make([]int64, 0, len(visible))
+	for _, c := range visible {
+		if c.Type == protocol.ChannelText || protocol.PostChannel(c.Type) {
+			ids = append(ids, c.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil, nil
+	}
+
+	counts, err := h.st.UnreadChannelCounts(ctx, s.UserID(), ids)
+	if err != nil {
+		return nil, nil, internalError(s, "count what is waiting for you", err)
+	}
+	if len(counts) == 0 {
+		return nil, nil, nil
+	}
+
+	// Only the channels that actually hold something are asked about again:
+	// the quiet ones would contribute nothing but their own index walk.
+	waiting := make([]int64, 0, len(counts))
+	unread := make([]protocol.ChannelUnread, 0, len(counts))
+	for _, id := range ids {
+		entry, ok := counts[id]
+		if !ok {
+			continue
+		}
+		waiting = append(waiting, id)
+		unread = append(unread, channelUnreadView(entry))
+	}
+
+	sample, err := h.st.UnreadChannelMentions(ctx, s.UserID(), waiting, maxUnreadMentions)
+	if err != nil {
+		return nil, nil, internalError(s, "read what is waiting for you", err)
+	}
+	mentions := make([]protocol.UnreadMention, 0, len(sample))
+	for _, m := range sample {
+		mentions = append(mentions, unreadMentionView(m))
+	}
+	return unread, mentions, nil
 }
 
 // internalError logs the cause and returns the opaque error the client sees.

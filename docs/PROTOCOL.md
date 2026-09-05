@@ -250,7 +250,9 @@ client's view of the tree stale.
   "roles":      [Role],    // the whole role table
   "permissions": "1234",   // the caller's resolved server-wide mask
   "server":      ServerInfo,
-  "conversations": [Conversation] // private threads, newest first; absent when off
+  "conversations": [Conversation],   // private threads, newest first; absent when off
+  "unread":         [ChannelUnread], // channels with something waiting; absent when none
+  "unreadMentions": [UnreadMention]  // the newest of those messages, capped
 }
 ```
 
@@ -414,6 +416,21 @@ member.
   "lastMessageAt": 1756600000,
   "lastMessage": DirectMessage, // absent until something is said
   "unread": 3
+}
+
+// ChannelUnread - what is waiting in one channel, as the caller sees it
+{
+  "channelId": 2,
+  "count": 12,             // messages past the caller's read marker
+  "lastReadId": 480        // the marker itself
+}
+
+// UnreadMention - one unread message, reduced to the words a client scans
+{
+  "channelId": 2,
+  "content": "@Pablo are you there",  // a post body carries its title in front
+  "userId": 7,             // absent for a webhook
+  "replyToUserId": 4       // absent when it answers nobody, or something deleted
 }
 
 // Attachment
@@ -631,6 +648,7 @@ Every op below needs an authenticated session.
 | `channel.create` | `ManageChannels` on the parent | `{ name, type, parentId?, topic?, position?, userLimit? }`. |
 | `channel.update` | `ManageChannels` on the channel; `ManageRoles` to touch `overwrites` | `{ channelId, name?, topic?, parentId?, position?, userLimit?, overwrites? }`. |
 | `channel.delete` | `ManageChannels` on the channel | `{ channelId }`. Cascades to descendants. |
+| `channel.read` | `ViewChannel` on the channel | `{ channelId, messageId? }`. Moves your own read marker; it never moves backwards. Omitting `messageId` means everything in the channel. Answers `ChannelUnread`. |
 | `post.create` | `CreatePosts` on the channel, plus `AttachFiles` to carry files | `{ channelId, title, content?, attachments?, event? }`. Post channels only. A media post needs a file; a calendar post needs an `event` and nothing else may carry one. Rate limited on the same bucket as `message.send`. |
 | `post.list` | `ViewChannel` on the channel | `{ channelId, before?, from?, to?, limit? }`. `before` pages backwards by post id; `from`/`to` read a calendar as a window in time, at most a year wide. |
 | `post.update` | Author for `title` and `event`; `ManageMessages` for `locked` and `pinned` | `{ postId, title?, locked?, pinned?, event? }`. The body is a message: it is edited through `message.edit`. |
@@ -1270,6 +1288,39 @@ narrows nothing at all is `bad_request`: a search needs something to look for.
 - **A hit carries its neighbours.** `before` and `after` are the messages either
   side of it in its own channel, absent at the edges of a history. They travel
   with the hit because a line of chat rarely means anything alone.
+
+## Unread channels
+
+The server keeps a **read marker** per member per channel: the id of the newest
+message they have seen there. `ready.unread` counts what sits past it, so a
+badge survives the client being closed rather than being whatever that client
+happened to see live. Writing in a channel moves your own marker, which is why
+your own messages are never unread, and `channel.read` only ever moves it
+forwards.
+
+A missing marker means a channel nobody has opened yet, and it counts from the
+member's **epoch** instead: the newest message that existed when that identity
+was created. Both readings a missing row has to carry fall out of that. History
+from before somebody joined starts read, so arriving at a server with a year
+behind it opens it to no badges at all; a channel created after they joined
+starts unread to its first line.
+
+A post counts as one and so does each comment under it, because both are
+message rows — see [Posts](#posts). Categories and voice channels hold no
+messages and never appear.
+
+### Mentions are not counted here
+
+**The server does not know what a mention is.** A mention is the name it names,
+resolved by the client against the member list it holds at the moment it draws
+one, which is why renaming somebody renames them throughout the history. So
+nothing on the wire says a badge should be highlighted.
+
+What the snapshot carries instead is `unreadMentions`: the words of the newest
+unread messages, capped by the server, for the client to run its own mention
+rules over — the same rules it runs on every message that arrives live. A
+channel with more waiting than the cap reaches keeps its exact count and loses
+only the highlight on its oldest end.
 
 ## Private conversations
 

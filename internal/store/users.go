@@ -81,10 +81,16 @@ func scanUser(row interface{ Scan(...any) error }) (User, error) {
 }
 
 // CreateGuest inserts a fresh unclaimed identity.
+//
+// unread_epoch is stamped with the newest message on the server, which is what
+// makes everything said before this identity existed count as read: somebody
+// arriving at a server with a year of history behind it opens it to no badges
+// at all, and to a badge on every channel from their first line onwards.
 func (s *Store) CreateGuest(ctx context.Context, nickname string) (User, error) {
 	ts := now()
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO users (nickname, status, custom_status, created_at, last_seen_at) VALUES (?, 'online', '', ?, ?)`,
+		`INSERT INTO users (nickname, status, custom_status, created_at, last_seen_at, unread_epoch)
+		 VALUES (?, 'online', '', ?, ?, (SELECT COALESCE(MAX(id), 0) FROM messages))`,
 		nickname, ts, ts)
 	if err != nil {
 		return User{}, fmt.Errorf("store: create guest: %w", err)

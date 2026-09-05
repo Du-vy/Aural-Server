@@ -270,6 +270,40 @@ func handleChannelDelete(ctx context.Context, s *Session, raw json.RawMessage) (
 	return event, nil
 }
 
+// handleChannelRead moves the caller's own read marker in one channel, which
+// is what makes a badge they cleared stay cleared after the client is closed —
+// and what clears it on their other clients at the same time.
+//
+// Reading needs only the right to see the channel, which is the rule
+// message.history follows: a member who may not post can still follow along,
+// and following along is precisely what this records.
+func handleChannelRead(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
+	req, failure := decode[protocol.ChannelReadRequest](raw)
+	if failure != nil {
+		return nil, failure
+	}
+	channel, ok := s.hub.Channel(req.ChannelID)
+	if !ok {
+		return nil, protocol.Errorf(protocol.ErrNotFound, "no such channel")
+	}
+	if failure := s.hub.requireChannelPermission(s, &req.ChannelID, permissions.ViewChannel); failure != nil {
+		return nil, failure
+	}
+	// Checked after the permission so an invisible channel reports "not found"
+	// rather than leaking its type. Both kinds that carry messages are
+	// accepted: a post and a comment under it are message rows, so a forum
+	// carries a marker exactly as a text channel does.
+	if channel.Type != protocol.ChannelText && !protocol.PostChannel(channel.Type) {
+		return nil, protocol.Errorf(protocol.ErrBadRequest, "that channel does not carry messages")
+	}
+
+	unread, err := s.hub.st.MarkChannelRead(ctx, s.UserID(), req.ChannelID, req.MessageID)
+	if err != nil {
+		return nil, internalError(s, "mark the channel read", err)
+	}
+	return channelUnreadView(unread), nil
+}
+
 // --- helpers ----------------------------------------------------------------
 
 // requireChannelPermission checks a permission at a point in the tree. A nil

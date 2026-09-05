@@ -709,6 +709,10 @@ var routes = map[string]route{
 	protocol.OpChannelCreate: {needsAuth: true, fn: handleChannelCreate},
 	protocol.OpChannelUpdate: {needsAuth: true, fn: handleChannelUpdate},
 	protocol.OpChannelDelete: {needsAuth: true, fn: handleChannelDelete},
+	// Moving a read marker counts what is left behind it, which walks one
+	// channel's index rather than an index of channels, so it is dispatched
+	// off the read loop with the other reads that do.
+	protocol.OpChannelRead: {needsAuth: true, slow: true, fn: handleChannelRead},
 
 	// Posts. Listing one channel's entries reads their bodies and the shape of
 	// every thread, so it is dispatched off the read loop with the other reads

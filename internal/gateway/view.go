@@ -47,6 +47,26 @@ func channelView(c store.Channel) protocol.Channel {
 	return out
 }
 
+// channelUnreadView renders what is waiting in one channel.
+func channelUnreadView(u store.ChannelUnread) protocol.ChannelUnread {
+	return protocol.ChannelUnread{
+		ChannelID:  u.ChannelID,
+		Count:      u.Count,
+		LastReadID: u.LastReadID,
+	}
+}
+
+// unreadMentionView renders one unread message as the words a client scans for
+// its own name, and nothing else.
+func unreadMentionView(m store.UnreadMention) protocol.UnreadMention {
+	return protocol.UnreadMention{
+		ChannelID:     m.ChannelID,
+		Content:       m.Content,
+		UserID:        m.UserID,
+		ReplyToUserID: m.ReplyToUserID,
+	}
+}
+
 // postView converts a stored post into its wire form.
 //
 // The body is passed in rather than read here because a listing renders every

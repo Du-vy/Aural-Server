@@ -97,6 +97,10 @@ const (
 	OpChannelCreate = "channel.create"
 	OpChannelUpdate = "channel.update"
 	OpChannelDelete = "channel.delete"
+	// channel.read is the channel-shaped twin of dm.read: it moves the
+	// caller's own marker up, which is what makes an unread badge survive the
+	// client being closed instead of living only in its memory.
+	OpChannelRead = "channel.read"
 
 	// Posts: the entries of a channel that holds entries rather than a
 	// stream. One set of ops serves announcements, forum topics, media items

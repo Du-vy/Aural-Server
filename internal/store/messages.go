@@ -73,6 +73,11 @@ type execer interface {
 
 // insertMessage writes one message row and returns its id. postID is nil for a
 // line of a text channel and set for the body or a comment of a post.
+//
+// Writing in a channel also moves the author's read marker to what they just
+// wrote, exactly as sending a private message does. Somebody who says
+// something has read everything above it by definition, and without this a
+// second client of theirs would light up a badge for their own sentence.
 func insertMessage(ctx context.Context, q execer, channelID int64, postID *int64,
 	userID int64, content string, replyToID *int64, ts int64) (int64, error) {
 	res, err := q.ExecContext(ctx,
@@ -85,6 +90,15 @@ func insertMessage(ctx context.Context, q execer, channelID int64, postID *int64
 	id, err := res.LastInsertId()
 	if err != nil {
 		return 0, fmt.Errorf("store: create message: %w", err)
+	}
+	// The new row is the newest there is, so it is already past the epoch a
+	// missing marker would have counted from and needs no floor of its own.
+	if _, err := q.ExecContext(ctx,
+		`INSERT INTO channel_reads (user_id, channel_id, last_read_id) VALUES (?, ?, ?)
+		 ON CONFLICT (user_id, channel_id) DO UPDATE
+		    SET last_read_id = MAX(excluded.last_read_id, channel_reads.last_read_id)`,
+		userID, channelID, id); err != nil {
+		return 0, fmt.Errorf("store: move read marker: %w", err)
 	}
 	return id, nil
 }

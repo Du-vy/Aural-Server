@@ -614,6 +614,44 @@ type Conversation struct {
 	Unread int `json:"unread"`
 }
 
+// ChannelUnread is what is waiting in one channel, as one member sees it.
+//
+// It is the same idea as the badge on a Conversation, and it travels for the
+// same reason: without it a client that has just connected cannot tell a
+// channel it read last night from one that has been busy since.
+type ChannelUnread struct {
+	ChannelID int64 `json:"channelId"`
+	// Count is how many messages sit past this member's read marker. A post
+	// counts as one and so does each comment under it, which is what a client
+	// counting them live arrives at.
+	Count int `json:"count"`
+	// LastReadID is the marker itself: the newest message this member has
+	// seen here.
+	LastReadID int64 `json:"lastReadId"`
+}
+
+// UnreadMention is one unread message reduced to what deciding the colour of a
+// badge needs.
+//
+// The server has no notion of a mention. A mention is the name it names,
+// resolved by the client against whoever it knows at the moment it is drawn —
+// see the header of src/lib/mentions.ts — so what crosses is the text, and the
+// client works out whether that text names the person reading it. Sending
+// whole Messages instead would carry attachments, embeds and reply previews
+// that nothing on the other side reads.
+type UnreadMention struct {
+	ChannelID int64 `json:"channelId"`
+	// Content is the words to scan. The body of a post carries its title in
+	// front of it, because a client counting that post live scans both.
+	Content string `json:"content"`
+	// UserID is the author, absent for a webhook.
+	UserID int64 `json:"userId,omitempty"`
+	// ReplyToUserID is who this message answers, absent when it answers
+	// nobody or answers something since deleted. Answering somebody reaches
+	// as far as writing their name out would.
+	ReplyToUserID int64 `json:"replyToUserId,omitempty"`
+}
+
 // Attachment is one file carried by a message.
 //
 // URL is relative to the server root, so a client that reached the server by
@@ -680,6 +718,14 @@ type Ready struct {
 	// with what is waiting in each. It travels in the snapshot because a badge
 	// is the whole reason to know a thread exists before opening it.
 	Conversations []Conversation `json:"conversations,omitempty"`
+	// Unread is every visible channel with something waiting in it. Channels
+	// with nothing waiting are left out rather than sent as zero, so a quiet
+	// server adds nothing to the snapshot.
+	Unread []ChannelUnread `json:"unread,omitempty"`
+	// UnreadMentions is the newest of those unread messages, capped, so the
+	// client can decide which of the badges above name it. See UnreadMention
+	// for why the deciding is done there and not here.
+	UnreadMentions []UnreadMention `json:"unreadMentions,omitempty"`
 	// Expressions is every custom emoji and sticker the server carries. It is
 	// in the snapshot rather than fetched because a message cannot be rendered
 	// without it: `:shrug:` in the very first line of history has to resolve.
@@ -826,6 +872,18 @@ type ChannelUpdateRequest struct {
 
 type ChannelDeleteRequest struct {
 	ChannelID int64 `json:"channelId"`
+}
+
+// ChannelReadRequest moves the caller's own read marker in one channel, which
+// is what clears its badge everywhere they are signed in.
+//
+// MessageID is optional and usually absent: a client clears a badge because
+// somebody is looking at the channel, and "everything in it" is what that
+// means. Naming a message is for a client that read up to a known point and
+// no further. Either way the marker only moves forwards.
+type ChannelReadRequest struct {
+	ChannelID int64 `json:"channelId"`
+	MessageID int64 `json:"messageId,omitempty"`
 }
 
 // PostCreateRequest starts an entry in a channel that holds them.
