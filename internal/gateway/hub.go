@@ -947,6 +947,9 @@ func (h *Hub) MaskUser(viewer *Session, view protocol.User) protocol.User {
 		// A custom status that keeps changing on an offline user is itself a
 		// tell, so it goes with the rest of the presence.
 		view.CustomStatus = ""
+		// And an activity is a louder one: it changes on its own, without the
+		// hidden user doing anything, so it would keep announcing them.
+		view.Activity = nil
 		view.ChannelID = nil
 	}
 	if view.ChannelID != nil && !h.SessionCanView(viewer, *view.ChannelID) {
@@ -1024,6 +1027,32 @@ func (h *Hub) BroadcastUserPresence(was string, view protocol.User) {
 			s.Send(protocol.Event(protocol.EvUserUpdated, protocol.UserEvent{User: h.MaskUser(s, view)}))
 		}
 	}
+}
+
+// ReportsActivityAsset reports whether any connected member is currently
+// naming that piece of artwork.
+//
+// It is what stands in for authentication on the endpoint that serves one: the
+// picture is public and the URL is guessable, so what has to be bounded is not
+// who may look but what this server may be made to fetch. The honest bound is
+// the set of things people here are actually playing.
+//
+// Hidden members are included on purpose. Their activity never reaches anybody
+// else, so nothing about them is revealed by the artwork being fetchable — and
+// leaving them out would mean their own client could not draw their own
+// picture.
+func (h *Hub) ReportsActivityAsset(app, key string) bool {
+	want := activityAssetPrefix + app + "/" + key
+	for _, s := range h.Sessions() {
+		activity := s.Activity()
+		if activity == nil {
+			continue
+		}
+		if activity.Image == want || activity.Icon == want {
+			return true
+		}
+	}
+	return false
 }
 
 // CollectMetrics gathers live resource usage, activity, and cached storage breakdown.

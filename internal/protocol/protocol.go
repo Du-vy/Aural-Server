@@ -61,8 +61,11 @@ const (
 	OpServerMetrics    = "server.metrics"    // query live server metrics & storage breakdown
 
 	OpUserUpdate = "user.update" // change own nickname
-	OpUserMove   = "user.move"   // move self (or another user) between channels
-	OpUserKick   = "user.kick"
+	// OpUserActivity reports what the caller is doing outside Aural. It is
+	// never stored: it belongs to the connection, and ends with it.
+	OpUserActivity = "user.activity"
+	OpUserMove     = "user.move" // move self (or another user) between channels
+	OpUserKick     = "user.kick"
 
 	// Bans. A kick ends a connection; a ban is a standing refusal, so it has
 	// its own small set of ops and a list that outlives everybody named in it.

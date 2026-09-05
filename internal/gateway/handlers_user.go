@@ -229,6 +229,237 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 	return protocol.UserEvent{User: s.hub.MaskUser(s, view)}, nil
 }
 
+// Bounds on one activity report.
+//
+// They are deliberately generous for text and tight for pictures. Text is what
+// a member list draws and is cut to fit long before any of these; the pictures
+// are the part that is broadcast to every connected member each time a track
+// changes, so they are what actually decides whether this feature costs the
+// server anything. An image ceiling of 24 KiB fits a 128-pixel cover as a data
+// URL with room to spare, and the two ceilings together stay well inside the
+// 64 KiB frame limit with the rest of the payload alongside them.
+const (
+	activityTextMax  = 128
+	activityURLMax   = 512
+	activityImageMax = 24 * 1024
+	activityIconMax  = 8 * 1024
+	// activityPartyMax bounds the party counter. It is a display number, not a
+	// membership: nothing here looks anybody up.
+	activityPartyMax = 1_000_000
+)
+
+// activityTypes is the set of verbs a report may carry.
+//
+// It is closed on the way in and open on the way out: a server only accepts
+// what it knows, while a client is expected to render a type it does not
+// recognise as "playing" rather than drop the activity. That is what lets a
+// later revision add one without every older client losing the feature.
+var activityTypes = map[string]bool{
+	"playing":   true,
+	"listening": true,
+}
+
+// handleUserActivity reports what the caller is doing outside Aural.
+//
+// Nothing here is written down. The report lives on the session and is gone
+// when the connection is, which is the only honest lifetime for it: it
+// describes a machine that this socket is the last evidence of. That is also
+// why there is no permission to check and no way to set it for somebody else —
+// it is not a claim about a person, it is a reading from their computer, and
+// only their computer can take it.
+func handleUserActivity(_ context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
+	req, failure := decode[protocol.UserActivityRequest](raw)
+	if failure != nil {
+		return nil, failure
+	}
+
+	// Clearing is exempt from the limiter on purpose. The report that matters
+	// most is the one saying the music stopped: dropping it would leave a
+	// member listening to a track that ended, which is worse than anything
+	// letting it through can cost.
+	if req.Activity != nil && !s.activities.allow() {
+		return nil, protocol.Errorf(protocol.ErrRateLimited,
+			"you are reporting activity too quickly")
+	}
+
+	activity, failure := validateActivity(req.Activity, s.hub.cfg.Activity.Assets)
+	if failure != nil {
+		return nil, failure
+	}
+
+	// Unchanged reports are the common case: a source that polls sends the
+	// same answer every time nothing happened, and forwarding those would
+	// redraw every member list on the server for nothing.
+	if sameActivity(s.Activity(), activity) {
+		return protocol.UserEvent{User: s.hub.MaskUser(s, s.view())}, nil
+	}
+
+	s.setActivity(activity)
+	view := s.view()
+	// The status has not changed, so this is an ordinary update — and for a
+	// hidden user it is no update at all, which is the point: an activity
+	// changes on its own and would otherwise keep announcing somebody who has
+	// chosen to look offline.
+	s.hub.BroadcastUserUpdated(view)
+	return protocol.UserEvent{User: view}, nil
+}
+
+// validateActivity bounds one report, or passes nil through as the clear it is.
+//
+// assets says whether this server will fetch game artwork on its members'
+// behalf. It is threaded down here rather than checked at the edge because the
+// answer decides what a picture reference turns into, and a reference this
+// server will not resolve has to be dropped on the way in — not broadcast for
+// every client to fail to load.
+func validateActivity(a *protocol.Activity, assets bool) (*protocol.Activity, *protocol.Error) {
+	if a == nil {
+		return nil, nil
+	}
+
+	clean := protocol.Activity{
+		Type:      strings.TrimSpace(a.Type),
+		Name:      strings.TrimSpace(a.Name),
+		Details:   strings.TrimSpace(a.Details),
+		State:     strings.TrimSpace(a.State),
+		StartedAt: a.StartedAt,
+		EndsAt:    a.EndsAt,
+		Image:     strings.TrimSpace(a.Image),
+		Icon:      strings.TrimSpace(a.Icon),
+		ImageText: strings.TrimSpace(a.ImageText),
+		IconText:  strings.TrimSpace(a.IconText),
+	}
+
+	if !activityTypes[clean.Type] {
+		return nil, protocol.Errorf(protocol.ErrBadRequest,
+			"activity type must be one of: listening, playing")
+	}
+	if clean.Name == "" {
+		return nil, protocol.Errorf(protocol.ErrBadRequest, "activity name is required")
+	}
+	for field, value := range map[string]string{
+		"name":      clean.Name,
+		"details":   clean.Details,
+		"state":     clean.State,
+		"imageText": clean.ImageText,
+		"iconText":  clean.IconText,
+	} {
+		if len([]rune(value)) > activityTextMax {
+			return nil, protocol.Errorf(protocol.ErrBadRequest,
+				fmt.Sprintf("activity %s must be at most %d characters", field, activityTextMax))
+		}
+	}
+
+	// A timestamp is a counter a client runs, so all that has to be true of it
+	// is that it is a time and that the pair reads forwards.
+	if clean.StartedAt < 0 || clean.EndsAt < 0 {
+		return nil, protocol.Errorf(protocol.ErrBadRequest, "activity timestamps must not be negative")
+	}
+	if clean.StartedAt > 0 && clean.EndsAt > 0 && clean.EndsAt < clean.StartedAt {
+		return nil, protocol.Errorf(protocol.ErrBadRequest, "activity ends before it starts")
+	}
+
+	image, failure := validateActivityImage(clean.Image, "image", activityImageMax, assets)
+	if failure != nil {
+		return nil, failure
+	}
+	clean.Image = image
+	icon, failure := validateActivityImage(clean.Icon, "icon", activityIconMax, assets)
+	if failure != nil {
+		return nil, failure
+	}
+	clean.Icon = icon
+
+	if a.Party != nil {
+		party := *a.Party
+		if party.Size < 0 || party.Max < 0 {
+			return nil, protocol.Errorf(protocol.ErrBadRequest, "activity party counts must not be negative")
+		}
+		if party.Size > activityPartyMax || party.Max > activityPartyMax {
+			return nil, protocol.Errorf(protocol.ErrBadRequest, "activity party counts are out of range")
+		}
+		// A party of nobody is what an absent party already says.
+		if party.Size > 0 || party.Max > 0 {
+			clean.Party = &party
+		}
+	}
+
+	return &clean, nil
+}
+
+// validateActivityImage bounds one picture reference, and resolves the one
+// form that is not a picture at all.
+//
+// Three forms are allowed, because the sources genuinely differ:
+//
+//	data:image/  a media session, which hands over decoded bytes that exist
+//	             nowhere but the machine they came from
+//	https://     a game naming art that is already hosted somewhere
+//	asset:       a game naming art by a key that means something only to
+//	             Discord, where the game's own application keeps it
+//
+// The third is the interesting one. It is not loadable by anybody, and turning
+// it into something that is means asking Discord what the key refers to. That
+// request is made by this server rather than by every member's client — see
+// handlers_activity.go for why — so what goes out on the wire is a path back
+// here, and the fetch happens once, when somebody's client asks for it.
+//
+// Plain http is not among the forms. This is content every member's client
+// will load, and a plaintext fetch turns a member list into a way of telling
+// somebody's network what they are listening to.
+func validateActivityImage(value, field string, max int, assets bool) (string, *protocol.Error) {
+	if value == "" {
+		return "", nil
+	}
+	switch {
+	case strings.HasPrefix(value, "https://"):
+		if len(value) > activityURLMax {
+			return "", protocol.Errorf(protocol.ErrBadRequest,
+				fmt.Sprintf("activity %s url must be at most %d characters", field, activityURLMax))
+		}
+	case strings.HasPrefix(value, "data:image/"):
+		if len(value) > max {
+			return "", protocol.Errorf(protocol.ErrTooLarge,
+				fmt.Sprintf("activity %s must be at most %d bytes", field, max))
+		}
+	case strings.HasPrefix(value, "asset:"):
+		// An operator who has switched artwork off has said this server does
+		// not call Discord. The reference is dropped rather than refused: the
+		// activity itself is fine, and losing the text over a picture nobody
+		// asked for would be the wrong trade.
+		if !assets {
+			return "", nil
+		}
+		app, key, found := strings.Cut(strings.TrimPrefix(value, "asset:"), "/")
+		if !found || !activityAppPattern.MatchString(app) || !activityAssetPattern.MatchString(key) {
+			return "", protocol.Errorf(protocol.ErrBadRequest,
+				fmt.Sprintf("activity %s names a malformed asset", field))
+		}
+		return activityAssetPrefix + app + "/" + key, nil
+	default:
+		return "", protocol.Errorf(protocol.ErrBadRequest,
+			fmt.Sprintf("activity %s must be an https, data:image or asset reference", field))
+	}
+	return value, nil
+}
+
+// sameActivity reports whether two reports say the same thing, so that a source
+// which polls does not redraw every member list on the server for no change.
+func sameActivity(a, b *protocol.Activity) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	switch {
+	case a.Party == nil && b.Party == nil:
+	case a.Party == nil || b.Party == nil:
+		return false
+	case *a.Party != *b.Party:
+		return false
+	}
+	x, y := *a, *b
+	x.Party, y.Party = nil, nil
+	return x == y
+}
+
 // handleUserMove joins, leaves or switches a voice channel. Presence lives only
 // in a voice channel: text channels are chosen client side and carry no state.
 func handleUserMove(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {

@@ -236,6 +236,59 @@ func (v VoiceState) Muted() bool { return v.SelfMute || v.Mute }
 // as it does everywhere else, because listening is why you are in the channel.
 func (v VoiceState) Deafened() bool { return v.SelfDeaf || v.Deaf }
 
+// Activity is what somebody is doing outside Aural: the track they are playing,
+// the game they are in.
+//
+// It is the one thing on a user that no part of Aural produced. It is read off
+// the machine the client runs on — the system's media session, or a game
+// talking a rich-presence protocol to a socket the client is listening on — and
+// it is never stored. It lives on the connection that reported it and goes when
+// that connection does, which is what keeps a stale "playing" from outliving
+// the session that meant it.
+//
+// The shape is deliberately close to what those sources already speak, so that
+// a client mapping one into this has nothing to invent. Everything but Type and
+// Name is optional, and a renderer that only draws those two is a complete one.
+type Activity struct {
+	// Type is what the verb in front of Name reads as: "listening" or
+	// "playing". A client renders an unknown type as "playing" rather than
+	// dropping it, so the set can grow without breaking an older one.
+	Type string `json:"type"`
+	// Name is the application: the game, the music player, the source.
+	Name string `json:"name"`
+	// Details and State are the two free lines under it. In practice Details
+	// is the specific thing — a track title, a map — and State is the context
+	// around it — the artist, the mode. Neither is interpreted here.
+	Details string `json:"details,omitempty"`
+	State   string `json:"state,omitempty"`
+	// StartedAt and EndsAt are unix seconds, and are what a client counts up
+	// from or down to. Both zero means no timer, which is most activities.
+	StartedAt int64 `json:"startedAt,omitempty"`
+	EndsAt    int64 `json:"endsAt,omitempty"`
+	// Image is the artwork, and Icon the small badge over its corner. Each is
+	// either an https URL or a data: URL carrying the picture itself, because
+	// the two sources differ: a game's rich presence names art already hosted
+	// somewhere, while a media session hands over decoded bytes that exist
+	// nowhere else. Both are bounded — see the limits in the gateway — and a
+	// client must treat either as somebody else's content, which is what it
+	// already does with an embed.
+	Image string `json:"image,omitempty"`
+	Icon  string `json:"icon,omitempty"`
+	// ImageText and IconText are the tooltips over the two pictures.
+	ImageText string `json:"imageText,omitempty"`
+	IconText  string `json:"iconText,omitempty"`
+	// Party is the group this activity is part of, when the source reports one.
+	Party *ActivityParty `json:"party,omitempty"`
+}
+
+// ActivityParty is "3 of 8" under an activity, and nothing more: the ids some
+// sources carry alongside it exist to let a stranger ask to join, which is a
+// feature this protocol does not have and an identifier it will not relay.
+type ActivityParty struct {
+	Size int `json:"size"`
+	Max  int `json:"max"`
+}
+
 // User is a member of the server. Guests are users too: they simply have no
 // username yet.
 type User struct {
@@ -261,6 +314,10 @@ type User struct {
 	// string, and finding out that a message will not be delivered is what
 	// sending one is for.
 	DMPrivacy string `json:"dmPrivacy,omitempty"`
+	// Activity is what this user is doing outside Aural, or nil. It is not
+	// stored anywhere: it belongs to the connection that reported it, and an
+	// offline entry never carries one.
+	Activity *Activity `json:"activity,omitempty"`
 }
 
 // Overwrite is a per-channel permission adjustment for one role. Allow and Deny
@@ -718,6 +775,19 @@ type UserUpdateRequest struct {
 	// or "none". It is your own setting and cannot be changed for anybody else,
 	// whatever permissions the caller holds.
 	DMPrivacy *string `json:"dmPrivacy,omitempty"`
+}
+
+// UserActivityRequest reports what the caller is doing outside Aural.
+//
+// It is separate from UserUpdateRequest because it is a different kind of
+// thing. Everything in a profile update is stored, chosen by a person, and
+// changed a handful of times a year; this is ephemeral, produced by a machine,
+// and changes whenever a track does. Sharing an op would mean a database write
+// per track change and one rate limit covering two very different rhythms.
+//
+// A nil Activity clears it, which is what a client sends when the music stops.
+type UserActivityRequest struct {
+	Activity *Activity `json:"activity"`
 }
 
 type UserMoveRequest struct {

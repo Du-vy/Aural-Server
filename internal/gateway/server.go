@@ -52,6 +52,13 @@ type Server struct {
 	uploads *userLimiters
 	unfurls *userLimiters
 	klipy   *userLimiters
+	// activityAssetLimit throttles fetching the artwork behind an activity,
+	// and activityAssets is what makes that rare: one picture is fetched once
+	// and then served from memory to everybody who can see the member playing.
+	// It is keyed by client address rather than by identity — the endpoint is
+	// reached by an <img> tag, which carries no token to name one by.
+	activityAssetLimit *userLimiters
+	activityAssets     *activityAssetCache
 	// deliveries throttles the webhook endpoints. It is keyed by webhook
 	// rather than by identity, because a webhook has no identity: the URL is
 	// the caller, and it is the URL a sender has to be paced by.
@@ -77,11 +84,13 @@ func New(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Stor
 
 	s := &Server{
 		cfg: cfg, st: st, log: log, hub: hub,
-		uploads:        newUserLimiters(uploadBurst, uploadsPerSecond),
-		unfurls:        newUserLimiters(unfurlBurst, unfurlsPerSecond),
-		klipy:          newUserLimiters(klipyBurst, klipyPerSecond),
-		deliveries:     newUserLimiters(deliveryBurst, deliveriesPerSecond),
-		trustedProxies: trusted,
+		uploads:            newUserLimiters(uploadBurst, uploadsPerSecond),
+		unfurls:            newUserLimiters(unfurlBurst, unfurlsPerSecond),
+		klipy:              newUserLimiters(klipyBurst, klipyPerSecond),
+		activityAssetLimit: newUserLimiters(activityAssetBurst, activityAssetsPerSecond),
+		activityAssets:     newActivityAssetCache(),
+		deliveries:         newUserLimiters(deliveryBurst, deliveriesPerSecond),
+		trustedProxies:     trusted,
 	}
 
 	mux := http.NewServeMux()
@@ -106,6 +115,8 @@ func New(ctx context.Context, cfg *config.Config, cfgPath string, st *store.Stor
 	mux.HandleFunc("OPTIONS "+uploadPrefix+"{key}/{filename}", s.handlePreflight)
 	mux.HandleFunc("GET /unfurl", s.handleUnfurl)
 	mux.HandleFunc("OPTIONS /unfurl", s.handlePreflight)
+	mux.HandleFunc("GET "+activityAssetPrefix+"{app}/{key}", s.handleActivityAsset)
+	mux.HandleFunc("OPTIONS "+activityAssetPrefix+"{app}/{key}", s.handlePreflight)
 	mux.HandleFunc("GET /klipy/{kind}/{action}", s.handleKlipy)
 	mux.HandleFunc("OPTIONS /klipy/{kind}/{action}", s.handlePreflight)
 

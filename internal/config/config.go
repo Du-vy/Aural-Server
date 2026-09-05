@@ -27,6 +27,7 @@ type Config struct {
 	Uploads      Uploads      `json:"uploads"`
 	Expressions  Expressions  `json:"expressions"`
 	Unfurl       Unfurl       `json:"unfurl"`
+	Activity     Activity     `json:"activity"`
 	Integrations Integrations `json:"integrations"`
 	Relay        Relay        `json:"relay"`
 	DDNS         DDNS         `json:"ddns"`
@@ -227,6 +228,27 @@ type Unfurl struct {
 	Enabled bool `json:"enabled"`
 	// CacheTTLDays is how many days a link preview is kept before re-fetching. Default is 7.
 	CacheTTLDays int `json:"cache_ttl_days"`
+}
+
+// Activity controls what this server does with the rich presence its members
+// report.
+//
+// There is one switch and it is about outbound traffic, not about the feature:
+// members may always report what they are doing, and the text of it costs this
+// server nothing. Artwork is the part that does. A game names its picture by a
+// key that means something only to Discord, so somebody has to ask Discord what
+// it refers to — and the choice is between every member's client asking, which
+// tells Discord who is playing what and from which address, and this server
+// asking once and serving the result to everybody.
+//
+// Doing it here is the lesser of the two, which is why it is the default: one
+// request from one address, cached, instead of one per member per game. An
+// operator who would rather this server never contacted Discord at all turns it
+// off, and activities arrive with their text and without their pictures.
+type Activity struct {
+	// Assets allows this server to fetch game artwork from Discord's CDN on
+	// behalf of its members.
+	Assets bool `json:"assets"`
 }
 
 // Integrations holds third-party service credentials like Klipy.com.
@@ -564,6 +586,9 @@ func Default() Config {
 		Unfurl: Unfurl{
 			Enabled:      true,
 			CacheTTLDays: 7,
+		},
+		Activity: Activity{
+			Assets: true,
 		},
 		Integrations: Integrations{
 			KlipyAPIKey: "",

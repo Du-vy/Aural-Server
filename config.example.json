@@ -58,6 +58,9 @@
     "enabled": true,
     "cache_ttl_days": 7
   },
+  "activity": {
+    "assets": true
+  },
   "integrations": {
     "klipy_api_key": ""
   },

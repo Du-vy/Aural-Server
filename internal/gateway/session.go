@@ -70,6 +70,15 @@ const (
 	// a second is faster than speech alternates; the burst covers a stutter.
 	speakingBurst     = 12
 	speakingPerSecond = 2
+	// activityBurst and activitiesPerSecond throttle the rich-presence report,
+	// which is the one frame a client sends on a machine's schedule rather
+	// than a person's. A game may push an update every second it is open and a
+	// track change arrives in a small flurry, so the burst covers the flurry
+	// while the refill holds the long-run rate to something a member list can
+	// be redrawn at. A client that outruns it is expected to coalesce, which
+	// is what dropping the frame rather than closing the connection tells it.
+	activityBurst       = 8
+	activitiesPerSecond = 0.5
 	// soundBurst and soundsPerSecond throttle the soundboard, which is paced
 	// far more tightly than anything else a client sends. One frame plays up
 	// to ten seconds of audio at everybody in the channel at once, so the
@@ -126,6 +135,8 @@ type Session struct {
 	speaking *rateLimiter
 	// soundboard throttles playing a clip at a room.
 	soundboard *rateLimiter
+	// activities throttles the rich-presence report.
+	activities *rateLimiter
 
 	// slowSlots bounds the reads running off the read loop. It is a channel
 	// rather than a counter so that taking a slot is a non-blocking try: a
@@ -153,6 +164,11 @@ type Session struct {
 	// automatic-moderation state that cannot live in the database: it is about
 	// the last few seconds, and it is thrown away with the connection.
 	recent []recentMessage
+	// activity is what this connection last reported its owner to be doing
+	// outside Aural, or nil. It is held here rather than on the user row
+	// because it describes the machine at the other end of this socket: a
+	// second connection means a second answer, and no connection means none.
+	activity *protocol.Activity
 }
 
 // recentMessage is one thing this connection wrote, kept only long enough for
@@ -177,6 +193,7 @@ func newSession(id int64, hub *Hub, conn *websocket.Conn, peer string, log *slog
 		signals:    newRateLimiter(signalBurst, signalsPerSecond),
 		speaking:   newRateLimiter(speakingBurst, speakingPerSecond),
 		soundboard: newRateLimiter(soundBurst, soundsPerSecond),
+		activities: newRateLimiter(activityBurst, activitiesPerSecond),
 	}
 }
 
@@ -246,6 +263,37 @@ func (s *Session) setChannel(id *int64) {
 	s.mu.Lock()
 	s.channelID = id
 	s.mu.Unlock()
+}
+
+// Activity is what the connection last reported its owner to be doing outside
+// Aural, or nil. The copy is deep enough that a caller holding it cannot reach
+// back into the session through the party pointer.
+func (s *Session) Activity() *protocol.Activity {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneActivity(s.activity)
+}
+
+// setActivity records a new report, or clears it with nil.
+func (s *Session) setActivity(activity *protocol.Activity) {
+	s.mu.Lock()
+	s.activity = cloneActivity(activity)
+	s.mu.Unlock()
+}
+
+// cloneActivity copies an activity and the party hanging off it, so that the
+// value on the session and the value on a view being broadcast are never the
+// same memory.
+func cloneActivity(a *protocol.Activity) *protocol.Activity {
+	if a == nil {
+		return nil
+	}
+	copied := *a
+	if a.Party != nil {
+		party := *a.Party
+		copied.Party = &party
+	}
+	return &copied
 }
 
 // --- voice ------------------------------------------------------------------
@@ -404,7 +452,11 @@ func (s *Session) view() protocol.User {
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return userView(s.user, s.roleIDs, s.channelID, true, owner)
+	view := userView(s.user, s.roleIDs, s.channelID, true, owner)
+	// Attached here rather than in userView: it is the one field that is not
+	// on the row, and this is the only place that has both halves.
+	view.Activity = cloneActivity(s.activity)
+	return view
 }
 
 // --- transport --------------------------------------------------------------
@@ -630,9 +682,10 @@ var routes = map[string]route{
 	protocol.OpServerUpdate:     {needsAuth: true, fn: handleServerUpdate},
 	protocol.OpServerMetrics:    {needsAuth: true, slow: true, fn: handleServerMetrics},
 
-	protocol.OpUserUpdate: {needsAuth: true, fn: handleUserUpdate},
-	protocol.OpUserMove:   {needsAuth: true, fn: handleUserMove},
-	protocol.OpUserKick:   {needsAuth: true, fn: handleUserKick},
+	protocol.OpUserUpdate:   {needsAuth: true, fn: handleUserUpdate},
+	protocol.OpUserActivity: {needsAuth: true, fn: handleUserActivity},
+	protocol.OpUserMove:     {needsAuth: true, fn: handleUserMove},
+	protocol.OpUserKick:     {needsAuth: true, fn: handleUserKick},
 
 	// Moderation that outlives a connection, and the record of it. Reading the
 	// log walks a table that only grows, so it is dispatched off the read loop

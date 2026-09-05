@@ -150,6 +150,11 @@ leave out falls back to its default. See `config.example.json` for the full file
     "max_sticker_bytes": 1048576,
     "max_sound_bytes": 4194304
   },
+  "activity": {
+    "assets": true             // resolve game artwork from Discord, once, for
+                               // everybody; off means activities keep their
+                               // text and lose their pictures
+  },
   "relay": {
     "enabled": false,          // bridge channels to a Discord server
     "bot_token": "",           // from the Bot page of a Discord application
@@ -744,6 +749,17 @@ server, with each message wearing the name and picture of whoever wrote it,
 files and edits carried across, an exact loop guard on each side, and AutoMod
 applied to what arrives. Built directly on the WebSocket library the server
 already uses, so it costs no new dependency.
+
+**Unreleased** — rich presence: `user.activity` carries what somebody is doing
+outside Aural — the track their media player is on, the game they are in — as a
+field on their user, broadcast the way presence already is. Nothing about it is
+stored: it belongs to the connection that reported it, an offline entry never
+carries one, and a member who looks offline has it dropped along with their
+custom status. Game artwork is resolved by the server rather than by every
+member's client — one cached request to Discord instead of one per member per
+game, and the picture then served from here — which `activity.assets` switches
+off for an operator who would rather this server never contacted Discord at
+all. See [`docs/PROTOCOL.md`](docs/PROTOCOL.md#activity).
 
 **Later** — bots and a bot API, per-user permission overwrites, screen
 sharing, and Aural Hub, a directory for finding public servers.

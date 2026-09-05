@@ -345,6 +345,10 @@ func offlineView(u store.User, roleIDs []int64, owner bool) protocol.User {
 	view.Status = "offline"
 	view.CustomStatus = ""
 	view.DMPrivacy = ""
+	// Nothing stored produces one — an activity only ever lives on a live
+	// session — so this is belt and braces against a future userView that
+	// learns to fill it in.
+	view.Activity = nil
 	return view
 }
 

@@ -278,7 +278,24 @@ member.
   "roles": [1, 2],
   "channelId": 3,          // null when in no voice channel
   "online": true,
-  "dmPrivacy": "everyone"  // only on your own entry; see Private conversations
+  "dmPrivacy": "everyone", // only on your own entry; see Private conversations
+  "activity": { /* Activity */ }  // absent unless they reported one
+}
+
+// Activity — what somebody is doing outside Aural. Never stored: it belongs to
+// the connection that reported it. See Activity.
+{
+  "type": "listening",     // listening | playing
+  "name": "Spotify",       // the application
+  "details": "Teardrop",   // the specific thing
+  "state": "Massive Attack",
+  "startedAt": 1756600000, // unix seconds; a counter the client runs
+  "endsAt": 1756600280,
+  "image": "data:image/jpeg;base64,...",  // data: | https: | /activity-assets/
+  "icon": "/activity-assets/230684596683866113/badge",
+  "imageText": "Mezzanine",
+  "iconText": "Spotify",
+  "party": { "size": 2, "max": 8 }        // absent when there is no group
 }
 
 // Channel — "category" holds others; every other type is a leaf
@@ -597,6 +614,7 @@ Every op below needs an authenticated session.
 | `server.claimAdmin` | — | Redeems the one-time owner token and makes the caller the owner. Grants no role. |
 | `server.update` | `ManageServer` | `{ name?, description?, klipyApiKey?, voice? }`. Persisted to the configuration file. `voice` replaces the audio plane whole and restarts every call. |
 | `user.update` | `ChangeNickname`, or `ManageNicknames` for others | `{ userId?, nickname }`. Renaming somebody else works while they are offline; the rest of the fields are your own and need a connection. |
+| `user.activity` | — | `{ activity }`, or `{ "activity": null }` to clear. Your own connection only: it is a reading from your machine, not a claim about a person. Never stored. Rate limited; clearing never is. |
 | `user.move` | `Connect` on the destination; `MoveUsers` for others | `{ userId?, channelId }`. `channelId: null` leaves. The target must be connected. |
 | `user.kick` | `KickUsers` | `{ userId, reason?, deleteMessages? }`. Ends the connection and removes the identity. `deleteMessages` purges what they wrote: `none`, `1d`, `7d`, `30d` or `all`. |
 | `ban.list` | `BanUsers` | `{}`. Newest first. The handles a ban catches are counted, never named. |
@@ -1543,6 +1561,88 @@ guessed from the ACME domain, the dynamic DNS name or the resolved public
 address when it is not set, and an unguessable one costs the per-author pictures
 on the Discord side and nothing else.
 
+## Activity
+
+`user.activity` reports what somebody is doing outside Aural — the track their
+media player is on, the game they are in. No part of Aural produces it: the
+client reads it off the machine it runs on, from the system's media session or
+from a game speaking a rich-presence protocol to a socket the client listens
+on, and maps whatever it finds onto the one shape above.
+
+It is a separate op from `user.update` because it is a different kind of thing.
+A profile is stored, chosen by a person, and changed a handful of times a year;
+an activity is ephemeral, produced by a machine, and changes whenever a track
+does. Sharing an op would mean a database write per track change and one rate
+limit covering two very different rhythms.
+
+Four rules hold it down:
+
+- **It lives on the connection.** Nothing writes it anywhere. It goes when the
+  connection does, an offline entry never carries one, and a client that signs
+  back in starts with none. A "playing" that outlived the session that meant it
+  would be worse than no activity at all.
+- **It is nobody else's to set.** There is no `userId` and no permission that
+  grants one. It is a reading from somebody's computer, and only their computer
+  can take it.
+- **Hiding hides it too.** An activity changes without its owner doing
+  anything, so for a member who looks offline — `invisible`, or genuinely
+  away — it is dropped along with the custom status. Otherwise it would keep
+  announcing somebody who chose not to be seen.
+- **Pictures are bounded and never fetched in the clear.** `image` and `icon`
+  each take one of three forms, because the sources genuinely differ:
+
+  | Sent by a client | Carried to everybody | Where it comes from |
+  | --- | --- | --- |
+  | `data:image/…` | unchanged, 24 KiB for `image` and 8 KiB for `icon` | a media session, which hands over decoded bytes that exist nowhere else |
+  | `https://…` | unchanged, 512 characters | a game naming art already hosted somewhere |
+  | `asset:<app>/<key>` | `/activity-assets/<app>/<key>` | a game naming art by a key that means something only to Discord |
+
+  Plain `http` is refused: this is content every member's client loads, and a
+  plaintext fetch would tell somebody's network what they are listening to. A
+  client must treat any of them as somebody else's content, exactly as it
+  already treats an embed, and resolve the third against the connection the
+  way it resolves an avatar.
+
+`type` is closed on the way in and open on the way out: a server accepts only
+the verbs it knows, while a client renders an unrecognised one as `playing`
+rather than dropping the activity. That is what lets a later revision add a
+verb without every older client losing the feature.
+
+### Game artwork
+
+A game does not hand over a picture. It hands over a key — the name of an image
+uploaded to the game's own Discord application — and the only place that knows
+what the key refers to is Discord. Somebody has to ask, and there are only two
+candidates.
+
+If every member's client asked, Discord would learn who is playing what, from
+how many addresses, every time anybody started a game. So the server asks
+instead: `asset:<app>/<key>` is rewritten on the way in to a path back here,
+and `GET /activity-assets/{app}/{key}` resolves it once, caches it, and serves
+the bytes. Every member then loads the picture from the server they were
+already talking to.
+
+It is a proxy rather than a redirect, for the same reason — handing a client a
+CDN URL would move the request back to where it started.
+
+There is no token on it, and there cannot be: the picture is loaded by an
+`<img>` tag, which carries no headers, exactly as an attachment is. An
+attachment is protected by an unguessable key; this path is two public Discord
+identifiers, so it protects nothing — and does not need to, because the artwork
+behind it is public too. What does need bounding is the fetch, so the server
+serves only artwork **somebody connected is currently reporting**, plus whatever
+is already in its cache. Anything else is `not_found`. On top of that it is rate
+limited per client address, refuses anything that does not come back as an
+image, caps the body, and follows no redirects.
+
+`activity.assets` in the server configuration switches the whole of it off, in
+which case an `asset:` reference is dropped on the way in and the activity
+arrives with its text and without its picture.
+
+An unchanged report is answered but not broadcast — a source that polls sends
+the same answer whenever nothing happened, and forwarding those would redraw
+every member list on the server for no change.
+
 ## Presence rules
 
 - **One connection per identity.** A second connection with the same identity
@@ -1563,6 +1663,9 @@ on the Discord side and nothing else.
   generate no events of their own, because somebody away generates none either.
   A guest has no offline entry to hide in, so a hidden guest is left out of the
   list entirely instead.
+- **An activity is presence.** It is dropped from every masked view for the
+  same reason a custom status is, and it is never carried by an offline entry
+  at all. See [Activity](#activity).
 - **A change made to somebody who is away is still announced.** Renaming a
   member or granting them a role sends `user.updated` carrying their offline
   entry, whether they are absent or hiding: these are the only things that
