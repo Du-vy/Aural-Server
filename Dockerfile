@@ -5,7 +5,7 @@
 # -----------------------------------------------------------------------------
 # Pinned to the minor version go.mod asks for: a floating "alpine" tag builds
 # fine today and picks up the next major toolchain without anybody deciding to.
-ARG GO_VERSION=1.26-alpine
+ARG GO_VERSION=1.27-alpine
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS builder
 
 WORKDIR /src
