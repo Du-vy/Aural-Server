@@ -154,6 +154,9 @@ func (s *Server) Run(ctx context.Context) error {
 		// Before the listener, deliberately: the sweep is only unambiguous
 		// while nothing is uploading.
 		s.sweepOrphanedFiles(ctx)
+		// And after it, because a sweep is one of the things that could have
+		// taken the icon — older builds swept it every restart.
+		s.forgetAMissingServerIcon()
 	}
 	go s.sweepMaintenance(ctx)
 	// Keeps the address the relay advertises current on a connection whose own

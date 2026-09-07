@@ -3,6 +3,7 @@ package gateway_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/aural-chat/aural-server/internal/gateway"
 	"github.com/aural-chat/aural-server/internal/protocol"
@@ -38,4 +39,28 @@ func TestServerMetricsRequiresManageServer(t *testing.T) {
 	if res.System.ServerVersion == "" {
 		t.Errorf("expected ServerVersion, got empty")
 	}
+}
+
+// The whole contract of ping is that it answers, and answers to anybody who is
+// signed in: a client cannot time its round trip to a server that will only
+// reply to an administrator.
+func TestPingAnswersAnyAuthenticatedSession(t *testing.T) {
+	h := newHarness(t, nil)
+	c := h.dial()
+	c.guest("GuestUser")
+
+	before := time.Now().Add(-time.Minute).UnixMilli()
+	res := ok[protocol.PongResponse](c, protocol.OpPing, nil)
+	after := time.Now().Add(time.Minute).UnixMilli()
+
+	if res.ServerTime < before || res.ServerTime > after {
+		t.Fatalf("pong carried %d, which is not a plausible clock right now", res.ServerTime)
+	}
+}
+
+func TestPingNeedsAuthentication(t *testing.T) {
+	h := newHarness(t, nil)
+	c := h.dial()
+
+	c.fails(protocol.OpPing, nil, protocol.ErrUnauthorized)
 }

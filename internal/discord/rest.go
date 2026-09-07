@@ -174,16 +174,48 @@ type OutboundMessage struct {
 	AvatarURL string
 	Embeds    []protocol.Embed
 	Files     []OutboundFile
+	// AllowedMentions is the accounts this message is permitted to ping, by
+	// Discord id. Everything not in it is still rendered and still resolves to
+	// a name; it simply raises no notification. Empty means the default, which
+	// is that nothing pings at all.
+	//
+	// It is a whitelist rather than a filter for the reason the header of
+	// allowedMentionsNone gives: the caller builds it by resolving names
+	// against the guild's own member list, so @everyone, @here and roles
+	// resolve to nothing and can never appear here.
+	AllowedMentions []string
 }
 
 // allowedMentionsNone suppresses every ping a relayed message could raise.
 //
 // This is not a nicety. Content coming the other way is written by people on a
 // server whose moderators are not Discord's, and an unfiltered relay hands any
-// one of them @everyone on a server they are not even in. Aural mentions are
-// plain text and would not resolve to a Discord id anyway, so nothing that
-// should ping is lost by refusing all of it.
+// one of them @everyone on a server they are not even in.
+//
+// The empty parse list is what refuses the three broad kinds — everyone, here,
+// and roles — and it stays empty in every message this package sends. What
+// changes per message is the users list beside it: see allowedMentionsFor.
 var allowedMentionsNone = map[string]any{"parse": []string{}}
+
+// allowedMentionsFor permits exactly the accounts named, and nothing else.
+//
+// The parse list stays empty, so this can only ever widen the permission by
+// one person at a time, and only to somebody the caller has already resolved
+// as a member of the guild being posted into. Discord caps the list at a
+// hundred ids and rejects the whole message over a longer one, so it is cut
+// rather than sent.
+func allowedMentionsFor(users []string) map[string]any {
+	if len(users) == 0 {
+		return allowedMentionsNone
+	}
+	if len(users) > maxAllowedMentions {
+		users = users[:maxAllowedMentions]
+	}
+	return map[string]any{"parse": []string{}, "users": users}
+}
+
+// maxAllowedMentions is Discord's own ceiling on the users list.
+const maxAllowedMentions = 100
 
 // executeBody is the JSON half of a webhook delivery.
 type executeBody struct {
@@ -212,7 +244,7 @@ func (r *REST) Execute(ctx context.Context, id, token string, msg OutboundMessag
 		Username:        msg.Username,
 		AvatarURL:       msg.AvatarURL,
 		Embeds:          msg.Embeds,
-		AllowedMentions: allowedMentionsNone,
+		AllowedMentions: allowedMentionsFor(msg.AllowedMentions),
 	}
 	path := r.webhookPath(id, token) + "?wait=true"
 
@@ -240,6 +272,9 @@ func (r *REST) Execute(ctx context.Context, id, token string, msg OutboundMessag
 func (r *REST) Edit(ctx context.Context, id, token, messageID string, msg OutboundMessage) error {
 	// A username or avatar cannot be changed on an edit, and sending them is a
 	// 400 rather than an ignored field.
+	// An edit deliberately pings nobody, whatever the new text names. Discord
+	// does not notify on an edit either, and a bridge that did would let a
+	// message be edited into a mention after the fact.
 	raw, err := json.Marshal(executeBody{
 		Content:         msg.Content,
 		Embeds:          msg.Embeds,

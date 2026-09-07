@@ -286,3 +286,120 @@ func (s stubResolver) ChannelName(id string) (string, bool) {
 	name, ok := s.channels[id]
 	return name, ok
 }
+
+func TestRewriteMentionsOnlyTouchesNamesThatResolve(t *testing.T) {
+	roster := map[string]string{
+		"ada":   "111111111111111111",
+		"Grace": "222222222222222222",
+	}
+	resolve := func(name string) (string, bool) {
+		id, ok := roster[name]
+		return id, ok
+	}
+
+	cases := []struct{ in, want string }{
+		// Somebody who is there.
+		{"hey @ada look", "hey <@111111111111111111> look"},
+		// Somebody who is not. An @ in front of a name nobody answers to is
+		// prose, and rewriting it would be inventing a person.
+		{"@nobody are you there", "@nobody are you there"},
+		// The broad kinds resolve to nothing, which is the whole of what keeps
+		// them from crossing.
+		{"@everyone @here", "@everyone @here"},
+		// Twice over, and both.
+		{"@ada and @Grace and @ada", "<@111111111111111111> and <@222222222222222222> and <@111111111111111111>"},
+		// Punctuation ends a name; a longer name is a different name.
+		{"@ada, hello", "<@111111111111111111>, hello"},
+		{"@adalovelace", "@adalovelace"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := RewriteMentions(tc.in, resolve); got != tc.want {
+			t.Errorf("RewriteMentions(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestRewriteMentionsRunsAfterEscaping(t *testing.T) {
+	resolve := func(name string) (string, bool) {
+		if name == "ada" {
+			return "111111111111111111", true
+		}
+		return "", false
+	}
+
+	// Somebody writing a raw Discord mention gets it defanged, and it must not
+	// then be un-defanged by the rewrite: the only ids that survive are the
+	// ones this side resolved.
+	escaped := EscapeOutbound("<@999999999999999999> and @ada")
+	got := RewriteMentions(escaped, resolve)
+
+	if strings.Contains(got, "<@999999999999999999>") {
+		t.Fatalf("a hand-written id crossed intact: %q", got)
+	}
+	if !strings.Contains(got, "<@111111111111111111>") {
+		t.Fatalf("a resolved name did not become a mention: %q", got)
+	}
+}
+
+func TestRosterKeepsPresenceAcrossAMemberUpdate(t *testing.T) {
+	c := NewClient(Options{Token: "x"})
+
+	c.cacheRoster("g1", []rawMember{
+		{User: User{ID: "1", Username: "ada", GlobalName: "Ada"}},
+		{User: User{ID: "2", Username: "grace"}},
+	}, []rawPresence{presenceOf("1", StatusIdle)}, 2)
+
+	if m, ok := c.MemberByName("g1", "ada"); !ok || m.Status != StatusIdle {
+		t.Fatalf("presence did not stick: %+v ok=%v", m, ok)
+	}
+
+	// A member frame says nothing about presence, so a rename must not quietly
+	// mark somebody offline.
+	nick := "Ada L"
+	c.cacheRoster("g1", []rawMember{{User: User{ID: "1", Username: "ada"}, Nick: &nick}}, nil, 0)
+
+	m, ok := c.MemberByName("g1", "ada")
+	if !ok {
+		t.Fatal("the handle should still resolve after a rename")
+	}
+	if m.Status != StatusIdle {
+		t.Fatalf("a rename cleared the presence: %q", m.Status)
+	}
+	if m.Name != "Ada L" {
+		t.Fatalf("the per-guild nickname should win: %q", m.Name)
+	}
+
+	// Ordering: whoever is around comes first.
+	members, total := c.GuildRoster("g1")
+	if total != 2 || len(members) != 2 {
+		t.Fatalf("roster = %d of %d, want 2 of 2", len(members), total)
+	}
+	if members[0].ID != "1" {
+		t.Fatalf("the member who is around should sort first: %+v", members)
+	}
+}
+
+func TestMemberByNameRefusesAnAmbiguousDisplayName(t *testing.T) {
+	c := NewClient(Options{Token: "x"})
+	c.cacheRoster("g1", []rawMember{
+		{User: User{ID: "1", Username: "sam_one", GlobalName: "Sam"}},
+		{User: User{ID: "2", Username: "sam_two", GlobalName: "Sam"}},
+	}, nil, 2)
+
+	// Two people called Sam are two people nobody can safely be pinged as.
+	if m, ok := c.MemberByName("g1", "Sam"); ok {
+		t.Fatalf("an ambiguous display name resolved to %+v", m)
+	}
+	// The handle is unique, so it still does.
+	if m, ok := c.MemberByName("g1", "sam_two"); !ok || m.ID != "2" {
+		t.Fatalf("a handle should always resolve: %+v ok=%v", m, ok)
+	}
+}
+
+func presenceOf(id, status string) rawPresence {
+	var p rawPresence
+	p.User.ID = id
+	p.Status = status
+	return p
+}

@@ -50,6 +50,17 @@ const (
 
 // Request ops, sent by the client.
 const (
+	// OpPing is the round trip a client times to know its latency to this
+	// server.
+	//
+	// The WebSocket already has a ping frame, and it is the wrong one to use:
+	// it is the server that sends those, and a browser answers them below the
+	// layer script can see, so a client cannot time one. This is the same
+	// question asked in the direction that can be measured — and asked of the
+	// read loop, so what it measures is the delay a message would actually
+	// meet rather than only the delay of the network.
+	OpPing = "ping"
+
 	OpAuthGuest    = "auth.guest"    // take a fresh guest identity
 	OpAuthToken    = "auth.token"    // resume a stored session token
 	OpAuthLogin    = "auth.login"    // sign in with username + password
@@ -111,6 +122,10 @@ const (
 	OpPostUpdate = "post.update"
 	OpPostDelete = "post.delete"
 	OpPostRSVP   = "post.rsvp" // answer a calendar event
+	// OpPostView marks entries as opened. It is private to whoever sends it
+	// and so is answered rather than broadcast: what somebody has looked at is
+	// nobody else's business.
+	OpPostView = "post.view"
 
 	OpMessageSend    = "message.send"
 	OpMessageHistory = "message.history" // page through a channel
@@ -231,6 +246,10 @@ const (
 	// and reaches only the sessions that may manage the server: it names
 	// webhook URLs, which are credentials.
 	EvRelayUpdated = "relay.updated"
+	// EvRelayRoster carries who is on the Discord side of one bridged channel.
+	// Unlike EvRelayUpdated it names no credential, so it reaches everybody who
+	// can see that channel — it is drawn in the member list.
+	EvRelayRoster = "relay.roster"
 
 	EvVoiceState    = "voice.state"    // somebody's voice state changed
 	EvVoiceSpeaking = "voice.speaking" // somebody started or stopped speaking

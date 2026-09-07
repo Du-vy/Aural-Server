@@ -42,20 +42,47 @@ const requestTimeout = 30 * time.Second
 
 // Intents are the event families a connection asks for.
 //
-// Only three matter here. Guilds is what makes Discord tell us which channels
-// exist at all; GuildMessages carries the events; MessageContent is the
-// privileged one that decides whether those events arrive with their text or
-// with an empty content field. A bot without it relays blank messages, which
-// is the single most common way this feature is misconfigured, so the failure
-// is detected and reported rather than left to look like a bug here.
+// Three carry the bridge itself. Guilds is what makes Discord tell us which
+// channels exist at all; GuildMessages carries the events; MessageContent is
+// the privileged one that decides whether those events arrive with their text
+// or with an empty content field. A bot without it relays blank messages,
+// which is the single most common way this feature is misconfigured, so the
+// failure is detected and reported rather than left to look like a bug here.
+//
+// Two more carry the roster — who is on the Discord side, and which of them
+// are around. Both are privileged as well, and unlike MessageContent the
+// bridge works perfectly without them, so they are asked for and given up
+// rather than insisted on. See RosterIntents.
 const (
 	IntentGuilds         = 1 << 0
+	IntentGuildMembers   = 1 << 1
+	IntentGuildPresences = 1 << 8
 	IntentGuildMessages  = 1 << 9
 	IntentMessageContent = 1 << 15
 
-	// RelayIntents is what this client identifies with.
+	// RelayIntents is the bridge alone: what this client falls back to when
+	// the roster cannot be had.
 	RelayIntents = IntentGuilds | IntentGuildMessages | IntentMessageContent
+
+	// RosterIntents is the bridge and the member list, and is what a
+	// connection is first attempted with.
+	//
+	// Both extras are privileged, which means an administrator has to switch
+	// them on in the developer portal and Discord refuses the connection
+	// outright if they have not. Refusing to bridge at all over a member list
+	// would be the wrong trade — the bridge is the feature and the roster is
+	// the garnish — so a rejection here is not fatal: the client drops back to
+	// RelayIntents, records why, and connects. What is lost is who is online
+	// on the other side, and the relay screen says so.
+	RosterIntents = RelayIntents | IntentGuildMembers | IntentGuildPresences
 )
+
+// MissingRosterIntents is what an administrator is told when Discord refuses
+// the privileged intents the member list needs. It reaches the relay settings
+// screen, which is where it can be acted on.
+const MissingRosterIntents = "the server members and presence intents are not enabled for this bot, " +
+	"so Aural cannot show who is on the Discord side — switch them on in the Discord developer " +
+	"portal, under Bot > Privileged Gateway Intents"
 
 // Gateway opcodes. These are the whole protocol as far as a relay is
 // concerned: the rest of the numbers Discord defines are for features this
@@ -77,13 +104,18 @@ const (
 // one of them is a configuration mistake — a bad token, an intent that was
 // never switched on in the developer portal — so the connection stops and
 // says so instead of retrying a wrong answer forever.
+// closeDisallowedIntents is 4014: a privileged intent was asked for and not
+// granted. It is named because it is the one close code with a branch of its
+// own — the roster intents are given up over it before it is treated as fatal.
+const closeDisallowedIntents = 4014
+
 var fatalCloseCodes = map[int]string{
 	4004: "the bot token was rejected",
 	4010: "invalid shard",
 	4011: "this bot is in too many guilds to connect without sharding",
 	4012: "the gateway API version this build uses is no longer accepted",
 	4013: "the intents this client asks for are not valid",
-	4014: "the message content intent is not enabled for this bot — switch it on in the Discord developer portal, under Bot > Privileged Gateway Intents",
+	4014: "a privileged intent this client asks for is not enabled for this bot — switch it on in the Discord developer portal, under Bot > Privileged Gateway Intents",
 }
 
 // ErrFatal wraps a failure the caller must not retry. The message says which.

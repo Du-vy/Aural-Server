@@ -85,9 +85,14 @@ type RelayState struct {
 	BotID   string `json:"botId,omitempty"`
 	// Error is why the relay is not connected, in the words the failure came
 	// in. An unset intent says so here.
-	Error  string       `json:"error,omitempty"`
-	Guilds []RelayGuild `json:"guilds"`
-	Links  []RelayLink  `json:"links"`
+	Error string `json:"error,omitempty"`
+	// RosterError is why the member list has no Discord side, when the bridge
+	// itself is fine. It is separate from Error because the two are different
+	// severities: this one means everything works except a sidebar, and it is
+	// almost always the two privileged intents not being switched on.
+	RosterError string       `json:"rosterError,omitempty"`
+	Guilds      []RelayGuild `json:"guilds"`
+	Links       []RelayLink  `json:"links"`
 }
 
 // RelayConfigureRequest switches the relay on and sets the bot token.
@@ -132,4 +137,61 @@ type RelayDeleteRequest struct {
 // RelayEvent carries the whole state after a change.
 type RelayEvent struct {
 	Relay RelayState `json:"relay"`
+}
+
+// The roster: who is on the Discord side of a bridged channel.
+//
+// Unlike everything above it, this is not administration. It reaches every
+// session that can see the channel, because it is drawn in the member list
+// beside the people who are actually here — which is the whole point of it. A
+// bridged room whose sidebar shows only the half of the conversation that has
+// already moved reads as a room where messages arrive from nowhere.
+//
+// Nothing here is an Aural identity, and it is deliberately a separate payload
+// rather than more entries in Users. A Discord account has no row on this
+// server, no roles, no permissions and no private thread; folding one into the
+// member list proper would mean every op that takes a user id having to answer
+// what it means for somebody who is not here.
+
+// RelayMember is one person on the Discord side.
+type RelayMember struct {
+	// ID is a Discord snowflake, and a string for the reason every id from
+	// Discord is: the values do not survive a JavaScript number.
+	ID string `json:"id"`
+	// Name is what a reader sees: the per-guild nickname if they set one, then
+	// their display name, then their handle.
+	Name string `json:"name"`
+	// Handle is the unique @handle. It is what a mention has to be spelled as
+	// to be sure of reaching the right account, so it travels alongside the
+	// name even though it is usually the same thing.
+	Handle string `json:"handle,omitempty"`
+	// Avatar is an absolute URL on Discord's CDN.
+	Avatar string `json:"avatar,omitempty"`
+	Bot    bool   `json:"bot,omitempty"`
+	// Status is "online", "idle", "dnd" or "offline". Somebody invisible is
+	// reported offline, which is what being invisible is for.
+	Status string `json:"status"`
+}
+
+// RelayRoster is the Discord side of one bridged channel.
+type RelayRoster struct {
+	// ChannelID is the channel here, not the one on Discord: it is what the
+	// member list is keyed by.
+	ChannelID int64         `json:"channelId"`
+	GuildName string        `json:"guildName,omitempty"`
+	Members   []RelayMember `json:"members"`
+	// Total is how many members that Discord server has in all. It is larger
+	// than the list when a big guild has been trimmed to what a sidebar can
+	// usefully draw, and the client says "and N more" rather than implying the
+	// list is everybody.
+	Total int `json:"total"`
+	// Unavailable is why there is nobody in the list, when the reason is
+	// worth showing — most often the two privileged intents this needs not
+	// being switched on for the bot. Empty when the roster is simply empty.
+	Unavailable string `json:"unavailable,omitempty"`
+}
+
+// RelayRosterEvent carries one channel's roster after it changed.
+type RelayRosterEvent struct {
+	Roster RelayRoster `json:"roster"`
 }

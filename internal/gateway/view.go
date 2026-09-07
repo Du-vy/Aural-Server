@@ -73,8 +73,9 @@ func unreadMentionView(m store.UnreadMention) protocol.UnreadMention {
 // body it needs in one pass, and because the one path that has just written a
 // post already holds it.
 func postView(p store.Post, body *protocol.Message, stats store.PostStats,
-	counts store.PostRSVPCounts, own string) protocol.Post {
+	counts store.PostRSVPCounts, own string, viewed bool) protocol.Post {
 	out := protocol.Post{
+		Viewed:    viewed,
 		ID:        p.ID,
 		ChannelID: p.ChannelID,
 		UserID:    p.UserID,

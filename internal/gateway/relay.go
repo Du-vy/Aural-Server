@@ -118,6 +118,10 @@ type discordRelay struct {
 	// stopped is closed when the relay shuts down, which is what releases the
 	// queue goroutines.
 	stopped chan struct{}
+	// rosterPub coalesces the member-list churn coming off the Discord gateway
+	// into one broadcast per channel per few seconds. Guarded by nothing here:
+	// it has a lock of its own, and is set once at construction.
+	rosterPub *rosterPublisher
 	// root is the server's own lifetime, captured by Run. A client started
 	// later — by an administrator switching the relay on from the settings
 	// screen — hangs off this rather than off the request that started it, so
@@ -129,7 +133,7 @@ type discordRelay struct {
 // newDiscordRelay builds the bridge. It does not connect: Start does, and only
 // once the configuration says to.
 func newDiscordRelay(hub *Hub) *discordRelay {
-	return &discordRelay{
+	r := &discordRelay{
 		hub:             hub,
 		st:              hub.st,
 		log:             hub.log.With(slog.String("component", "discord-relay")),
@@ -140,6 +144,8 @@ func newDiscordRelay(hub *Hub) *discordRelay {
 		queues:          map[int64]*relayQueue{},
 		stopped:         make(chan struct{}),
 	}
+	r.rosterPub = newRosterPublisher(r)
+	return r
 }
 
 // --- lifecycle --------------------------------------------------------------
@@ -188,6 +194,7 @@ func (r *discordRelay) start(parent context.Context, token string) {
 		Handlers: discord.Handlers{
 			Ready:          r.onReady,
 			GuildAvailable: r.onGuild,
+			RosterChanged:  r.onRoster,
 			Message:        func(m discord.Message) { r.onDiscordMessage(ctx, m) },
 			MessageEdited:  func(m discord.Message) { r.onDiscordEdit(ctx, m) },
 			MessageDeleted: func(channelID string, ids []string) { r.onDiscordDelete(ctx, channelID, ids) },
@@ -223,6 +230,10 @@ func (r *discordRelay) stop() {
 	cancel := r.cancel
 	r.cancel, r.client = nil, nil
 	r.mu.Unlock()
+
+	// Before the cancel, so a flush already on the timer cannot publish a
+	// roster for a connection that is going.
+	r.rosterPub.stop()
 
 	if cancel != nil {
 		cancel()
@@ -968,6 +979,7 @@ func (r *discordRelay) State(ctx context.Context) protocol.RelayState {
 		self := client.Self()
 		state.BotName, state.BotID = self.Username, self.ID
 		state.Connected, state.Error = client.Connected()
+		state.RosterError = client.RosterDenied()
 	}
 
 	links, err := r.st.RelayLinks(ctx)

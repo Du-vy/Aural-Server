@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/aural-chat/aural-server/internal/permissions"
 	"github.com/aural-chat/aural-server/internal/protocol"
@@ -118,7 +120,10 @@ func handlePostCreate(ctx context.Context, s *Session, raw json.RawMessage) (any
 	}
 
 	bodyView := messageView(body, attachments, nil)
-	view := postView(created, &bodyView, store.PostStats{}, store.PostRSVPCounts{}, "")
+	// Viewed is false on the way out and true for the author on the way back:
+	// the frame everybody else gets is about an entry none of them has opened,
+	// and the one thing the writer has certainly seen is what they just wrote.
+	view := postView(created, &bodyView, store.PostStats{}, store.PostRSVPCounts{}, "", false)
 	// The tallies are empty and nobody has answered, so this frame is the same
 	// for everybody and can go out as it stands.
 	s.hub.BroadcastChannelEvent(
@@ -126,7 +131,9 @@ func handlePostCreate(ctx context.Context, s *Session, raw json.RawMessage) (any
 	s.log.Info("post created",
 		slog.Int64("post", created.ID), slog.Int64("channel", created.ChannelID))
 
-	return protocol.PostEvent{Post: view}, nil
+	reply := view
+	reply.Viewed = true
+	return protocol.PostEvent{Post: reply}, nil
 }
 
 // handlePostList pages through one channel's entries.
@@ -389,6 +396,44 @@ func handlePostRSVP(ctx context.Context, s *Session, raw json.RawMessage) (any, 
 	return reply, nil
 }
 
+// maxPostsPerView bounds one marking request. A gallery marks in runs as it is
+// scrolled, and a run longer than a page of it is a client that has lost track
+// rather than somebody who has looked at more.
+const maxPostsPerView = 200
+
+// handlePostView marks entries as opened by the caller.
+//
+// Opening something is not writing, so it needs no more than the right to see
+// the channel — the same reasoning that lets anybody who can read an event
+// answer it.
+//
+// Nothing is broadcast. What somebody has looked at is theirs, and the only
+// client that has any use for it is the one that asked.
+func handlePostView(ctx context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
+	req, failure := decode[protocol.PostViewRequest](raw)
+	if failure != nil {
+		return nil, failure
+	}
+	if len(req.PostIDs) == 0 {
+		return nil, protocol.Errorf(protocol.ErrBadRequest, "name at least one post")
+	}
+	if len(req.PostIDs) > maxPostsPerView {
+		return nil, protocol.Errorf(protocol.ErrBadRequest,
+			fmt.Sprintf("at most %d posts may be marked at once", maxPostsPerView))
+	}
+	if _, failure := s.requirePostChannel(req.ChannelID, permissions.ViewChannel); failure != nil {
+		return nil, failure
+	}
+
+	// The channel goes into the statement as well as being checked here, so an
+	// id belonging to some other channel marks nothing rather than being
+	// trusted because the channel named alongside it was visible.
+	if err := s.hub.st.MarkPostsViewed(ctx, s.UserID(), req.ChannelID, req.PostIDs, time.Now().Unix()); err != nil {
+		return nil, internalError(s, "record what you have seen", err)
+	}
+	return nil, nil
+}
+
 // --- helpers ----------------------------------------------------------------
 
 // requirePostChannel checks that a channel exists, holds posts, and that the
@@ -477,8 +522,13 @@ func (s *Session) postViews(ctx context.Context, posts []store.Post, viewerID in
 		return nil, internalError(s, "read the posts", err)
 	}
 	var own map[int64]string
+	var viewed map[int64]bool
 	if viewerID != 0 {
 		own, err = s.hub.st.RSVPsOf(ctx, viewerID, eventIDs)
+		if err != nil {
+			return nil, internalError(s, "read the posts", err)
+		}
+		viewed, err = s.hub.st.ViewedPosts(ctx, viewerID, ids)
 		if err != nil {
 			return nil, internalError(s, "read the posts", err)
 		}
@@ -492,7 +542,7 @@ func (s *Session) postViews(ctx context.Context, posts []store.Post, viewerID in
 				body = &view
 			}
 		}
-		out = append(out, postView(p, body, stats[p.ID], counts[p.ID], own[p.ID]))
+		out = append(out, postView(p, body, stats[p.ID], counts[p.ID], own[p.ID], viewed[p.ID]))
 	}
 	return out, nil
 }

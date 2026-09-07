@@ -65,6 +65,11 @@ type Handlers struct {
 	Message        func(m Message)
 	MessageEdited  func(m Message)
 	MessageDeleted func(channelID string, messageIDs []string)
+	// RosterChanged is called when somebody in a guild joined, left, was
+	// renamed, or changed presence. It names the guild rather than the person:
+	// the caller republishes a whole roster anyway, and on a busy guild the
+	// alternative is one call per presence flicker.
+	RosterChanged func(guildID string)
 }
 
 // Options configures a client.
@@ -101,6 +106,15 @@ type Client struct {
 	guilds   map[string]Guild
 	channels map[string]Channel
 	roles    map[string]Role
+	// rosters is who is in each guild, when the privileged intents allow it to
+	// be known. Empty on a bot without them, which is what rosterDenied says.
+	rosters map[string]*guildRoster
+	// intents is what the next identify asks for. It starts at RosterIntents
+	// and drops to RelayIntents if Discord refuses them; see classifyClose.
+	intents int
+	// rosterDenied is why the member list is empty, for the relay screen. It
+	// is a string rather than a flag because it is shown, not branched on.
+	rosterDenied string
 	// connected is whether a session is currently established, which is what
 	// the settings screen reports back to an administrator.
 	connected bool
@@ -138,6 +152,8 @@ func NewClient(opts Options) *Client {
 		guilds:   map[string]Guild{},
 		channels: map[string]Channel{},
 		roles:    map[string]Role{},
+		rosters:  map[string]*guildRoster{},
+		intents:  RosterIntents,
 	}
 }
 
@@ -339,7 +355,7 @@ func (c *Client) session(ctx context.Context) error {
 
 		switch f.Op {
 		case opDispatch:
-			c.dispatch(f)
+			c.dispatch(ctx, f)
 
 		case opHeartbeat:
 			// Discord asking for one out of band. Answering promptly is what
@@ -387,9 +403,17 @@ func (c *Client) session(ctx context.Context) error {
 
 // identify opens a fresh session.
 func (c *Client) identify(ctx context.Context) error {
+	c.mu.RLock()
+	intents := c.intents
+	c.mu.RUnlock()
+
 	return c.send(ctx, opIdentify, map[string]any{
 		"token":   c.token,
-		"intents": RelayIntents,
+		"intents": intents,
+		// How many members Discord sends with each guild before it starts
+		// leaving them out. At its ceiling, the usual guild arrives whole and
+		// never needs a chunk request at all.
+		"large_threshold": largeThreshold,
 		"properties": map[string]string{
 			"os":      "linux",
 			"browser": "aural",
@@ -509,16 +533,60 @@ func readFrame(ctx context.Context, conn *websocket.Conn) (frame, error) {
 // refused will be refused again on every reconnect for as long as it is wrong.
 func (c *Client) classifyClose(err error) error {
 	code := int(websocket.CloseStatus(err))
+	// 4014 is "you asked for a privileged intent you were not granted", and it
+	// does not say which. Two of the four this client asks for are the member
+	// list's, and the member list is the part worth losing: a bridge that
+	// refuses to carry messages because it could not also draw a sidebar has
+	// the priorities backwards. So the first 4014 gives those up and retries,
+	// and only a second one — which can then only be message content — is
+	// fatal.
+	if code == closeDisallowedIntents && c.dropRosterIntents() {
+		c.log.Warn("discord refused the roster intents; bridging without the member list")
+		return errors.New("discord: " + MissingRosterIntents)
+	}
 	if reason, fatal := fatalCloseCodes[code]; fatal {
+		if code == closeDisallowedIntents {
+			reason = "the message content intent is not enabled for this bot — switch it on in " +
+				"the Discord developer portal, under Bot > Privileged Gateway Intents"
+		}
 		return &fatalError{reason: reason}
 	}
 	return err
 }
 
+// dropRosterIntents gives up the two privileged intents the member list needs,
+// once. It reports whether it changed anything, which is what keeps the second
+// refusal from being retried forever.
+func (c *Client) dropRosterIntents() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.intents == RelayIntents {
+		return false
+	}
+	c.intents = RelayIntents
+	c.rosterDenied = MissingRosterIntents
+	c.rosters = map[string]*guildRoster{}
+	// A resume would pick the old session back up, intents and all. The next
+	// connection has to identify.
+	c.sessionID, c.resumeURL, c.sequence = "", "", 0
+	return true
+}
+
+// RosterDenied is why the member list is empty, or empty when it is not.
+func (c *Client) RosterDenied() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.rosterDenied
+}
+
 // --- dispatch ---------------------------------------------------------------
 
 // dispatch routes one event to the handler and the caches.
-func (c *Client) dispatch(f frame) {
+func (c *Client) dispatch(ctx context.Context, f frame) {
+	if c.rosterEvent(f) {
+		return
+	}
 	switch f.T {
 	case "READY":
 		var ready struct {
@@ -558,6 +626,22 @@ func (c *Client) dispatch(f frame) {
 			return
 		}
 		c.cacheGuild(g)
+		// The members and presences that came with the guild, and a request
+		// for the ones Discord left out. Both are no-ops on a bot without the
+		// roster intents: the arrays are absent and MemberCount matches what
+		// arrived, which is nothing.
+		var roster struct {
+			Members     []rawMember   `json:"members"`
+			Presences   []rawPresence `json:"presences"`
+			MemberCount int           `json:"member_count"`
+		}
+		if json.Unmarshal(f.D, &roster) == nil && (len(roster.Members) > 0 || roster.MemberCount > 0) {
+			c.cacheRoster(g.ID, roster.Members, roster.Presences, roster.MemberCount)
+			c.rosterChanged(g.ID)
+			if roster.MemberCount > len(roster.Members) && len(roster.Members) > 0 {
+				c.requestMembers(ctx, g.ID)
+			}
+		}
 		if c.handlers.GuildAvailable != nil {
 			c.handlers.GuildAvailable(g)
 		}
@@ -571,6 +655,8 @@ func (c *Client) dispatch(f frame) {
 		// guild and the cache should survive it.
 		if !g.Unavailable {
 			c.forgetGuild(g.ID)
+			c.forgetRoster(g.ID)
+			c.rosterChanged(g.ID)
 		}
 
 	case "CHANNEL_CREATE", "CHANNEL_UPDATE", "THREAD_CREATE", "THREAD_UPDATE":

@@ -6,7 +6,11 @@ import (
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/aural-chat/aural-server/internal/gateway"
 	"github.com/aural-chat/aural-server/internal/protocol"
@@ -183,6 +187,56 @@ func TestServerIconRemovalViaServerUpdate(t *testing.T) {
 	info := h.getInfo()
 	if info.Icon != "" {
 		t.Fatalf("GET /info icon after removal = %q, want empty", info.Icon)
+	}
+}
+
+// The icon is the one uploaded file no table names — it belongs to the server,
+// so it lives in the configuration — which is exactly what made the startup
+// sweep take it: a file no row points at is indistinguishable from one left
+// behind by a crash unless the sweep is told about this one by name.
+//
+// The symptom was slow enough to be hard to place. The bytes survived until the
+// next restart more than a grace period after the upload, and once they were
+// gone every client that had already cached the picture went on drawing it, so
+// the icon looked broken only to whoever had joined since.
+func TestTheStartupSweepSparesTheServerIcon(t *testing.T) {
+	h := newHarness(t, withUploads(t, nil))
+
+	admin := h.dial()
+	ready := admin.guest("Admin")
+	h.claimAdmin(admin)
+
+	iconURL := h.uploadedServerIcon(ready.SessionToken, "icon.png", pngBytes(t, 128, 128))
+	// Past the grace period, since that guard is about uploads still in flight
+	// and would otherwise be the only reason this passed.
+	backdate(t, h, iconURL)
+
+	h.server.SweepOrphanedFiles(context.Background())
+
+	res := h.fetch(iconURL)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("the sweep took the server icon: got %d, want 200", res.StatusCode)
+	}
+	if info := h.getInfo(); info.Icon != iconURL {
+		t.Fatalf("GET /info icon = %q, want %q", info.Icon, iconURL)
+	}
+}
+
+// backdate ages a stored file past the sweep's grace period, given the URL it
+// is served from. The key is the path segment before the filename.
+func backdate(t *testing.T, h *harness, url string) {
+	t.Helper()
+
+	trimmed := strings.TrimPrefix(url, "/attachments/")
+	key, _, found := strings.Cut(trimmed, "/")
+	if !found || key == "" {
+		t.Fatalf("cannot read a storage key out of %q", url)
+	}
+	path := filepath.Join(h.cfg.Uploads.Path, key[:2], key)
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("backdate %q: %v", path, err)
 	}
 }
 

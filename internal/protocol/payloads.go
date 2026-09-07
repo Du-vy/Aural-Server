@@ -466,6 +466,16 @@ type Post struct {
 	// RSVP travels with a calendar post: the tallies everybody sees, and the
 	// answer of whoever is being sent the frame.
 	RSVP *PostRSVPSummary `json:"rsvp,omitempty"`
+	// Viewed is whether the identity this frame was sent to has opened this
+	// entry. Like RSVP.Own it is the one field here that differs per reader,
+	// and it is false on a broadcast, where there is no reader to answer for —
+	// which is also the right answer for an entry that has only just been
+	// written.
+	//
+	// A gallery is what this is for. Somebody opens the picture that caught
+	// their eye and then one three rows down, so what a media channel needs is
+	// the set of what has been seen rather than the read marker's frontier.
+	Viewed bool `json:"viewed"`
 }
 
 // PostEventDetails is when and where a calendar post happens.
@@ -480,6 +490,17 @@ type PostEventDetails struct {
 	EndsAt   *int64 `json:"endsAt,omitempty"`
 	AllDay   bool   `json:"allDay"`
 	Location string `json:"location,omitempty"`
+}
+
+// PostViewRequest marks entries as opened by whoever sends it.
+//
+// The channel is named as well as the entries so that one permission check
+// covers the batch; an id that is not in it marks nothing. Batched because a
+// gallery is opened in runs, and a round trip per picture would be a round
+// trip per flick of the arrow key.
+type PostViewRequest struct {
+	ChannelID int64   `json:"channelId"`
+	PostIDs   []int64 `json:"postIds"`
 }
 
 // PostRSVPSummary counts the answers to a calendar post.
@@ -671,6 +692,17 @@ type Attachment struct {
 	Height *int `json:"height,omitempty"`
 }
 
+// PongResponse answers OpPing.
+//
+// The round trip is the whole measurement and the caller times it for itself,
+// so nothing here is needed to compute latency. ServerTime is carried anyway
+// because it costs a field and answers the question that always follows a
+// slow one — whether the two clocks agree — without a second op.
+type PongResponse struct {
+	// ServerTime is this server's wall clock in milliseconds since the epoch.
+	ServerTime int64 `json:"serverTime"`
+}
+
 // Hello is the first frame the server sends, before any authentication. It lets
 // the client check protocol compatibility and decide which auth op to send.
 type Hello struct {
@@ -732,6 +764,10 @@ type Ready struct {
 	Expressions []Expression `json:"expressions,omitempty"`
 	// Sounds is the soundboard, which the panel is drawn from.
 	Sounds []Sound `json:"sounds,omitempty"`
+	// RelayRosters is who is on the Discord side of each bridged channel this
+	// session can see. Absent on a server with no relay, and on one whose bot
+	// was never granted the intents a member list needs.
+	RelayRosters []RelayRoster `json:"relayRosters,omitempty"`
 }
 
 // --- requests ---------------------------------------------------------------

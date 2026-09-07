@@ -183,6 +183,43 @@ func EscapeOutbound(text string) string {
 	return replacer.Replace(text)
 }
 
+// mentionCandidate is an @ followed by the characters a name may be written
+// in. It matches the client's own convention deliberately — see the header of
+// src/lib/mentions.ts — because what it is looking for is exactly what the
+// picker on that side inserts.
+//
+// Letters, digits, underscore, dot and hyphen, and nothing else. A Discord
+// handle is drawn from a narrower set than that, and a display name may be
+// wider; a name with a space in it simply cannot be written as a mention on
+// either side, which is why every account also has a handle.
+var mentionCandidate = regexp.MustCompile(`@([\p{L}\p{N}_.-]{1,64})`)
+
+// RewriteMentions turns the @names in an outgoing message into the ids Discord
+// resolves, using resolve to say who each one is.
+//
+// resolve returns false for anything it does not recognise, and those are left
+// exactly as they were written: an @ in front of a name nobody on the other
+// side answers to is somebody's prose, and rewriting it would be this bridge
+// inventing a person. That is the same rule the client applies when it decides
+// whether to draw a mention at all.
+//
+// It runs after EscapeOutbound, which has already broken every < @ sequence
+// the text arrived with. The ones this writes are therefore the only real
+// mentions in the result, and each of them came from a name that resolved.
+func RewriteMentions(text string, resolve func(name string) (id string, ok bool)) string {
+	if text == "" || resolve == nil {
+		return text
+	}
+	return mentionCandidate.ReplaceAllStringFunc(text, func(match string) string {
+		name := match[1:]
+		id, ok := resolve(name)
+		if !ok {
+			return match
+		}
+		return "<@" + id + ">"
+	})
+}
+
 // TruncateRunes cuts text to at most n runes, never mid-character, appending an
 // ellipsis when it had to cut.
 //

@@ -665,6 +665,33 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS idx_posts_root_message ON posts(root_message_id)
 		WHERE root_message_id IS NOT NULL;
 	`,
+	// 19: which entries somebody has actually opened.
+	//
+	// A channel's read marker cannot answer this. A marker is a high-water
+	// line, and a wall of pictures is not read in a line: somebody opens the
+	// third one, then the ninth, then comes back a day later for the rest.
+	// What a media channel needs is the set, not the frontier — which is the
+	// one place in this schema where per-item state earns its row.
+	//
+	// Only what has been opened is written. A post nobody has opened has no
+	// row, and there is no backfill, because the epoch already on the member
+	// answers for everything older: a post whose body predates somebody's
+	// arrival was never theirs to catch up on. That is the same reading
+	// migration 18 gave a channel with no marker, and it is what keeps this
+	// upgrade quiet — nobody opens the client the next morning to a gallery
+	// where every picture is suddenly new.
+	`
+	CREATE TABLE post_views (
+		post_id   INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+		user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		viewed_at INTEGER NOT NULL,
+		PRIMARY KEY (post_id, user_id)
+	);
+	-- post_id leads the primary key's own index, so only the other half needs
+	-- one: deleting an account looks for its rows here and would otherwise
+	-- scan the table to find them.
+	CREATE INDEX idx_post_views_user ON post_views(user_id);
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

@@ -431,6 +431,11 @@ func (h *Hub) buildReady(ctx context.Context, s *Session, sessionToken string) (
 		UnreadMentions: mentions,
 		Expressions:    expressions,
 		Sounds:         sounds,
+		// Who is on the Discord side of each bridged channel. It travels in
+		// the snapshot for the same reason the emoji do: a member list drawn
+		// before it arrived would be a member list missing half a room, and
+		// the correction a moment later reads as a bug.
+		RelayRosters: h.discord.Rosters(s),
 	}, nil
 }
 

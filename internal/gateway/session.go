@@ -672,6 +672,12 @@ type route struct {
 
 // routes is the whole client-facing surface of the protocol.
 var routes = map[string]route{
+	// Timing a round trip has to stay on the read loop: dispatched off it, it
+	// would measure how quickly a goroutine starts rather than how quickly
+	// this connection is being served, and a session wedged behind a slow
+	// frame would go on reporting a healthy latency.
+	protocol.OpPing: {needsAuth: true, fn: handlePing},
+
 	protocol.OpAuthGuest:    {needsAuth: false, fn: handleAuthGuest},
 	protocol.OpAuthToken:    {needsAuth: false, fn: handleAuthToken},
 	protocol.OpAuthLogin:    {needsAuth: false, fn: handleAuthLogin},
@@ -722,6 +728,7 @@ var routes = map[string]route{
 	protocol.OpPostUpdate: {needsAuth: true, fn: handlePostUpdate},
 	protocol.OpPostDelete: {needsAuth: true, fn: handlePostDelete},
 	protocol.OpPostRSVP:   {needsAuth: true, fn: handlePostRSVP},
+	protocol.OpPostView:   {needsAuth: true, fn: handlePostView},
 
 	protocol.OpMessageSend: {needsAuth: true, fn: handleMessageSend},
 	// The two reads that walk history rather than an index of it, and the only

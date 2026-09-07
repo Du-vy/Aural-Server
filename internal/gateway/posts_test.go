@@ -555,3 +555,112 @@ func TestChannelTimelinesAndThreadsStaySeparate(t *testing.T) {
 		protocol.MessageHistoryRequest{ChannelID: forum.ID, PostID: post.ID, Around: post.Body.ID},
 		protocol.ErrBadRequest)
 }
+
+// A gallery is not read in a line, so what it needs is the set of what has
+// been opened rather than a marker's frontier — and it has to survive the
+// client being closed, which is the whole reason it is on the server.
+func TestOpenedMediaEntriesAreRememberedPerPerson(t *testing.T) {
+	h := newHarness(t, withUploads(t, nil))
+
+	admin, adminReady := h.admin("Admin")
+	channel := h.postChannel(admin, protocol.ChannelMedia, "gallery")
+
+	shot := h.uploadOK(adminReady.SessionToken, channel.ID, "shot.png", pngBytes(t, 32, 16))
+	first := ok[protocol.PostEvent](admin, protocol.OpPostCreate, protocol.PostCreateRequest{
+		ChannelID: channel.ID, Title: "One", Attachments: []int64{shot.ID},
+	}).Post
+	if !first.Viewed {
+		t.Fatal("the one thing a writer has certainly seen is what they just wrote")
+	}
+
+	// Somebody who arrives after the pictures were posted. Their epoch is the
+	// newest message there is, so both entries predate them and both count as
+	// seen — which is what keeps a gallery from lighting up entirely for
+	// everybody who joins.
+	late := h.dial()
+	late.guest("Late")
+	for _, post := range listPosts(late, channel.ID) {
+		if !post.Viewed {
+			t.Fatalf("an entry from before somebody joined starts seen: %+v", post)
+		}
+	}
+
+	// Somebody who was already here when they were posted. Both are new.
+	bystander := h.dial()
+	bystanderReady := bystander.guest("Bystander")
+	newer := h.uploadOK(adminReady.SessionToken, channel.ID, "newer.png", pngBytes(t, 32, 16))
+	third := ok[protocol.PostEvent](admin, protocol.OpPostCreate, protocol.PostCreateRequest{
+		ChannelID: channel.ID, Title: "Two", Attachments: []int64{newer.ID},
+	}).Post
+
+	if viewedByID(listPosts(bystander, channel.ID))[third.ID] {
+		t.Fatal("an entry posted while somebody was here starts unseen")
+	}
+
+	ok[struct{}](bystander, protocol.OpPostView,
+		protocol.PostViewRequest{ChannelID: channel.ID, PostIDs: []int64{third.ID}})
+
+	if !viewedByID(listPosts(bystander, channel.ID))[third.ID] {
+		t.Fatal("opening an entry should be remembered")
+	}
+	// And it is one person's. The admin wrote it, so use the late arrival,
+	// whose own view of the third entry is untouched by anybody else marking
+	// theirs.
+	if viewedByID(listPosts(late, channel.ID))[third.ID] {
+		t.Fatal("what somebody has opened is theirs alone")
+	}
+
+	// Across a fresh connection, which is the point of storing it at all.
+	resumed := h.dial()
+	ok[protocol.Ready](resumed, protocol.OpAuthToken,
+		protocol.AuthTokenRequest{Token: bystanderReady.SessionToken})
+	if !viewedByID(listPosts(resumed, channel.ID))[third.ID] {
+		t.Fatal("what has been opened must outlive the connection that opened it")
+	}
+}
+
+func TestMarkingEntriesSeenIsBoundedAndScopedToItsChannel(t *testing.T) {
+	h := newHarness(t, withUploads(t, nil))
+
+	admin, _ := h.admin("Admin")
+	gallery := h.postChannel(admin, protocol.ChannelMedia, "gallery")
+	forum := h.postChannel(admin, protocol.ChannelForum, "topics")
+
+	// Before the topic, so that it is genuinely unseen to them: an entry from
+	// before somebody arrived starts seen, which would hide what this is about.
+	bystander := h.dial()
+	bystander.guest("Bystander")
+
+	topic := ok[protocol.PostEvent](admin, protocol.OpPostCreate, protocol.PostCreateRequest{
+		ChannelID: forum.ID, Title: "A topic", Content: "words",
+	}).Post
+
+	bystander.fails(protocol.OpPostView,
+		protocol.PostViewRequest{ChannelID: gallery.ID}, protocol.ErrBadRequest)
+
+	tooMany := make([]int64, 201)
+	bystander.fails(protocol.OpPostView,
+		protocol.PostViewRequest{ChannelID: gallery.ID, PostIDs: tooMany}, protocol.ErrBadRequest)
+
+	// An id belonging to another channel marks nothing rather than being
+	// trusted because the channel named alongside it was visible.
+	ok[struct{}](bystander, protocol.OpPostView,
+		protocol.PostViewRequest{ChannelID: gallery.ID, PostIDs: []int64{topic.ID}})
+	if viewedByID(listPosts(bystander, forum.ID))[topic.ID] {
+		t.Fatal("naming the wrong channel must not mark an entry")
+	}
+}
+
+func listPosts(c *client, channelID int64) []protocol.Post {
+	c.t.Helper()
+	return ok[protocol.PostListResult](c, protocol.OpPostList,
+		protocol.PostListRequest{ChannelID: channelID}).Posts
+}
+
+func viewedByID(posts []protocol.Post) map[int64]bool {
+	out := map[int64]bool{}
+	for _, p := range posts {
+		out[p.ID] = p.Viewed
+	}
+	return out
+}

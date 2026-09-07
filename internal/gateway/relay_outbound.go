@@ -130,13 +130,20 @@ func (r *discordRelay) deliverToDiscord(ctx context.Context, link store.RelayLin
 	// The quote goes on after the emptiness check, so a message that had
 	// nothing to send stays unsent rather than crossing as a bare header.
 	content = r.outboundReplyQuote(ctx, m) + content
+	// Before the truncation, because an id is longer than the name it replaces
+	// and Discord refuses the whole message over the limit rather than cutting
+	// it. After the escaping, which is what makes the ids written here the only
+	// real mentions in the result. See resolveOutboundMentions for why this is
+	// the one thing allowed to ping across the bridge.
+	content, mentions := r.resolveOutboundMentions(link.DiscordGuildID, content)
 	content = discord.TruncateRunes(content, maxMessageRunes)
 
 	out := discord.OutboundMessage{
-		Content:   content,
-		Username:  r.outboundName(m),
-		AvatarURL: r.outboundAvatar(m),
-		Files:     files,
+		Content:         content,
+		Username:        r.outboundName(m),
+		AvatarURL:       r.outboundAvatar(m),
+		Files:           files,
+		AllowedMentions: mentions,
 	}
 
 	posted, err := r.restClient().Execute(ctx, link.WebhookID, link.WebhookToken, out)
@@ -208,7 +215,14 @@ func (r *discordRelay) pushEdit(ctx context.Context, link store.RelayLink, m sto
 	}
 	// The copy keeps the header the reply crossed with: an edit changes what
 	// was said, not what it was said in answer to.
-	content = discord.TruncateRunes(r.outboundReplyQuote(ctx, m)+content, maxMessageRunes)
+	content = r.outboundReplyQuote(ctx, m) + content
+	// Names are resolved here too, so an edited message goes on reading the
+	// way the original did rather than reverting its mentions to plain text.
+	// The ids they resolve to are dropped rather than passed on: Edit sends no
+	// allowed mentions at all, so an edit can render a mention but never raise
+	// one. Without that, a message could be edited into a ping after the fact.
+	content, _ = r.resolveOutboundMentions(link.DiscordGuildID, content)
+	content = discord.TruncateRunes(content, maxMessageRunes)
 
 	err = r.restClient().Edit(ctx, link.WebhookID, link.WebhookToken, pair.DiscordID,
 		discord.OutboundMessage{Content: content})

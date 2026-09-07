@@ -303,6 +303,20 @@ func (h *Hub) SetServerIcon(url, key string, size int64) (oldKey string, oldSize
 	return oldKey, oldSize, config.Save(h.cfgPath, snapshot)
 }
 
+// ServerIconKey is the storage key of the picture in use, empty when there is
+// none.
+//
+// The icon is the one uploaded file with no row anywhere: it belongs to the
+// server rather than to an account, so it lives in the configuration. That is
+// also what makes this accessor necessary — the orphan sweep decides what to
+// delete from the tables, and a file no table names looks exactly like a file
+// left behind by a crash unless it is named here as well.
+func (h *Hub) ServerIconKey() string {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	return h.cfg.Server.IconKey
+}
+
 // DropServerIcon unlinks a displaced icon and gives its room back to the quota.
 func (h *Hub) DropServerIcon(key string, size int64) {
 	if h.files == nil || key == "" {

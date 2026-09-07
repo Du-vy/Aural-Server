@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"mime"
 	"net/http"
@@ -686,9 +687,15 @@ func humanBytes(n int64) string {
 // directory finds those, and startup is when it is safe to do — nothing is
 // serving yet, so nothing is half-written.
 //
-// The keep set has to be every key in both tables. A partial set does not sweep
-// less, it deletes more, so a query that fails cancels the sweep rather than
-// narrowing it.
+// The keep set has to be every key anything still points at. A partial set does
+// not sweep less, it deletes more, so a query that fails cancels the sweep
+// rather than narrowing it — and for the same reason the server icon is added
+// by hand: it is the one file with no row, because it belongs to the server
+// rather than to an account and so lives in the configuration. Leaving it out
+// meant the first restart more than orphanGrace after an icon was uploaded
+// deleted the bytes while the configuration went on naming them, which reads
+// from a client as a server whose picture only the people who had already
+// cached it can see.
 func (s *Server) sweepOrphanedFiles(ctx context.Context) {
 	files := s.hub.Files()
 	if files == nil {
@@ -711,7 +718,7 @@ func (s *Server) sweepOrphanedFiles(ctx context.Context) {
 		return
 	}
 
-	keep := make(map[string]struct{}, len(attachments)+len(pictures)+len(expressions))
+	keep := make(map[string]struct{}, len(attachments)+len(pictures)+len(expressions)+1)
 	for _, key := range attachments {
 		keep[key] = struct{}{}
 	}
@@ -719,6 +726,9 @@ func (s *Server) sweepOrphanedFiles(ctx context.Context) {
 		keep[key] = struct{}{}
 	}
 	for _, key := range expressions {
+		keep[key] = struct{}{}
+	}
+	if key := s.hub.ServerIconKey(); key != "" {
 		keep[key] = struct{}{}
 	}
 
@@ -730,6 +740,46 @@ func (s *Server) sweepOrphanedFiles(ctx context.Context) {
 	if removed > 0 {
 		s.log.Info("removed unreferenced files", slog.Int("files", removed), slog.Int("kept", len(keep)))
 	}
+}
+
+// forgetAMissingServerIcon clears the configured icon when its bytes are not
+// there any more.
+//
+// This is repair rather than housekeeping, and it is here for one specific
+// history: builds before the orphan sweep learned about the icon deleted it on
+// the first restart after it was uploaded, leaving the configuration naming a
+// file that no longer exists. Every client that connects after that asks for a
+// picture it will never get, which is a broken image on the rail rather than
+// the initial the fallback would otherwise draw, and an administrator looking
+// at server settings sees an icon that is apparently set.
+//
+// Forgetting it says the true thing — this server has no picture — and makes
+// re-uploading one the obvious next step.
+func (s *Server) forgetAMissingServerIcon() {
+	files := s.hub.Files()
+	if files == nil {
+		return
+	}
+	key := s.hub.ServerIconKey()
+	if key == "" {
+		return
+	}
+	file, _, err := files.Open(key)
+	if err == nil {
+		file.Close()
+		return
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		// Something else is wrong with the upload directory. Reporting it is
+		// useful; throwing away the configuration over it is not.
+		s.log.Warn("could not check the server icon", slog.Any("error", err))
+		return
+	}
+	if _, _, err := s.hub.SetServerIcon("", "", 0); err != nil {
+		s.log.Warn("could not clear the missing server icon", slog.Any("error", err))
+		return
+	}
+	s.log.Warn("the server icon file is gone; the server now has no picture until one is uploaded again")
 }
 
 // sweepMaintenance runs until ctx ends, doing the periodic housekeeping.
