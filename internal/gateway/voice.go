@@ -71,6 +71,29 @@ func (h *Hub) voiceInfo() protocol.Voice {
 		DTX:             cfg.DTX,
 		Stereo:          cfg.Stereo,
 		MaxParticipants: cfg.MaxParticipants,
+		Screen:          h.screenInfo(cfg),
+	}
+}
+
+// screenInfo is the video plane as a client is told about it.
+//
+// Enforced is the whole of the difference between the two hosting modes here.
+// In server_host every shared screen is uploaded to this machine and sent out
+// again once per viewer, so the ceilings are a promise the operator makes
+// about their own line and are applied. In client_host nothing crosses this
+// machine at all: the ceilings would be one person's opinion about somebody
+// else's bandwidth, so they are sent for an administrator to look at and
+// bind nobody.
+func (h *Hub) screenInfo(cfg config.Voice) protocol.Screen {
+	return protocol.Screen{
+		Enabled:      cfg.Enabled && cfg.Screen.Enabled && h.relay != nil,
+		Audio:        cfg.Screen.Audio,
+		Enforced:     cfg.Mode == protocol.VoiceModeServerHost,
+		MaxHeight:    cfg.Screen.MaxHeight,
+		MaxFramerate: cfg.Screen.MaxFramerate,
+		MaxBitrate:   cfg.Screen.MaxBitrate,
+		MaxStreams:   cfg.Screen.MaxStreams,
+		MaxViewers:   cfg.Screen.MaxViewers,
 	}
 }
 
@@ -247,6 +270,7 @@ func (h *Hub) voiceStateOf(s *Session) (protocol.VoiceState, bool) {
 		SelfDeaf:  v.selfDeaf,
 		Mute:      v.mute || !canSpeak,
 		Deaf:      v.deaf,
+		Streaming: v.screen.active,
 	}
 
 	h.voiceMu.Lock()
@@ -416,6 +440,13 @@ func (h *Hub) leaveVoice(s *Session, channelID int64, notifySelf bool) {
 	if channelID == 0 {
 		return
 	}
+	// The screen goes before the session does, so that everybody watching is
+	// told the stream ended rather than left holding a picture that has quietly
+	// stopped moving. It reads the session, so it has to run before the session
+	// is cleared.
+	h.endScreenShare(s, channelID)
+	h.stopWatchingAll(s, channelID)
+
 	had := s.clearVoiceSession(channelID)
 	if h.relay != nil {
 		h.relay.Leave(channelID, s.UserID())
@@ -506,6 +537,132 @@ func (h *Hub) resetAllVoice(reason string) {
 			h.relay.CloseChannel(channelID)
 		}
 	}
+}
+
+// --- screens ----------------------------------------------------------------
+
+// endScreenShare stops one participant's screen share and tells the channel.
+//
+// It is safe to call for somebody who was not sharing, which is what lets
+// every departure path call it without asking first.
+func (h *Hub) endScreenShare(s *Session, channelID int64) {
+	if channelID == 0 {
+		return
+	}
+	previous := s.setScreen(sessionScreen{})
+	if !previous.active {
+		return
+	}
+	if h.relay != nil {
+		h.relay.CloseScreen(channelID, s.UserID())
+	}
+	// Everybody who was watching stops watching. Their own intent is cleared
+	// as well as the subscription, so a share that starts again is one they
+	// choose to open rather than one that reappears on its own.
+	h.dropViewers(channelID, s.UserID())
+
+	h.BroadcastChannelEvent(protocol.Event(protocol.EvVoiceStream, protocol.VoiceStreamEvent{
+		ChannelID: channelID,
+		UserID:    s.UserID(),
+		Active:    false,
+	}), channelID)
+}
+
+// dropViewers ends everybody's subscription to one screen.
+func (h *Hub) dropViewers(channelID, publisherID int64) {
+	for _, other := range h.Sessions() {
+		if other.UserID() == publisherID || other.voiceChannel() != channelID {
+			continue
+		}
+		if !other.setWatching(publisherID, false) {
+			continue
+		}
+		if h.relay != nil {
+			h.relay.Unwatch(channelID, other.UserID(), publisherID)
+		}
+		h.announceWatch(channelID, other.UserID(), publisherID, false)
+	}
+}
+
+// stopWatchingAll ends every subscription one participant holds, which is what
+// leaving a channel amounts to for somebody who was watching.
+func (h *Hub) stopWatchingAll(s *Session, channelID int64) {
+	if channelID == 0 {
+		return
+	}
+	for _, publisherID := range s.stopWatching() {
+		if h.relay != nil {
+			h.relay.Unwatch(channelID, s.UserID(), publisherID)
+		}
+		h.announceWatch(channelID, s.UserID(), publisherID, false)
+	}
+}
+
+// announceWatch tells the channel that somebody started or stopped watching a
+// screen.
+//
+// It goes to the whole channel rather than to the two people involved because
+// two different readers need it. In client_host mode the host is the one
+// carrying the picture and has to be told to start or stop; and everybody else
+// is drawing a viewer count next to the stream, which is a thing worth knowing
+// before you decide to share your screen with a room.
+func (h *Hub) announceWatch(channelID, viewerID, publisherID int64, watching bool) {
+	h.BroadcastChannelEvent(protocol.Event(protocol.EvVoiceWatch, protocol.VoiceWatchEvent{
+		ChannelID:   channelID,
+		ViewerID:    viewerID,
+		PublisherID: publisherID,
+		Watching:    watching,
+	}), channelID)
+}
+
+// screenShares is every live share in a channel, as a viewer may see them. It
+// is what a joining client is handed so a stream that started before it
+// arrived is not invisible until the next time it changes.
+func (h *Hub) screenShares(viewer *Session, channelID int64) []protocol.VoiceStreamEvent {
+	var out []protocol.VoiceStreamEvent
+	for _, other := range h.Sessions() {
+		if other.UserID() != viewer.UserID() && HidesPresence(other.User().Status) {
+			continue
+		}
+		if other.voiceChannel() != channelID {
+			continue
+		}
+		screen := other.screenShare()
+		if !screen.active {
+			continue
+		}
+		out = append(out, protocol.VoiceStreamEvent{
+			ChannelID: channelID,
+			UserID:    other.UserID(),
+			Active:    true,
+			Quality:   screen.quality,
+			Audio:     screen.audio,
+			Source:    screen.source,
+		})
+	}
+	return out
+}
+
+// countScreenShares is how many people are sharing a screen in a channel, and
+// how many are watching one of them.
+func (h *Hub) countScreenShares(channelID, publisherID int64) (shares, viewers int) {
+	for _, other := range h.Sessions() {
+		if other.voiceChannel() != channelID {
+			continue
+		}
+		if other.screenShare().active {
+			shares++
+		}
+		if publisherID != 0 && other.UserID() != publisherID {
+			for _, watched := range other.watchedScreens() {
+				if watched == publisherID {
+					viewers++
+					break
+				}
+			}
+		}
+	}
+	return shares, viewers
 }
 
 // sessionOf returns the live session of the nth entry of a member list.

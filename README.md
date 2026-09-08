@@ -131,7 +131,16 @@ leave out falls back to its default. See `config.example.json` for the full file
     "public_ip": "",           // an IP, or a hostname to re-resolve; see below
     "udp_port_min": 0,         // 0 lets the OS choose the media ports
     "udp_port_max": 0,
-    "ice_servers": []          // STUN and TURN, needed by client_host
+    "ice_servers": [],         // STUN and TURN, needed by client_host
+    "screen": {
+      "enabled": true,         // may a voice channel carry a shared screen?
+      "audio": true,           // may that screen carry the machine's sound?
+      "max_height": 1080,      // the ceilings, in server_host only
+      "max_framerate": 30,
+      "max_bitrate": 2500000,  // bits per second, per stream
+      "max_streams": 0,        // screens at once in one channel; 0 = uncapped
+      "max_viewers": 0         // viewers of one screen; 0 = uncapped
+    }
   },
   "uploads": {
     "enabled": true,
@@ -272,6 +281,48 @@ values are the rates Opus actually encodes at: 8000, 12000, 16000, 24000 and
 48000. **44100 is not one of them**, and is rejected rather than accepted and
 quietly rounded: Opus always runs on a 48 kHz clock and resamples internally, so
 naming 44100 would ask for something the codec would not do.
+
+### Screen sharing
+
+A shared screen is a second track on the media session that is already carrying
+the call, exactly as it is in Discord: there is no separate channel type, and
+the voice is never interrupted because the microphone is a different track on
+the same connection. Whoever relays the audio relays the picture, so it follows
+`voice.mode` without any setting of its own.
+
+Nothing is sent to anybody who did not ask for it. Everybody in a call hears
+everybody, but a screen is two orders of magnitude larger than a voice, so a
+viewer presses watch and only then does the stream start arriving. A channel
+with three screens being shared in it costs somebody who is looking at none of
+them nothing at all.
+
+**The ceilings apply in `server_host` only, and the server says so.** Every
+stream there is uploaded once and sent out again once per viewer, so
+`max_bitrate` is a promise the operator makes about their own line: at the
+default 2.5 Mb/s, one stream with four viewers is 10 Mb/s of upload. In
+`client_host` nothing crosses this machine, so the ceilings would be an opinion
+about somebody else's bandwidth and are not applied — they are still saved, and
+still shown to an administrator, and the client is told plainly that they bind
+nobody.
+
+`screen.enabled` is the exception and applies in both modes. It is policy rather
+than bandwidth: an operator who does not want screens shared on their server
+means it whoever is carrying the packets. `Stream` is a permission of its own,
+separate from `Speak`, because a channel very often wants everybody talking and
+only a few people transmitting a picture.
+
+`screen.audio` decides whether a share may carry the sound of the machine it
+came from. It is separate because it is a separate risk: a window shared by
+mistake shows one application, a desktop shared with audio carries everything
+that machine plays.
+
+**Codecs.** The relay offers VP9, H.264, VP8 and AV1, and the client publishing
+picks from that list. It does not transcode and never could — it forwards RTP it
+does not look inside, which is what keeps this server one static binary with no
+codec in it. VP9 is what a shared screen wants up to 1080p30, where its
+screen-content coding keeps text legible at a bitrate H.264 has already smeared;
+H.264 is what it wants above that, because it is encoded by the graphics card
+and VP9 is not.
 
 ### Home servers, dynamic addresses and TLS
 
@@ -662,7 +713,7 @@ internal/store        SQLite schema, migrations and every query
 internal/auth         Argon2id passwords and opaque session tokens
 internal/permissions  the bitmask and the resolution rules
 internal/uploads      attachment storage on disk, quota, content types, WAV length
-internal/voice        the Opus parameters, and the WebRTC relay
+internal/voice        the codec parameters, and the WebRTC relay
 internal/discord      the Discord gateway and webhook API, for the relay
 internal/publicip     the address the relay advertises: literal, DNS or STUN
 internal/ddns         DuckDNS and Cloudflare: address records and DNS-01

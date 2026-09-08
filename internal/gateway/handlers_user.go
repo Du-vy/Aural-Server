@@ -789,6 +789,19 @@ func handleServerUpdate(_ context.Context, s *Session, raw json.RawMessage) (any
 		current.DTX = req.Voice.DTX
 		current.Stereo = req.Voice.Stereo
 		current.MaxParticipants = req.Voice.MaxParticipants
+		// The video plane travels inside the audio one and is replaced with
+		// it. The deployment half of Screen is that there is none: every field
+		// of it is a policy an administrator sets, so unlike the address and
+		// the port range there is nothing here to hold back.
+		current.Screen = config.Screen{
+			Enabled:      req.Voice.Screen.Enabled,
+			Audio:        req.Voice.Screen.Audio,
+			MaxHeight:    req.Voice.Screen.MaxHeight,
+			MaxFramerate: req.Voice.Screen.MaxFramerate,
+			MaxBitrate:   req.Voice.Screen.MaxBitrate,
+			MaxStreams:   req.Voice.Screen.MaxStreams,
+			MaxViewers:   req.Voice.Screen.MaxViewers,
+		}
 		// The same rules the configuration file goes through, so a setting that
 		// would not survive a restart cannot be reached from a client either.
 		if err := current.Validate(); err != nil {

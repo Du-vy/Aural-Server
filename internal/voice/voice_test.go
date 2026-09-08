@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"github.com/aural-chat/aural-server/internal/protocol"
 	"io"
 	"log/slog"
 	"strings"
@@ -53,11 +54,20 @@ func TestFmtpLineFollowsTheFlags(t *testing.T) {
 // so the two ends have to agree on how one is spelled. The client parses
 // exactly this shape.
 func TestStreamAndTrackIDsNameTheirUser(t *testing.T) {
-	if got := StreamID(42); got != "av-42" {
-		t.Errorf("StreamID: got %q", got)
-	}
-	if got := TrackID(42); got != "au-42" {
-		t.Errorf("TrackID: got %q", got)
+	for _, tc := range []struct {
+		purpose       string
+		stream, track string
+	}{
+		{protocol.TrackMic, "av-42", "au-42"},
+		{protocol.TrackScreen, "sc-42", "vi-42"},
+		{protocol.TrackScreenAudio, "sa-42", "sd-42"},
+	} {
+		if got := StreamID(42, tc.purpose); got != tc.stream {
+			t.Errorf("StreamID(%s): got %q, want %q", tc.purpose, got, tc.stream)
+		}
+		if got := TrackID(42, tc.purpose); got != tc.track {
+			t.Errorf("TrackID(%s): got %q, want %q", tc.purpose, got, tc.track)
+		}
 	}
 }
 

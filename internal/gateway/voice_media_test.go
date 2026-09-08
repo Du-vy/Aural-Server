@@ -50,6 +50,10 @@ type rtcClient struct {
 	userID int64
 	// arrived carries every track the relay sends down.
 	arrived chan *webrtc.TrackRemote
+	// screen is the picture this client has to send, held until the relay
+	// offers a section to send it on. It is read on the signalling goroutine
+	// and written by the test, so it lives behind the same mutex as the rest.
+	screen webrtc.TrackLocal
 }
 
 func dialRTC(t *testing.T, h *harness, nickname string) *rtcClient {
@@ -279,6 +283,7 @@ func (c *rtcClient) pumpSignals() {
 			}); err != nil {
 				continue
 			}
+			c.fillSlots(event)
 			answer, err := c.pc.CreateAnswer(nil)
 			if err != nil {
 				continue
@@ -293,6 +298,63 @@ func (c *rtcClient) pumpSignals() {
 			})
 		}
 	}
+}
+
+// fillSlots puts this client's screen onto the section the relay opened for it.
+//
+// It is the whole of how a screen share starts, and it is what the real client
+// does with the same two maps: a section naming this client is the relay
+// offering to receive, so the answer turns it around and sends. Anything else
+// in the offer is media arriving and is left alone.
+func (c *rtcClient) fillSlots(event protocol.VoiceSignalEvent) {
+	c.mu.Lock()
+	screen := c.screen
+	c.mu.Unlock()
+	if screen == nil {
+		return
+	}
+
+	for mid, owner := range event.Tracks {
+		if owner != c.userID || event.Purposes[mid] != protocol.TrackScreen {
+			continue
+		}
+		// AddTrack finds the section the relay just opened, because a
+		// receive-only offer leaves exactly one transceiver willing to send
+		// video and this is it. A browser would set the direction and replace
+		// the track on the sender it already has; pion builds the sender when
+		// the track arrives, so this is the same act spelled its way.
+		if _, err := c.pc.AddTrack(screen); err != nil {
+			c.t.Errorf("attach the screen to %s: %v", mid, err)
+		}
+		c.mu.Lock()
+		c.screen = nil
+		c.mu.Unlock()
+		return
+	}
+}
+
+// shareScreen announces a screen share and holds the track that will carry it.
+// The relay answers by offering a section for it, which fillSlots fills.
+func (c *rtcClient) shareScreen(t *testing.T, quality protocol.VideoQuality) *webrtc.TrackLocalStaticSample {
+	t.Helper()
+
+	track, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
+		"screen", fmt.Sprintf("screen-%d", c.userID),
+	)
+	if err != nil {
+		t.Fatalf("screen track: %v", err)
+	}
+	c.mu.Lock()
+	c.screen = track
+	c.mu.Unlock()
+
+	var result protocol.VoiceStreamResult
+	c.request(t, protocol.OpVoiceStream, protocol.VoiceStreamRequest{
+		Active:  true,
+		Quality: &quality,
+	}, &result)
+	return track
 }
 
 // send fires a request and does not wait for its reply, which is what a
@@ -388,7 +450,7 @@ func TestServerHostedRelayCarriesAudioBothWays(t *testing.T) {
 	// Bob hears Alice through the answer he was given: she was already
 	// publishing when he arrived, so her track travelled in it.
 	_, stream, packets := hear(t, bob, 20)
-	if want := voice.StreamID(alice.userID); stream != want {
+	if want := voice.StreamID(alice.userID, protocol.TrackMic); stream != want {
 		t.Fatalf("bob heard stream %q, want %q", stream, want)
 	}
 	if packets < 20 {
@@ -398,7 +460,7 @@ func TestServerHostedRelayCarriesAudioBothWays(t *testing.T) {
 	// Alice hears Bob only because the relay offered again once his audio
 	// turned up, and her client answered. That is the renegotiation path.
 	_, stream, packets = hear(t, alice, 20)
-	if want := voice.StreamID(bob.userID); stream != want {
+	if want := voice.StreamID(bob.userID, protocol.TrackMic); stream != want {
 		t.Fatalf("alice heard stream %q, want %q", stream, want)
 	}
 	if packets < 20 {
@@ -516,7 +578,7 @@ func TestServerHostedRelayDeliversAudioIntactToEveryListener(t *testing.T) {
 		c    *rtcClient
 	}{{"bob", bob}, {"carol", carol}} {
 		stream, packets := hearIntact(t, listener.c, 25)
-		if want := voice.StreamID(alice.userID); stream != want {
+		if want := voice.StreamID(alice.userID, protocol.TrackMic); stream != want {
 			t.Fatalf("%s heard stream %q, want %q", listener.name, stream, want)
 		}
 		if packets < 25 {
@@ -585,5 +647,116 @@ func TestServerHostedRelayStopsAMutedParticipant(t *testing.T) {
 	}
 	if _, _, err := remote.ReadRTP(); err == nil {
 		t.Fatal("the relay forwarded audio from a muted participant")
+	}
+}
+
+// TestServerHostedRelayCarriesAScreenOnlyToWhoeverAsked is the end-to-end check
+// of the video plane, and of the one decision that makes it affordable.
+//
+// Two things are being asserted and they pull in opposite directions. A screen
+// must actually arrive: real RTP, over a real transport, forwarded by the relay
+// to somebody who asked for it. And it must not arrive at anybody who did not
+// ask — which is the difference between a channel where three people are
+// sharing costing a viewer three streams and costing them nothing.
+func TestServerHostedRelayCarriesAScreenOnlyToWhoeverAsked(t *testing.T) {
+	h := newHarness(t, serverHosted)
+	alice := dialRTC(t, h, "Alice")
+	bob := dialRTC(t, h, "Bob")
+	carol := dialRTC(t, h, "Carol")
+
+	var channelID int64
+	for _, ch := range h.server.Hub().SortedChannels() {
+		if ch.Type == protocol.ChannelVoice {
+			channelID = ch.ID
+			break
+		}
+	}
+	if channelID == 0 {
+		t.Fatal("the seed has no voice channel")
+	}
+
+	for _, c := range []*rtcClient{alice, bob, carol} {
+		c.request(t, protocol.OpUserMove, protocol.UserMoveRequest{ChannelID: &channelID}, nil)
+		c.openMedia(t, channelID)
+	}
+
+	screen := alice.shareScreen(t, protocol.VideoQuality{Height: 720, Framerate: 30, Bitrate: 1_000_000})
+
+	// Only Bob asks to watch. Carol is in the same channel, hears the same
+	// call, and must be sent no video at all.
+	bob.request(t, protocol.OpVoiceWatch,
+		protocol.VoiceWatchRequest{UserID: alice.userID, Watching: true}, nil)
+
+	done := make(chan struct{})
+	defer close(done)
+	go showScreen(screen, done)
+
+	track := awaitVideo(t, bob, 15*time.Second)
+	if track == nil {
+		t.Fatal("the screen never reached the viewer who asked for it")
+	}
+	if want := voice.StreamID(alice.userID, protocol.TrackScreen); track.StreamID() != want {
+		t.Fatalf("the screen arrived as stream %q, want %q", track.StreamID(), want)
+	}
+	if packets := readSome(t, track, 10); packets < 10 {
+		t.Fatalf("only %d video packets arrived, want at least 10", packets)
+	}
+
+	// Carol has been sitting through all of that. A video track reaching her
+	// would mean the relay is sending a picture to somebody who never asked,
+	// which on a channel of any size is the most expensive possible bug.
+	if track := awaitVideo(t, carol, 2*time.Second); track != nil {
+		t.Fatal("a screen was sent to somebody who did not ask to watch it")
+	}
+}
+
+// awaitVideo waits for a video track to arrive, or reports that none did.
+func awaitVideo(t *testing.T, c *rtcClient, within time.Duration) *webrtc.TrackRemote {
+	t.Helper()
+	deadline := time.After(within)
+	for {
+		select {
+		case track := <-c.arrived:
+			if track.Kind() == webrtc.RTPCodecTypeVideo {
+				return track
+			}
+		case <-deadline:
+			return nil
+		}
+	}
+}
+
+// readSome reads up to n packets off a track, giving up rather than blocking
+// if the picture stops.
+func readSome(t *testing.T, track *webrtc.TrackRemote, n int) int {
+	t.Helper()
+	buf := make([]byte, 1500)
+	count := 0
+	for count < n {
+		if err := track.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			return count
+		}
+		if _, _, err := track.Read(buf); err != nil {
+			return count
+		}
+		count++
+	}
+	return count
+}
+
+// showScreen writes video until the test stops it. As with speak, the payload
+// is not real VP8 and does not need to be: nothing between the two ends
+// decodes it, and the relay least of all.
+func showScreen(track *webrtc.TrackLocalStaticSample, done <-chan struct{}) {
+	ticker := time.NewTicker(33 * time.Millisecond)
+	defer ticker.Stop()
+	payload := make([]byte, 400)
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			_ = track.WriteSample(media.Sample{Data: payload, Duration: 33 * time.Millisecond})
+		}
 	}
 }

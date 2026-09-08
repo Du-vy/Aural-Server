@@ -33,7 +33,16 @@
     "public_ip": "",
     "udp_port_min": 40000,
     "udp_port_max": 40100,
-    "ice_servers": []
+    "ice_servers": [],
+    "screen": {
+      "enabled": true,
+      "audio": true,
+      "max_height": 1080,
+      "max_framerate": 30,
+      "max_bitrate": 2500000,
+      "max_streams": 0,
+      "max_viewers": 0
+    }
   },
   "uploads": {
     "enabled": true,

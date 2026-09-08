@@ -567,6 +567,7 @@ A 64-bit mask. `Administrator` bypasses every other check.
 | 20 | `BanUsers` | Refuse somebody the server, and the address and device behind them |
 | 21 | `ViewAuditLog` | Read the record of what moderators did |
 | 22 | `ManageExpressions` | Upload and remove custom emoji, stickers and soundboard sounds |
+| 23 | `Stream` | Share a screen or a window in a voice channel |
 | 31 | `Administrator` | Everything, unconditionally |
 
 ### Resolution
@@ -922,13 +923,15 @@ and everybody opens a new session; whoever gets there first hosts the next one.
 | --- | --- | --- |
 | `voice.connect` | Already in the channel | `{ channelId, sdp? }`. `sdp` is the caller's offer in `server_host` and is absent in `client_host`. Rate limited. |
 | `voice.leave` | — | Closes the media session without leaving the channel. |
-| `voice.signal` | — | `{ targetId, kind, sdp?, candidate?, tracks? }`. Rate limited. |
+| `voice.signal` | — | `{ targetId, kind, sdp?, candidate?, tracks?, purposes? }`. Rate limited. |
 | `voice.state` | — | `{ selfMute?, selfDeaf? }`. Absent fields are left alone. |
 | `voice.moderate` | `MuteUsers` / `DeafenUsers`, and rank | `{ userId, mute?, deaf? }`. |
 | `voice.speaking` | — | `{ speaking }`. Transitions only. Rate limited. |
+| `voice.stream` | `Stream` | `{ active, quality?, audio, source? }`. Starts, changes or stops a screen share. Rate limited. |
+| `voice.watch` | — | `{ userId, watching }`. Starts or stops receiving one participant's screen. Rate limited. |
 
 `voice.connect` replies with `{ channelId, mode, sdp?, hostUserId?, hostEpoch?,
-iceServers, voice, participants }`. In `server_host` the `sdp` is the server's
+iceServers, voice, participants, streams? }`. In `server_host` the `sdp` is the server's
 answer and the session is live. In `client_host` there is no answer: the reply
 names the host, and either this client is it — in which case it waits to be told
 who to dial — or it waits for that host's offer.
@@ -943,11 +946,22 @@ agreed to carry.
 link offers**: the relay in `server_host`, the elected host in `client_host`.
 There is no glare to resolve because there is never a second offerer.
 
-`tracks` maps an SDP media id to the user whose audio it carries, and travels
-with an offer in `client_host` only. The server-hosted relay needs none of it —
-it names each participant in the stream id, as `av-<userId>` — but a relaying
-browser cannot rename somebody else's track, so the host says which media id is
-whose. The server passes the map along without reading it.
+`tracks` maps an SDP media id to the user whose media it carries, and
+`purposes` maps the same media ids to what that media is: `mic`, `screen` or
+`screen_audio`. Both travel with an offer, and the kind of the track cannot
+replace them — a voice and the sound of a shared screen are both audio.
+
+The two maps describe both directions at once, which is what makes a screen
+share possible without a second offerer. **A section naming the receiving client
+itself is a slot the offerer has opened for that client to publish its own
+screen on**: the offer describes it as receive-only, and the answer turns it
+around by attaching a track. Every other section is media arriving. The server
+passes both maps along without reading them, beyond bounding their size and
+refusing a purpose it does not know.
+
+The relay also names what it sends in the stream id — `av-<userId>` for a
+microphone, `sc-<userId>` for a screen, `sa-<userId>` for that screen's sound —
+which is what a client older than the maps still reads.
 
 **A client must hold signalling it is not ready for rather than discard it.**
 The relay starts gathering candidates the moment it has an answer, so its first
@@ -958,8 +972,8 @@ peers in `client_host`.
 ### Voice state
 
 `VoiceState` is `{ userId, channelId, connected, selfMute, selfDeaf, mute, deaf,
-host }`, and one arrives in `ready.voiceStates` for every participant of every
-voice channel the caller may see.
+host, streaming }`, and one arrives in `ready.voiceStates` for every participant
+of every voice channel the caller may see.
 
 The mute flags come in pairs because they have different owners. `selfMute` is
 the participant's own choice and theirs to undo; `mute` was imposed by a
@@ -972,6 +986,83 @@ sends, so it holds whatever the client does. In `client_host` there is no relay
 to enforce it: the host is told, through the same `voice.state` event everybody
 receives, and a host running modified code could ignore it. That is a real
 difference between the modes and is worth knowing before choosing one.
+
+### Screen sharing
+
+A screen share is a second and a third thing sent down the media session that
+was already carrying a call: a picture, and optionally the sound of the machine
+it came from. It is not a channel type and not a mode — a voice channel either
+has one running in it or does not — and it never interrupts the voice, because
+the microphone is a separate track on the same connection and is never touched.
+
+`ServerInfo.voice.screen` is `{ enabled, audio, enforced, maxHeight,
+maxFramerate, maxBitrate, maxStreams, maxViewers }`.
+
+**`enforced` is the whole of the difference between the hosting modes.** In
+`server_host` every stream is uploaded to the server and sent out again once per
+viewer, so the ceilings are a promise the operator makes about their own line
+and they bind: a quality above them is clamped rather than refused. In
+`client_host` nothing crosses the server, so they would be one person's opinion
+about somebody else's bandwidth; they are sent for an administrator to see and
+applied to nobody. It is sent rather than derived from `mode` so that both ends
+apply one rule and cannot drift apart on what it was.
+
+`enabled` is policy rather than bandwidth and applies in both modes: an operator
+who does not want screens shared on their server means it whoever is carrying
+the packets.
+
+#### Starting one
+
+`voice.stream` carries no SDP and returns none. The media section a screen
+travels on is opened by whoever relays the channel and answered by the client,
+so this op is only the decision that a screen is being shared, and the quality
+it may be shared at. It replies with `{ active, quality, audio }` — the request
+held inside what the server carries — and a client applies what comes back
+rather than what it asked for.
+
+```
+                voice.stream {active}
+   publisher  ─────────────────────────▶  server
+                                            │  relay opens a recvonly section
+              ◀───────────────────────────  │  voice.signal {offer, tracks, purposes}
+   publisher  ───────────────────────────▶     voice.signal {answer}  (with the track on it)
+```
+
+The offerer never changes. The relay offers to receive; the publisher answers by
+sending. That is why a share can start in the middle of a call without the two
+ends ever both offering at once, and it is the same in `client_host`, where the
+elected host opens the section instead.
+
+Sending it again with a different quality changes a share without stopping it.
+Sending it with `active: false` stops one, and that is deliberately reachable
+even when sharing has since been switched off server-wide: somebody must always
+be able to stop.
+
+#### Watching one
+
+Nothing arrives unasked. Everybody in a call hears everybody, but a picture is
+two orders of magnitude larger than a voice, so `voice.watch` is what starts it
+arriving and what stops it. In `server_host` the relay links the subscription
+directly. In `client_host` the resulting `voice.watch` event **is** the
+mechanism: the host is the only machine holding the picture, so it reads the
+event and puts that person's screen onto the viewer's link.
+
+The event goes to the whole channel rather than to the two people involved,
+because two different readers need it: the host, and everybody drawing a viewer
+count beside a stream.
+
+Ending a share ends everybody's subscription to it. Leaving the intent behind
+would have a share that started again reach people who stopped looking several
+minutes ago.
+
+#### What a keyframe costs
+
+A relay does not decode, so it cannot make a keyframe; all it can do is pass the
+request back to the machine that has the picture. It does so when a viewer
+subscribes — a stream of a still screen may otherwise be minutes from its next
+one — and when a viewer's own RTCP asks. Requests are collapsed to at most one
+every 500 ms, because several viewers arriving together is exactly when a burst
+of keyframes would hurt most.
 
 ### Webhooks
 
@@ -1148,10 +1239,12 @@ corner of it. Any other value a sender writes becomes `"rich"`.
 | --- | --- | --- |
 | `voice.state` | `{ state }` | Everyone who may see the channel. |
 | `voice.speaking` | `{ userId, channelId, speaking }` | Everyone who may see the channel. |
-| `voice.signal` | `{ fromUserId, channelId, kind, sdp?, candidate?, tracks? }` | The addressed client. `fromUserId` is `0` for the relay. |
+| `voice.signal` | `{ fromUserId, channelId, kind, sdp?, candidate?, tracks?, purposes? }` | The addressed client. `fromUserId` is `0` for the relay. |
 | `voice.peer` | `{ channelId, userId, action, epoch }` | The host of a `client_host` channel, and nobody else. |
 | `voice.host` | `{ channelId, hostUserId, epoch }` | Everyone who may see the channel. |
 | `voice.reset` | `{ channelId, reason }` | Whoever must start over. |
+| `voice.stream` | `{ channelId, userId, active, quality, audio, source? }` | Everyone who may see the channel. |
+| `voice.watch` | `{ channelId, viewerId, publisherId, watching }` | Everyone who may see the channel. |
 
 `voice.reset` is not an error. It is the single way back from everything: a host
 handover (`host_changed`), an audio plane an administrator reconfigured

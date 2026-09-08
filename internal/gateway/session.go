@@ -106,6 +106,29 @@ type sessionVoice struct {
 	mute      bool
 	deaf      bool
 	speaking  bool
+	// screen is the share this session is running, if any. It hangs off the
+	// media session rather than off the channel because that is what it is: a
+	// second thing sent down a connection that was already open, which ends
+	// when that connection does and not before.
+	screen sessionScreen
+}
+
+// sessionScreen is one participant's screen share.
+//
+// The quality is kept because it is what the rest of the channel is told: a
+// viewer sizes the picture and says what it is before a frame has arrived, and
+// somebody deciding whether to watch on a metered connection deserves to know
+// what they are about to be sent.
+type sessionScreen struct {
+	active  bool
+	quality protocol.VideoQuality
+	audio   bool
+	source  string
+	// watching is whose screens this session has asked for. It is here rather
+	// than in the room because it is the client's own intent: it survives the
+	// stream it names stopping and starting, and it is what has to be undone
+	// when the connection goes.
+	watching map[int64]bool
 }
 
 // Session is one client connection and the identity behind it.
@@ -337,6 +360,10 @@ func (s *Session) clearVoiceSession(channelID int64) bool {
 	s.voice.channelID = 0
 	s.voice.connected = false
 	s.voice.speaking = false
+	// A share belongs to the media session that carried it, and so does having
+	// asked to watch one. Both end here rather than lingering into whatever
+	// session comes next.
+	s.voice.screen = sessionScreen{}
 	return true
 }
 
@@ -394,6 +421,71 @@ func (s *Session) setSpeaking(speaking bool) bool {
 	}
 	s.voice.speaking = speaking
 	return true
+}
+
+// setScreen records the share this session is running, and reports what it was
+// before so the caller can tell a change from a repetition.
+func (s *Session) setScreen(screen sessionScreen) sessionScreen {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.voice.screen
+	// Whose screens this session is watching is not part of the share it is
+	// sending, and a client announcing one must not be able to forget the
+	// other.
+	screen.watching = previous.watching
+	s.voice.screen = screen
+	return previous
+}
+
+// screenShare is the share this session is running, if any.
+func (s *Session) screenShare() sessionScreen {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.voice.screen
+}
+
+// setWatching records that this session has asked for somebody's screen, or
+// has stopped asking. It reports whether the intent actually changed, so a
+// client repeating itself costs nothing further down.
+func (s *Session) setWatching(publisherID int64, watching bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if watching == s.voice.screen.watching[publisherID] {
+		return false
+	}
+	if !watching {
+		delete(s.voice.screen.watching, publisherID)
+		return true
+	}
+	if s.voice.screen.watching == nil {
+		s.voice.screen.watching = map[int64]bool{}
+	}
+	s.voice.screen.watching[publisherID] = true
+	return true
+}
+
+// watchedScreens is whose screens this session has asked for.
+func (s *Session) watchedScreens() []int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]int64, 0, len(s.voice.screen.watching))
+	for userID := range s.voice.screen.watching {
+		out = append(out, userID)
+	}
+	return out
+}
+
+// stopWatching forgets every screen this session had asked for and returns
+// what they were, which is what a departure has to undo.
+func (s *Session) stopWatching() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]int64, 0, len(s.voice.screen.watching))
+	for userID := range s.voice.screen.watching {
+		out = append(out, userID)
+	}
+	s.voice.screen.watching = nil
+	return out
 }
 
 func (s *Session) setUser(u store.User) {
@@ -777,4 +869,6 @@ var routes = map[string]route{
 	protocol.OpVoiceState:    {needsAuth: true, fn: handleVoiceState},
 	protocol.OpVoiceModerate: {needsAuth: true, fn: handleVoiceModerate},
 	protocol.OpVoiceSpeaking: {needsAuth: true, fn: handleVoiceSpeaking},
+	protocol.OpVoiceStream:   {needsAuth: true, fn: handleVoiceStream},
+	protocol.OpVoiceWatch:    {needsAuth: true, fn: handleVoiceWatch},
 }

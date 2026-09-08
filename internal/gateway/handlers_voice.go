@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 
+	"github.com/aural-chat/aural-server/internal/config"
 	"github.com/aural-chat/aural-server/internal/permissions"
 	"github.com/aural-chat/aural-server/internal/protocol"
 	"github.com/aural-chat/aural-server/internal/voice"
@@ -114,6 +115,8 @@ func handleVoiceConnect(_ context.Context, s *Session, raw json.RawMessage) (any
 				Kind:       sig.Kind,
 				SDP:        sig.SDP,
 				Candidate:  sig.Candidate,
+				Tracks:     sig.Tracks,
+				Purposes:   sig.Purposes,
 			}))
 		})
 		if err != nil {
@@ -162,6 +165,7 @@ func handleVoiceConnect(_ context.Context, s *Session, raw json.RawMessage) (any
 	}
 
 	result.Participants = s.hub.voiceParticipants(s, channelID)
+	result.Streams = s.hub.screenShares(s, channelID)
 	s.hub.broadcastVoiceState(s)
 	if cfg.Mode == protocol.VoiceModeClientHost {
 		s.hub.broadcastVoiceHost(channelID, host, epoch)
@@ -204,8 +208,13 @@ func handleVoiceSignal(_ context.Context, s *Session, raw json.RawMessage) (any,
 	}
 	// The track map is relayed unread, so its size is the one thing about it
 	// worth checking: a channel cannot hold more people than the server can.
-	if len(req.Tracks) > maxSignalTracks {
+	if len(req.Tracks) > maxSignalTracks || len(req.Purposes) > maxSignalTracks {
 		return nil, protocol.Errorf(protocol.ErrBadRequest, "that track map names more media than a channel can hold")
+	}
+	for _, purpose := range req.Purposes {
+		if !protocol.ValidTrackPurpose(purpose) {
+			return nil, protocol.Errorf(protocol.ErrBadRequest, "that track map names media of a kind this server does not carry")
+		}
 	}
 
 	channelID := s.voiceChannel()
@@ -262,6 +271,7 @@ func handleVoiceSignal(_ context.Context, s *Session, raw json.RawMessage) (any,
 		SDP:        req.SDP,
 		Candidate:  req.Candidate,
 		Tracks:     req.Tracks,
+		Purposes:   req.Purposes,
 	}))
 	return struct{}{}, nil
 }
@@ -379,6 +389,225 @@ func handleVoiceSpeaking(_ context.Context, s *Session, raw json.RawMessage) (an
 		Speaking:  speaking,
 	}), channelID)
 	return struct{}{}, nil
+}
+
+// handleVoiceStream starts, changes or stops the caller's screen share.
+//
+// It carries no SDP and returns none. The media section a screen travels on is
+// opened by the relay and answered by the client, which is the same direction
+// every other negotiation here runs in; this op is the decision that a screen
+// is being shared at all, and the quality it is allowed to be shared at.
+//
+// Stopping is the same op with Active false, and it is deliberately reachable
+// even when sharing has since been switched off server-wide: somebody must
+// always be able to stop.
+func handleVoiceStream(_ context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
+	req, failure := decode[protocol.VoiceStreamRequest](raw)
+	if failure != nil {
+		return nil, failure
+	}
+	if !s.signals.allow() {
+		return nil, protocol.Errorf(protocol.ErrRateLimited, "you are changing your screen share too quickly")
+	}
+
+	channelID := s.voiceChannel()
+	if channelID == 0 {
+		return nil, protocol.Errorf(protocol.ErrConflict, "you have no voice session open")
+	}
+
+	if !req.Active {
+		s.hub.endScreenShare(s, channelID)
+		s.hub.broadcastVoiceState(s)
+		return protocol.VoiceStreamResult{}, nil
+	}
+
+	cfg := s.hub.voiceConfig()
+	if !cfg.Enabled || !cfg.Screen.Enabled || s.hub.relay == nil {
+		return nil, protocol.Errorf(protocol.ErrStreamDisabled, "this server does not carry screen shares")
+	}
+
+	base, roleIDs := s.Permissions()
+	if !s.hub.ChannelPermissions(base, roleIDs, channelID).Has(permissions.Stream) {
+		return nil, protocol.Errorf(protocol.ErrForbidden, "you are not allowed to share a screen here")
+	}
+
+	previous := s.screenShare()
+	if cfg.Screen.MaxStreams > 0 && !previous.active {
+		if shares, _ := s.hub.countScreenShares(channelID, 0); shares >= cfg.Screen.MaxStreams {
+			return nil, protocol.Errorf(protocol.ErrConflict,
+				"that channel is carrying as many screens as this server allows")
+		}
+	}
+
+	quality := clampQuality(req.Quality, cfg.Screen, cfg.Mode)
+	audio := req.Audio && cfg.Screen.Audio
+	source := protocol.ScreenSourceDisplay
+	if req.Source == protocol.ScreenSourceWindow {
+		source = protocol.ScreenSourceWindow
+	}
+
+	// Only a server-hosted session has anything to open: in client_host the
+	// channel's host is the far end, and it opens the section itself when the
+	// event below reaches it.
+	if cfg.Mode == protocol.VoiceModeServerHost {
+		if err := s.hub.relay.OpenScreen(channelID, s.UserID(), audio); err != nil {
+			if errors.Is(err, voice.ErrNoSession) {
+				return nil, protocol.Errorf(protocol.ErrConflict, "you have no voice session open")
+			}
+			s.log.Warn("open a screen share",
+				slog.Int64("channel", channelID), slog.Any("error", err))
+			return nil, protocol.Errorf(protocol.ErrVoiceFailed, "that screen share could not be opened")
+		}
+	}
+
+	s.setScreen(sessionScreen{active: true, quality: quality, audio: audio, source: source})
+
+	event := protocol.VoiceStreamEvent{
+		ChannelID: channelID,
+		UserID:    s.UserID(),
+		Active:    true,
+		Quality:   quality,
+		Audio:     audio,
+		Source:    source,
+	}
+	s.hub.BroadcastChannelEvent(protocol.Event(protocol.EvVoiceStream, event), channelID)
+	if !previous.active {
+		// The badge next to a name comes from the voice state, so a share that
+		// has only changed quality does not need to disturb it.
+		s.hub.broadcastVoiceState(s)
+		s.log.Info("screen share started",
+			slog.Int64("channel", channelID),
+			slog.Int("height", quality.Height),
+			slog.Int("framerate", quality.Framerate),
+			slog.Int("bitrate", quality.Bitrate),
+			slog.Bool("audio", audio))
+	}
+	return protocol.VoiceStreamResult{Active: true, Quality: quality, Audio: audio}, nil
+}
+
+// handleVoiceWatch starts or stops receiving one participant's screen.
+//
+// Watching is asked for rather than assumed because a screen is the most
+// expensive thing this server carries: in server_host mode one share at
+// 2.5 Mb/s with four viewers is ten megabits a second of somebody's uplink,
+// and sending it to people who are not looking would be the largest waste in
+// the protocol.
+func handleVoiceWatch(_ context.Context, s *Session, raw json.RawMessage) (any, *protocol.Error) {
+	req, failure := decode[protocol.VoiceWatchRequest](raw)
+	if failure != nil {
+		return nil, failure
+	}
+	if !s.signals.allow() {
+		return nil, protocol.Errorf(protocol.ErrRateLimited, "you are changing what you watch too quickly")
+	}
+	if req.UserID == s.UserID() {
+		return nil, protocol.Errorf(protocol.ErrBadRequest, "you are already looking at your own screen")
+	}
+
+	channelID := s.voiceChannel()
+	if channelID == 0 {
+		return nil, protocol.Errorf(protocol.ErrConflict, "you have no voice session open")
+	}
+
+	target, ok := s.hub.SessionForUser(req.UserID)
+	if !ok || target.voiceChannel() != channelID {
+		return nil, protocol.Errorf(protocol.ErrNotFound, "that user is not in this voice session")
+	}
+
+	if !req.Watching {
+		if !s.setWatching(req.UserID, false) {
+			return struct{}{}, nil
+		}
+		if s.hub.relay != nil {
+			s.hub.relay.Unwatch(channelID, s.UserID(), req.UserID)
+		}
+		s.hub.announceWatch(channelID, s.UserID(), req.UserID, false)
+		return struct{}{}, nil
+	}
+
+	if !target.screenShare().active {
+		return nil, protocol.Errorf(protocol.ErrNotFound, "that user is not sharing a screen")
+	}
+	cfg := s.hub.voiceConfig()
+	if cfg.Screen.MaxViewers > 0 {
+		if _, viewers := s.hub.countScreenShares(channelID, req.UserID); viewers >= cfg.Screen.MaxViewers {
+			return nil, protocol.Errorf(protocol.ErrConflict,
+				"that stream already has as many viewers as this server allows")
+		}
+	}
+
+	if !s.setWatching(req.UserID, true) {
+		return struct{}{}, nil
+	}
+	if cfg.Mode == protocol.VoiceModeServerHost && s.hub.relay != nil {
+		if err := s.hub.relay.Watch(channelID, s.UserID(), req.UserID); err != nil {
+			s.setWatching(req.UserID, false)
+			if errors.Is(err, voice.ErrNoSession) {
+				return nil, protocol.Errorf(protocol.ErrNotFound, "that stream is no longer running")
+			}
+			return nil, protocol.Errorf(protocol.ErrVoiceFailed, "that stream could not be opened")
+		}
+	}
+	// In client_host mode this event is the whole mechanism: the channel's
+	// host reads it and puts the publisher's picture onto its link with the
+	// viewer. Everybody else reads it as a viewer count.
+	s.hub.announceWatch(channelID, s.UserID(), req.UserID, true)
+	return struct{}{}, nil
+}
+
+// clampQuality holds a requested screen quality inside what the server carries.
+//
+// The ceilings apply in server_host mode only. In client_host the media never
+// touches this machine, so the bandwidth being spent belongs to the two people
+// spending it and the operator has no standing to bound it — which is exactly
+// what Voice.Screen.Enforced tells the client, so that both ends reach the
+// same answer rather than one of them being surprised.
+//
+// A missing or nonsensical request is filled from the ceiling rather than
+// refused: somebody who asked for nothing in particular wants the best this
+// server offers, and that is a reading with no downside.
+func clampQuality(want *protocol.VideoQuality, screen config.Screen, mode string) protocol.VideoQuality {
+	quality := protocol.VideoQuality{
+		Height:    screen.MaxHeight,
+		Framerate: screen.MaxFramerate,
+		Bitrate:   screen.MaxBitrate,
+	}
+	if want != nil {
+		if want.Height > 0 {
+			quality.Height = want.Height
+		}
+		if want.Framerate > 0 {
+			quality.Framerate = want.Framerate
+		}
+		if want.Bitrate > 0 {
+			quality.Bitrate = want.Bitrate
+		}
+	}
+
+	ceiling := protocol.VideoQuality{
+		Height:    config.MaxScreenHeight,
+		Framerate: config.MaxScreenFramerate,
+		Bitrate:   config.MaxScreenBitrate,
+	}
+	if mode == protocol.VoiceModeServerHost {
+		ceiling = protocol.VideoQuality{
+			Height:    screen.MaxHeight,
+			Framerate: screen.MaxFramerate,
+			Bitrate:   screen.MaxBitrate,
+		}
+	}
+
+	quality.Height = clampInt(quality.Height, config.MinScreenHeight, ceiling.Height)
+	quality.Framerate = clampInt(quality.Framerate, config.MinScreenFramerate, ceiling.Framerate)
+	quality.Bitrate = clampInt(quality.Bitrate, config.MinScreenBitrate, ceiling.Bitrate)
+	return quality
+}
+
+func clampInt(value, low, high int) int {
+	if high < low {
+		high = low
+	}
+	return min(max(value, low), high)
 }
 
 // --- helpers ----------------------------------------------------------------

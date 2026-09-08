@@ -1,16 +1,23 @@
-// Package voice is the audio plane: the Opus parameters both hosting modes
+// Package voice is the media plane: the Opus parameters both hosting modes
 // agree on, and the WebRTC relay a server-hosted channel runs.
 //
-// Audio never touches the WebSocket. That socket carries signalling — offers,
+// Media never touches the WebSocket. That socket carries signalling — offers,
 // answers and ICE candidates — and the media itself travels over RTP, encoded
-// as Opus by the sender and decoded by the receiver. Nothing here encodes or
-// decodes anything: a relay forwards packets it does not look inside, which is
-// what lets this server be a single static binary with no cgo and no codec.
+// by the sender and decoded by the receiver. Nothing here encodes or decodes
+// anything: a relay forwards packets it does not look inside, which is what
+// lets this server be a single static binary with no cgo and no codec.
 //
 // The two hosting modes differ only in who does the forwarding. In
 // server_host the Relay in this package does it. In client_host one of the
 // clients does, and the server's part is limited to electing that client and
 // passing signalling between the two ends — no code here is involved at all.
+//
+// A participant publishes up to three things and they are treated separately
+// all the way down: a microphone, a shared screen, and that screen's sound.
+// The microphone goes to everybody in the room, because that is what a call
+// is. A screen goes only to whoever asked to watch it, because it is two
+// orders of magnitude more expensive and nobody wants four of them arriving
+// unasked.
 package voice
 
 import (
@@ -23,16 +30,23 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/aural-chat/aural-server/internal/protocol"
 )
 
-// opusPayloadType is the dynamic payload type the relay offers Opus under. It
-// is the number every WebRTC implementation in practice uses for it, which
-// keeps the SDP boring.
-const opusPayloadType = 111
+// The dynamic payload types the relay offers each codec under. They are the
+// numbers Chromium itself uses for the same codecs, which keeps the SDP boring
+// and the answers predictable.
+const (
+	opusPayloadType = 111
+	vp9PayloadType  = 98
+	vp8PayloadType  = 96
+	h264PayloadType = 102
+	av1PayloadType  = 45
+)
 
 // negotiationTimeout is how long a renegotiation may go unanswered before the
 // peer is given up on. A client that does not answer an offer is a client
@@ -49,17 +63,32 @@ const (
 	iceKeepAliveInterval   = 2 * time.Second
 )
 
-// rtcpDrainBuffer is large enough for any RTCP compound packet. The reads exist
-// to keep the interceptor chain fed, not to look at what arrives.
-const rtcpDrainBuffer = 1500
+// rtcpBuffer is large enough for any RTCP compound packet.
+const rtcpBuffer = 1500
 
 // receiveMTU is the size of the buffer one RTP packet is read into. It is
 // pion's own default for the same thing, and an Opus packet is a small
 // fraction of it.
 const receiveMTU = 1500
 
+// keyframeInterval is the shortest gap between two keyframe requests sent to
+// one publisher.
+//
+// A viewer joining a video stream sees nothing until the next keyframe, so one
+// is asked for the moment they subscribe. Five viewers arriving together would
+// otherwise ask five times and get five keyframes, each of them a burst an
+// order of magnitude larger than an ordinary frame — the exact opposite of
+// what a stream that is already struggling needs. Asking at most twice a
+// second collapses that into one.
+const keyframeInterval = 500 * time.Millisecond
+
 // Settings is the audio plane as the relay needs it. It is a plain value so a
 // reconfiguration is a comparison and a swap rather than a lock discipline.
+//
+// It says nothing about video on purpose. The relay does not encode, so the
+// resolution and frame rate of a shared screen are between the sender and its
+// own encoder; what the server allows is checked when the share is announced,
+// which is the only place it can be checked at all.
 type Settings struct {
 	SampleRate int
 	Bitrate    int
@@ -103,20 +132,69 @@ func boolDigit(v bool) string {
 	return "0"
 }
 
-// StreamID and TrackID name a participant's audio in the SDP the relay sends.
-// A subscriber reads the publisher's identity straight off the arriving track
-// rather than being told separately, which removes the window where a client
-// holds audio it cannot yet attribute to anybody.
-func StreamID(userID int64) string { return "av-" + strconv.FormatInt(userID, 10) }
+// StreamID and TrackID name a participant's media in the SDP the relay sends.
+// A subscriber reads the publisher's identity and what the track carries
+// straight off the arriving stream rather than being told separately, which
+// removes the window where a client holds media it cannot yet attribute to
+// anybody.
+func StreamID(userID int64, purpose string) string {
+	return streamPrefix(purpose) + strconv.FormatInt(userID, 10)
+}
 
 // TrackID is the track name inside that stream.
-func TrackID(userID int64) string { return "au-" + strconv.FormatInt(userID, 10) }
+func TrackID(userID int64, purpose string) string {
+	return trackPrefix(purpose) + strconv.FormatInt(userID, 10)
+}
+
+// The stream and track name prefixes, one pair per purpose. The microphone
+// keeps the names it has always had so that a client older than screen sharing
+// still finds the audio exactly where it used to be.
+func streamPrefix(purpose string) string {
+	switch purpose {
+	case protocol.TrackScreen:
+		return "sc-"
+	case protocol.TrackScreenAudio:
+		return "sa-"
+	default:
+		return "av-"
+	}
+}
+
+func trackPrefix(purpose string) string {
+	switch purpose {
+	case protocol.TrackScreen:
+		return "vi-"
+	case protocol.TrackScreenAudio:
+		return "sd-"
+	default:
+		return "au-"
+	}
+}
+
+// publishedPurposes is every kind of media one participant can send, in the
+// order a room walks them.
+var publishedPurposes = []string{protocol.TrackMic, protocol.TrackScreen, protocol.TrackScreenAudio}
+
+// screenPurposes is the subset a screen share consists of.
+var screenPurposes = []string{protocol.TrackScreen, protocol.TrackScreenAudio}
 
 // Signal is one SDP or ICE frame moving between the relay and a client.
 type Signal struct {
 	Kind      string
 	SDP       string
 	Candidate *protocol.ICECandidate
+	// Tracks and Purposes travel with an offer and say what each media section
+	// of it is: whose media it carries, and which of that person's media.
+	//
+	// They are what lets one offer describe both directions at once. A section
+	// naming the receiving client itself is a slot the relay has opened for
+	// that client to send its own screen on — the relay offers to receive,
+	// the client answers by sending — and a section naming anybody else is
+	// media arriving. Without the maps a client would have to guess which of
+	// several video sections it was meant to fill, and guessing is how media
+	// ends up in the wrong window.
+	Tracks   map[string]int64
+	Purposes map[string]string
 }
 
 // Errors the gateway distinguishes. Everything else is reported as it comes.
@@ -133,8 +211,9 @@ var (
 // One channel is one room and one participant is one peer connection. Each
 // publisher gets its own local track per subscriber rather than one shared
 // between them, which costs a little memory and buys the only thing worth
-// having here: the ability to stop one person's audio reaching one other
-// person, which is what muting and deafening are.
+// having here: the ability to stop one person's media reaching one other
+// person, which is what muting, deafening and choosing not to watch a screen
+// all are.
 type Relay struct {
 	log *slog.Logger
 
@@ -170,9 +249,88 @@ func NewRelay(settings Settings, log *slog.Logger, onGone func(channelID, userID
 	}, nil
 }
 
-// buildAPI assembles the WebRTC stack. Only Opus is registered: a client that
-// offers anything else is answered with an audio section it cannot use, which
-// is the correct answer to a client offering video to a voice server.
+// videoFeedback is the RTCP a video sender asks to be told about.
+//
+// The two that matter here are nack, which is how a lost packet is asked for
+// again, and pli, which is how a receiver says it has nothing it can decode
+// and needs a fresh keyframe. Both are forwarded across the relay rather than
+// answered by it: a relay that does not encode cannot make a keyframe, it can
+// only pass the request on to whoever can.
+var videoFeedback = []webrtc.RTCPFeedback{
+	{Type: "goog-remb"},
+	{Type: "transport-cc"},
+	{Type: "ccm", Parameter: "fir"},
+	{Type: "nack"},
+	{Type: "nack", Parameter: "pli"},
+}
+
+// videoCodecs is what the relay will carry a picture as, in the order it
+// offers them.
+//
+// The order is a recommendation and not a decision: the relay offers the slot
+// a client publishes its screen on, so the client answers, and an answerer
+// picks from what it was offered. A client with a hardware H.264 encoder and a
+// laptop fan it would rather not hear says so through its own codec
+// preferences, and this list is what it chooses within.
+//
+// VP9 leads because a shared screen is the case it is best at: large flat
+// areas of one colour and text that does not move are what its screen-content
+// tools are for, and it holds legible text at a bitrate where H.264 has
+// already given up. H.264 follows because it is the one codec that is encoded
+// in hardware on almost every machine, which is what somebody sharing a game
+// at sixty frames a second actually needs. AV1 is offered last: it compresses
+// better than either and, encoded in software at 1080p in real time, costs
+// more CPU than the machine sharing usually has to spare.
+func videoCodecs() []webrtc.RTPCodecParameters {
+	return []webrtc.RTPCodecParameters{
+		{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:     webrtc.MimeTypeVP9,
+				ClockRate:    90000,
+				SDPFmtpLine:  "profile-id=0",
+				RTCPFeedback: videoFeedback,
+			},
+			PayloadType: vp9PayloadType,
+		},
+		{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:    webrtc.MimeTypeH264,
+				ClockRate:   90000,
+				SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+				// Constrained Baseline at level 3.1 is the profile every
+				// decoder in practice has, and packetization-mode=1 is the
+				// only one worth carrying: mode 0 cannot fragment a NAL unit,
+				// so a keyframe larger than the MTU has nowhere to go.
+				RTCPFeedback: videoFeedback,
+			},
+			PayloadType: h264PayloadType,
+		},
+		{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:     webrtc.MimeTypeVP8,
+				ClockRate:    90000,
+				RTCPFeedback: videoFeedback,
+			},
+			PayloadType: vp8PayloadType,
+		},
+		{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:     webrtc.MimeTypeAV1,
+				ClockRate:    90000,
+				RTCPFeedback: videoFeedback,
+			},
+			PayloadType: av1PayloadType,
+		},
+	}
+}
+
+// buildAPI assembles the WebRTC stack.
+//
+// Opus is the only audio codec: a client that offers anything else is answered
+// with an audio section it cannot use, which is the correct answer to a client
+// offering something this server has not agreed to carry. Video is registered
+// for the screen shares a voice channel may carry on top of the call, and for
+// nothing else — there is no camera here.
 func buildAPI(s Settings) (*webrtc.API, error) {
 	media := &webrtc.MediaEngine{}
 	// Opus is always signalled as two channels in the rtpmap regardless of what
@@ -189,7 +347,19 @@ func buildAPI(s Settings) (*webrtc.API, error) {
 		return nil, fmt.Errorf("voice: register opus: %w", err)
 	}
 
+	for _, codec := range videoCodecs() {
+		if err := media.RegisterCodec(codec, webrtc.RTPCodecTypeVideo); err != nil {
+			return nil, fmt.Errorf("voice: register %s: %w", codec.MimeType, err)
+		}
+	}
+
 	registry := &interceptor.Registry{}
+	// This registers the negative acknowledgement pair as well as the reports,
+	// and it does so for whichever registered codecs asked for them — which is
+	// every video codec above and no audio one. That is the right split: a
+	// lost Opus packet is concealed by the decoder and asking for it again
+	// would arrive too late to play, while a lost video packet leaves a
+	// visible hole until it is either resent or coded over.
 	if err := webrtc.RegisterDefaultInterceptors(media, registry); err != nil {
 		return nil, fmt.Errorf("voice: interceptors: %w", err)
 	}
@@ -279,6 +449,10 @@ func (r *Relay) Close() {
 // heard depends on their own track turning up, which happens moments later and
 // renegotiates everybody else.
 //
+// A shared screen is not part of any of that. The offer this answers carries
+// one microphone and nothing else, and the sections a screen needs are opened
+// later, by the relay, when somebody says they are about to share one.
+//
 // out is called with every signalling frame the relay produces for this
 // participant, from any goroutine, and must not block.
 func (r *Relay) Join(channelID, userID int64, offer string, out func(Signal)) (string, error) {
@@ -310,14 +484,7 @@ func (r *Relay) Join(channelID, userID int64, offer string, out func(Signal)) (s
 		return "", fmt.Errorf("voice: peer connection: %w", err)
 	}
 
-	p := &peer{
-		userID: userID,
-		room:   rm,
-		pc:     pc,
-		out:    out,
-		subs:   map[int64]*subscription{},
-	}
-	p.publication = &publication{owner: p, sinks: map[int64]*sink{}}
+	p := newPeer(userID, rm, pc, out)
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
@@ -343,11 +510,8 @@ func (r *Relay) Join(channelID, userID int64, offer string, out func(Signal)) (s
 		}
 	})
 
-	pc.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		if remote.Kind() != webrtc.RTPCodecTypeAudio {
-			return
-		}
-		rm.publish(p, remote)
+	pc.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		rm.publish(p, remote, receiver)
 	})
 
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
@@ -430,20 +594,85 @@ func (r *Relay) CloseChannel(channelID int64) {
 	}
 }
 
-// SetMuted stops or resumes forwarding what a participant sends. A muted
-// client stops sending too; this is the half that does not depend on the
-// client agreeing.
+// SetMuted stops or resumes forwarding what a participant's microphone sends.
+// A muted client stops sending too; this is the half that does not depend on
+// the client agreeing.
+//
+// It does not touch a screen share. Muting yourself while showing somebody a
+// video is an ordinary thing to do, and a mute that silenced the video too
+// would be a surprise nobody asked for.
 func (r *Relay) SetMuted(channelID, userID int64, muted bool) {
 	if p := r.peer(channelID, userID); p != nil {
 		p.muted.Store(muted)
 	}
 }
 
-// SetDeafened stops or resumes forwarding everything towards a participant.
+// SetDeafened stops or resumes forwarding sound towards a participant. Video
+// is unaffected: somebody who has stopped listening has not stopped looking.
 func (r *Relay) SetDeafened(channelID, userID int64, deafened bool) {
 	if p := r.peer(channelID, userID); p != nil {
 		p.deafened.Store(deafened)
 	}
+}
+
+// OpenScreen makes room in a participant's session for the screen they are
+// about to share, and renegotiates if there was not room already.
+//
+// The relay offers to receive; the client answers by sending. That is the same
+// direction of travel as everything else here — the relay is the only side
+// that ever offers — and it is what lets a screen share start in the middle of
+// a call without the two ends ever both offering at once.
+//
+// Calling it again for a share that is already open is how the sound of a
+// screen is added to one that started without it, and is otherwise a no-op.
+func (r *Relay) OpenScreen(channelID, userID int64, audio bool) error {
+	p := r.peer(channelID, userID)
+	if p == nil {
+		return ErrNoSession
+	}
+	p.streaming.Store(true)
+	return p.room.openScreen(p, audio)
+}
+
+// CloseScreen ends a participant's screen share: everybody watching stops
+// receiving it, and the relay stops forwarding it whatever the client does.
+//
+// The sections themselves are kept. They cost two lines of SDP each and their
+// being there is what makes starting a share again immediate rather than
+// another round of negotiation.
+func (r *Relay) CloseScreen(channelID, userID int64) {
+	p := r.peer(channelID, userID)
+	if p == nil {
+		return
+	}
+	p.streaming.Store(false)
+	p.room.closeScreen(p)
+}
+
+// Watch starts or stops sending one participant's screen to one other.
+//
+// A screen is the one thing here that is not sent to everybody: it is large
+// enough that carrying it to somebody who is not looking would be the single
+// most expensive thing this server does, so it is carried only where it was
+// asked for.
+func (r *Relay) Watch(channelID, viewerID, publisherID int64) error {
+	return r.setWatching(channelID, viewerID, publisherID, true)
+}
+
+// Unwatch is Watch's other half. It is safe to call for a stream that was
+// never being watched.
+func (r *Relay) Unwatch(channelID, viewerID, publisherID int64) {
+	_ = r.setWatching(channelID, viewerID, publisherID, false)
+}
+
+func (r *Relay) setWatching(channelID, viewerID, publisherID int64, watching bool) error {
+	r.mu.Lock()
+	rm := r.rooms[channelID]
+	r.mu.Unlock()
+	if rm == nil {
+		return ErrNoSession
+	}
+	return rm.setWatching(viewerID, publisherID, watching)
 }
 
 // Connected reports whether a participant holds a live session here.
@@ -488,10 +717,16 @@ func (r *Relay) dropIfEmpty(rm *room) {
 
 // room is one voice channel's worth of peers.
 //
-// Its mutex is the outermost of the three in this package. The lock order is
-// room, then peer, then publication, and nothing ever takes them the other way
-// round: the RTP forwarding loop, which is the only hot path, takes the
-// publication's read lock and no other.
+// Its mutex is the outermost in this package. The lock order is room, then a
+// peer's sections, then the peer itself, then a publication, and nothing ever
+// takes them the other way round: the RTP forwarding loop, which is the only
+// hot path, takes the publication's read lock and no other.
+//
+// The sections mutex exists because renegotiating has to read what a peer is
+// sending, and renegotiating is very often the last thing done while the room
+// is being rearranged. Guarding those maps with the room's own mutex would
+// have that read wait for a lock its caller is already holding, which is a
+// deadlock rather than a delay.
 type room struct {
 	channelID int64
 	relay     *Relay
@@ -510,59 +745,190 @@ func (rm *room) peer(userID int64) *peer {
 	return rm.peers[userID]
 }
 
-// admit registers a joining peer and subscribes it to everything already being
-// published. It is called before the answer is created, so the subscriptions
-// travel in that answer and need no renegotiation.
+// admit registers a joining peer and subscribes it to every microphone already
+// being published. It is called before the answer is created, so those
+// subscriptions travel in that answer and need no renegotiation.
+//
+// Screens are not among them. An arrival is subscribed to nobody's screen and
+// nobody is subscribed to theirs until somebody asks to watch, which is the
+// whole of what makes a room with four screens in it affordable.
 func (rm *room) admit(p *peer) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
 	for _, other := range rm.peers {
-		if other.publication.live() {
-			rm.link(other.publication, p, false)
+		if pub := other.publications[protocol.TrackMic]; pub.live() {
+			rm.link(pub, p, false)
 		}
 	}
 	rm.peers[p.userID] = p
 }
 
-// publish takes a participant's arriving track, hands it to everyone else, and
-// starts forwarding it. The forwarding loop owns the track until it errors,
-// which is how a closed peer connection ends it.
-func (rm *room) publish(p *peer, remote *webrtc.TrackRemote) {
+// publish takes a participant's arriving track, works out what it is, hands it
+// to everyone entitled to it and starts forwarding. The forwarding loop owns
+// the track until it errors, which is how a closed peer connection ends it.
+func (rm *room) publish(p *peer, remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+	purpose := p.purposeOf(remote, receiver)
+
 	rm.mu.Lock()
 	if rm.peers[p.userID] != p {
 		// The peer was evicted between its track arriving and this running.
 		rm.mu.Unlock()
 		return
 	}
-	pub := p.publication
-	pub.arm(remote.Codec().RTPCodecCapability)
+	pub := p.publications[purpose]
+	if pub == nil {
+		rm.mu.Unlock()
+		return
+	}
+	generation := pub.arm(remote)
+
+	// A microphone reaches the room the moment it arrives. A screen reaches
+	// only whoever had already asked to watch it, which is nobody the first
+	// time and can be several people on a share that stopped and started.
 	for _, other := range rm.peers {
-		if other != p {
+		if other == p {
+			continue
+		}
+		if purpose == protocol.TrackMic || other.isWatching(p.userID) {
 			rm.link(pub, other, true)
 		}
 	}
 	rm.mu.Unlock()
 
-	go pub.forward(remote, rm.relay.log)
+	go pub.forward(remote, generation, rm.relay.log)
 }
 
-// link gives one subscriber a track carrying one publisher's audio. rm.mu is
+// openScreen gives a peer the media sections its screen share needs.
+//
+// It reports nothing about whether a renegotiation happened because there is
+// nothing useful the caller could do with it: the offer, if there is one,
+// travels on the peer's own signalling channel like every other.
+func (rm *room) openScreen(p *peer, audio bool) error {
+	wanted := []string{protocol.TrackScreen}
+	if audio {
+		wanted = append(wanted, protocol.TrackScreenAudio)
+	}
+
+	rm.mu.Lock()
+	if rm.peers[p.userID] != p {
+		rm.mu.Unlock()
+		return ErrNoSession
+	}
+	added := false
+	// A share that stopped and started again arrives on the section it already
+	// had: the client merely put a track back on a sender it never gave up, so
+	// no track "arrives" a second time and nothing here would otherwise notice
+	// that the picture is flowing again. Re-arming is what notices.
+	for _, purpose := range screenPurposes {
+		pub := p.publications[purpose]
+		if pub == nil || !pub.rearm() {
+			continue
+		}
+		for _, other := range rm.peers {
+			if other != p && other.isWatching(p.userID) {
+				rm.link(pub, other, true)
+			}
+		}
+	}
+	for _, purpose := range wanted {
+		if p.slot(purpose) != nil {
+			continue
+		}
+		kind := webrtc.RTPCodecTypeVideo
+		if purpose == protocol.TrackScreenAudio {
+			kind = webrtc.RTPCodecTypeAudio
+		}
+		transceiver, err := p.pc.AddTransceiverFromKind(kind, webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionRecvonly,
+		})
+		if err != nil {
+			rm.mu.Unlock()
+			return fmt.Errorf("voice: open a %s section: %w", purpose, err)
+		}
+		p.setSlot(purpose, transceiver)
+		added = true
+	}
+	rm.mu.Unlock()
+
+	if added {
+		p.renegotiate()
+	}
+	return nil
+}
+
+// closeScreen stops a screen share reaching anybody.
+func (rm *room) closeScreen(p *peer) {
+	rm.mu.Lock()
+	for _, purpose := range screenPurposes {
+		pub := p.publications[purpose]
+		if pub == nil {
+			continue
+		}
+		pub.disarm()
+		for subscriberID := range pub.detachAll() {
+			rm.unlink(rm.peers[subscriberID], p.userID, purpose, true)
+		}
+	}
+	// Nobody is watching a stream that has ended. Leaving the intent behind
+	// would have a share that started again reach people who stopped looking
+	// several minutes ago.
+	for _, other := range rm.peers {
+		other.setWatching(p.userID, false)
+	}
+	rm.mu.Unlock()
+}
+
+// setWatching adds or removes one viewer's subscription to one screen.
+func (rm *room) setWatching(viewerID, publisherID int64, watching bool) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	viewer := rm.peers[viewerID]
+	publisher := rm.peers[publisherID]
+	if viewer == nil || publisher == nil {
+		return ErrNoSession
+	}
+
+	if !watching {
+		viewer.setWatching(publisherID, false)
+		for _, purpose := range screenPurposes {
+			if pub := publisher.publications[purpose]; pub != nil {
+				pub.detach(viewerID)
+			}
+			rm.unlink(viewer, publisherID, purpose, true)
+		}
+		return nil
+	}
+
+	viewer.setWatching(publisherID, true)
+	for _, purpose := range screenPurposes {
+		pub := publisher.publications[purpose]
+		if pub != nil && pub.live() {
+			rm.link(pub, viewer, true)
+		}
+	}
+	return nil
+}
+
+// link gives one subscriber a track carrying one publisher's media. rm.mu is
 // held by every caller.
 func (rm *room) link(pub *publication, sub *peer, renegotiate bool) {
-	if sub.subs[pub.owner.userID] != nil {
+	key := subKey{publisher: pub.owner.userID, purpose: pub.purpose}
+	if sub.subscription(key) != nil {
 		return
 	}
 	track, err := webrtc.NewTrackLocalStaticRTP(
 		pub.capability(),
-		TrackID(pub.owner.userID),
-		StreamID(pub.owner.userID),
+		TrackID(pub.owner.userID, pub.purpose),
+		StreamID(pub.owner.userID, pub.purpose),
 	)
 	if err != nil {
 		rm.relay.log.Error("build relay track",
 			slog.Int64("channel", rm.channelID),
 			slog.Int64("from", pub.owner.userID),
 			slog.Int64("to", sub.userID),
+			slog.String("carries", pub.purpose),
 			slog.Any("error", err))
 		return
 	}
@@ -572,20 +938,47 @@ func (rm *room) link(pub *publication, sub *peer, renegotiate bool) {
 			slog.Int64("channel", rm.channelID),
 			slog.Int64("from", pub.owner.userID),
 			slog.Int64("to", sub.userID),
+			slog.String("carries", pub.purpose),
 			slog.Any("error", err))
 		return
 	}
 
-	sub.subs[pub.owner.userID] = &subscription{sender: sender}
+	sub.addSubscription(key, &subscription{sender: sender, purpose: pub.purpose, publisher: pub.owner.userID})
 	pub.attach(sub, track)
-	go drainRTCP(sender)
+	go readRTCP(sender, pub.requestKeyframe)
 
+	if pub.video {
+		// A subscriber that arrives mid-stream has nothing it can decode until
+		// the next keyframe, which on a still picture may be a very long time
+		// away. Asking for one now is the difference between a stream that
+		// appears at once and one that appears eventually.
+		pub.requestKeyframe()
+	}
 	if renegotiate {
 		sub.renegotiate()
 	}
 }
 
-// remove takes a participant out of the room and out of everybody's ears.
+// unlink undoes one subscription. rm.mu is held by every caller, and sub may
+// be nil for a peer that has already gone.
+func (rm *room) unlink(sub *peer, publisherID int64, purpose string, renegotiate bool) {
+	if sub == nil {
+		return
+	}
+	entry := sub.removeSubscription(subKey{publisher: publisherID, purpose: purpose})
+	if entry == nil {
+		return
+	}
+	if err := sub.pc.RemoveTrack(entry.sender); err != nil {
+		rm.relay.log.Debug("remove relay track", slog.Any("error", err))
+	}
+	if renegotiate {
+		sub.renegotiate()
+	}
+}
+
+// remove takes a participant out of the room, out of everybody's ears and off
+// everybody's screen.
 func (rm *room) remove(userID int64) {
 	rm.mu.Lock()
 	p := rm.peers[userID]
@@ -596,25 +989,27 @@ func (rm *room) remove(userID int64) {
 	delete(rm.peers, userID)
 
 	// Stop everybody receiving them.
-	for subID := range p.publication.detachAll() {
-		other := rm.peers[subID]
-		if other == nil {
+	for _, purpose := range publishedPurposes {
+		pub := p.publications[purpose]
+		if pub == nil {
 			continue
 		}
-		if s := other.subs[userID]; s != nil {
-			delete(other.subs, userID)
-			if err := other.pc.RemoveTrack(s.sender); err != nil {
-				rm.relay.log.Debug("remove relay track", slog.Any("error", err))
-			}
-			other.renegotiate()
+		for subscriberID := range pub.detachAll() {
+			rm.unlink(rm.peers[subscriberID], userID, purpose, true)
 		}
 	}
 
 	// Stop them receiving everybody.
-	for pubID := range p.subs {
-		if other := rm.peers[pubID]; other != nil {
-			other.publication.detach(userID)
+	for _, key := range p.subscriptions() {
+		if other := rm.peers[key.publisher]; other != nil {
+			if pub := other.publications[key.purpose]; pub != nil {
+				pub.detach(userID)
+			}
 		}
+	}
+	// And stop anybody remembering that they were watching this person.
+	for _, other := range rm.peers {
+		other.setWatching(userID, false)
 	}
 	rm.mu.Unlock()
 
@@ -652,17 +1047,29 @@ func (rm *room) closeAll() {
 	rm.mu.Unlock()
 
 	for _, p := range peers {
-		p.publication.detachAll()
+		for _, pub := range p.publications {
+			pub.detachAll()
+		}
 		p.close()
 	}
 }
 
 // --- peers ------------------------------------------------------------------
 
-// subscription is one publisher's audio as it is sent to one subscriber. The
+// subKey names one subscription: whose media, and which of their media. Both
+// halves are needed because one publisher can be the source of three different
+// things and a viewer may hold any subset of them.
+type subKey struct {
+	publisher int64
+	purpose   string
+}
+
+// subscription is one publisher's media as it is sent to one subscriber. The
 // track itself is held by the publication, which is what writes to it.
 type subscription struct {
-	sender *webrtc.RTPSender
+	sender    *webrtc.RTPSender
+	purpose   string
+	publisher int64
 }
 
 // peer is one participant's connection to the relay.
@@ -672,26 +1079,163 @@ type peer struct {
 	pc     *webrtc.PeerConnection
 	out    func(Signal)
 
-	// muted stops what this peer sends; deafened stops what it receives. Both
-	// are read on the forwarding path, once per packet per subscriber, which is
-	// why they are atomics rather than anything the mutex guards.
-	muted    atomic.Bool
-	deafened atomic.Bool
+	// muted stops what this peer's microphone sends; deafened stops the sound
+	// it receives; streaming is whether its screen share is meant to be
+	// running at all. All three are read on the forwarding path, once per
+	// packet per subscriber, which is why they are atomics rather than
+	// anything the mutex guards.
+	muted     atomic.Bool
+	deafened  atomic.Bool
+	streaming atomic.Bool
 
-	// publication is this peer's own audio. It exists from the moment the peer
-	// does, and starts carrying packets when the track arrives.
-	publication *publication
+	// publications is everything this peer sends, by purpose. All three exist
+	// from the moment the peer does and start carrying packets when a track
+	// arrives for them.
+	publications map[string]*publication
 
-	// subs is what this peer receives, keyed by publisher. It is guarded by the
-	// room mutex, not by mu: every change to it is a structural change to the
-	// room.
-	subs map[int64]*subscription
+	// sectionsMu guards the three maps below. They are only ever changed while
+	// the room mutex is held — every change to them is a structural change to
+	// the room — but they are read while renegotiating, which happens with the
+	// room mutex already held, so the room's own mutex cannot be what protects
+	// them.
+	sectionsMu sync.Mutex
+	// slots are the media sections opened for this peer to publish a screen
+	// on, by purpose. They are how an arriving track is known to be a screen
+	// rather than a microphone, which the kind alone cannot say: a screen's
+	// sound and a voice are both audio.
+	slots map[string]*webrtc.RTPTransceiver
+	// subs is what this peer receives, by publisher and purpose.
+	subs map[subKey]*subscription
+	// watching is whose screens this peer has asked for. It outlives the
+	// tracks: somebody who asked to watch a stream that had not started yet is
+	// sent it the moment it does.
+	watching map[int64]bool
 
 	mu          sync.Mutex
 	closed      bool
 	negotiating bool
 	pending     bool
 	timer       *time.Timer
+}
+
+func newPeer(userID int64, rm *room, pc *webrtc.PeerConnection, out func(Signal)) *peer {
+	p := &peer{
+		userID:       userID,
+		room:         rm,
+		pc:           pc,
+		out:          out,
+		publications: make(map[string]*publication, len(publishedPurposes)),
+		slots:        map[string]*webrtc.RTPTransceiver{},
+		subs:         map[subKey]*subscription{},
+		watching:     map[int64]bool{},
+	}
+	for _, purpose := range publishedPurposes {
+		p.publications[purpose] = &publication{
+			owner:   p,
+			purpose: purpose,
+			video:   purpose == protocol.TrackScreen,
+			sinks:   map[int64]*sink{},
+		}
+	}
+	return p
+}
+
+// The sections a peer holds, each behind the one mutex that guards them.
+
+func (p *peer) subscription(key subKey) *subscription {
+	p.sectionsMu.Lock()
+	defer p.sectionsMu.Unlock()
+	return p.subs[key]
+}
+
+func (p *peer) addSubscription(key subKey, entry *subscription) {
+	p.sectionsMu.Lock()
+	p.subs[key] = entry
+	p.sectionsMu.Unlock()
+}
+
+func (p *peer) removeSubscription(key subKey) *subscription {
+	p.sectionsMu.Lock()
+	defer p.sectionsMu.Unlock()
+	entry := p.subs[key]
+	delete(p.subs, key)
+	return entry
+}
+
+func (p *peer) subscriptions() []subKey {
+	p.sectionsMu.Lock()
+	defer p.sectionsMu.Unlock()
+	keys := make([]subKey, 0, len(p.subs))
+	for key := range p.subs {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func (p *peer) slot(purpose string) *webrtc.RTPTransceiver {
+	p.sectionsMu.Lock()
+	defer p.sectionsMu.Unlock()
+	return p.slots[purpose]
+}
+
+func (p *peer) setSlot(purpose string, transceiver *webrtc.RTPTransceiver) {
+	p.sectionsMu.Lock()
+	p.slots[purpose] = transceiver
+	p.sectionsMu.Unlock()
+}
+
+func (p *peer) isWatching(publisherID int64) bool {
+	p.sectionsMu.Lock()
+	defer p.sectionsMu.Unlock()
+	return p.watching[publisherID]
+}
+
+func (p *peer) setWatching(publisherID int64, watching bool) {
+	p.sectionsMu.Lock()
+	if watching {
+		p.watching[publisherID] = true
+	} else {
+		delete(p.watching, publisherID)
+	}
+	p.sectionsMu.Unlock()
+}
+
+// purposeOf works out what an arriving track carries.
+//
+// A section the relay opened for a screen is known by the transceiver it was
+// opened on, which is the only reliable way to tell a screen's sound from a
+// voice: both are Opus, both arrive on a sendonly section of the client's, and
+// nothing in the RTP says which is which. Anything arriving on a section the
+// relay did not open is the microphone, because the only other thing in the
+// client's original offer was the microphone.
+func (p *peer) purposeOf(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) string {
+	p.sectionsMu.Lock()
+	slots := make(map[string]*webrtc.RTPTransceiver, len(p.slots))
+	for purpose, transceiver := range p.slots {
+		slots[purpose] = transceiver
+	}
+	p.sectionsMu.Unlock()
+
+	if len(slots) > 0 && receiver != nil {
+		for _, transceiver := range p.pc.GetTransceivers() {
+			if transceiver.Receiver() != receiver {
+				continue
+			}
+			for purpose, slot := range slots {
+				if slot == transceiver {
+					return purpose
+				}
+			}
+			break
+		}
+	}
+	if remote.Kind() == webrtc.RTPCodecTypeVideo {
+		// A picture arriving on a section the relay did not open is still a
+		// picture, and calling it a microphone would be worse than carrying it
+		// where a screen goes.
+		return protocol.TrackScreen
+	}
+	return protocol.TrackMic
 }
 
 func (p *peer) emit(sig Signal) {
@@ -703,11 +1247,52 @@ func (p *peer) emit(sig Signal) {
 	}
 }
 
-// renegotiate offers the peer its current set of tracks.
+// describeSections says what each media section of this peer's session is for,
+// by media id. It is read after a local description is set, which is the first
+// moment the media ids exist.
+func (p *peer) describeSections() (map[string]int64, map[string]string) {
+	p.sectionsMu.Lock()
+	senders := make(map[*webrtc.RTPSender]subKey, len(p.subs))
+	for key, entry := range p.subs {
+		senders[entry.sender] = key
+	}
+	slots := make(map[*webrtc.RTPTransceiver]string, len(p.slots))
+	for purpose, transceiver := range p.slots {
+		slots[transceiver] = purpose
+	}
+	p.sectionsMu.Unlock()
+
+	tracks := map[string]int64{}
+	purposes := map[string]string{}
+	for _, transceiver := range p.pc.GetTransceivers() {
+		mid := transceiver.Mid()
+		if mid == "" {
+			continue
+		}
+		if purpose, ok := slots[transceiver]; ok {
+			// A section naming the receiving client itself is the slot it
+			// publishes its own screen on.
+			tracks[mid] = p.userID
+			purposes[mid] = purpose
+			continue
+		}
+		if key, ok := senders[transceiver.Sender()]; ok {
+			tracks[mid] = key.publisher
+			purposes[mid] = key.purpose
+		}
+	}
+	if len(tracks) == 0 {
+		return nil, nil
+	}
+	return tracks, purposes
+}
+
+// renegotiate offers the peer its current set of sections.
 //
 // The relay is the only side that ever offers after the first exchange: a
-// client adds its microphone before its opening offer and never changes it, so
-// there is exactly one offerer at any moment and no glare to resolve. A second
+// client adds its microphone before its opening offer and never adds anything
+// again — even a screen share goes onto a section the relay offered — so there
+// is exactly one offerer at any moment and no glare to resolve. A second
 // renegotiation arriving while one is outstanding is remembered rather than
 // sent, and runs when the answer lands.
 func (p *peer) renegotiate() {
@@ -743,7 +1328,8 @@ func (p *peer) renegotiate() {
 		go p.room.evict(p, "offer went missing")
 		return
 	}
-	p.emit(Signal{Kind: protocol.SignalOffer, SDP: local.SDP})
+	tracks, purposes := p.describeSections()
+	p.emit(Signal{Kind: protocol.SignalOffer, SDP: local.SDP, Tracks: tracks, Purposes: purposes})
 }
 
 // armTimeoutLocked starts the clock on an outstanding offer. p.mu is held.
@@ -833,20 +1419,33 @@ func (p *peer) close() {
 
 // --- forwarding -------------------------------------------------------------
 
-// sink is one subscriber's copy of one publisher's audio.
+// sink is one subscriber's copy of one publisher's media.
 type sink struct {
 	track *webrtc.TrackLocalStaticRTP
 	peer  *peer
 }
 
-// publication is one participant's outgoing audio and everybody listening to it.
+// publication is one thing one participant sends, and everybody receiving it.
 type publication struct {
-	owner *peer
+	owner   *peer
+	purpose string
+	// video says whether this carries a picture, which decides whether
+	// keyframes are something that can be asked for and whether a deafened
+	// subscriber still gets it.
+	video bool
 
 	mu    sync.RWMutex
 	armed bool
 	codec webrtc.RTPCodecCapability
-	sinks map[int64]*sink
+	// remote is the arriving track, kept so a keyframe can be asked of the
+	// SSRC actually carrying the picture.
+	remote *webrtc.TrackRemote
+	// generation distinguishes one arriving track from the next on the same
+	// section, so a forwarding loop left over from a share that stopped and
+	// started again exits rather than writing alongside its replacement.
+	generation  uint64
+	sinks       map[int64]*sink
+	lastRequest time.Time
 }
 
 // live reports whether a track has arrived for this publication yet. A peer
@@ -858,10 +1457,42 @@ func (pub *publication) live() bool {
 	return pub.armed
 }
 
-func (pub *publication) arm(codec webrtc.RTPCodecCapability) {
+// arm records the arriving track and returns the generation the forwarding
+// loop for it should run under.
+func (pub *publication) arm(remote *webrtc.TrackRemote) uint64 {
 	pub.mu.Lock()
-	pub.armed, pub.codec = true, codec
+	defer pub.mu.Unlock()
+	pub.armed = true
+	pub.codec = remote.Codec().RTPCodecCapability
+	pub.remote = remote
+	pub.generation++
+	return pub.generation
+}
+
+// disarm marks the publication as carrying nothing, which is what a screen
+// share that has stopped is. The section stays; only the claim that something
+// is arriving on it goes away.
+func (pub *publication) disarm() {
+	pub.mu.Lock()
+	pub.armed = false
 	pub.mu.Unlock()
+}
+
+// rearm puts a stopped publication back into service on the track it already
+// had, and reports whether there was one to put back.
+//
+// It exists because stopping a screen share is not the end of a track: the
+// client takes its picture off a sender and later puts one back, on the same
+// section with the same SSRC, so nothing arrives that could announce itself.
+// The announcement is this instead.
+func (pub *publication) rearm() bool {
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if pub.armed || pub.remote == nil {
+		return false
+	}
+	pub.armed = true
+	return true
 }
 
 func (pub *publication) capability() webrtc.RTPCodecCapability {
@@ -892,17 +1523,67 @@ func (pub *publication) detachAll() map[int64]*sink {
 	return sinks
 }
 
-// forward copies RTP from one publisher to everyone listening, until the track
-// ends. It is the only hot path in the server, so it allocates nothing per
-// packet and takes exactly one read lock.
+// requestKeyframe asks the publisher for a frame that can be decoded on its
+// own, which is the only thing that lets a new viewer see anything.
+//
+// The relay cannot make one: it does not decode, so it has nothing to encode
+// from. All it can do is pass the request back to the machine that does have
+// the picture, which is what a picture loss indication is. Requests are
+// collapsed to at most one every keyframeInterval, because several viewers
+// arriving at once is exactly when a burst of keyframes would hurt most.
+func (pub *publication) requestKeyframe() {
+	if !pub.video {
+		return
+	}
+	pub.mu.Lock()
+	remote := pub.remote
+	now := time.Now()
+	if !pub.armed || remote == nil || now.Sub(pub.lastRequest) < keyframeInterval {
+		pub.mu.Unlock()
+		return
+	}
+	pub.lastRequest = now
+	ssrc := remote.SSRC()
+	pub.mu.Unlock()
+
+	if err := pub.owner.pc.WriteRTCP([]rtcp.Packet{
+		&rtcp.PictureLossIndication{MediaSSRC: uint32(ssrc)},
+	}); err != nil {
+		// A request that could not be sent costs one viewer a moment longer
+		// before the picture appears. The next one, from the next arrival or
+		// the next report, is a fraction of a second away.
+		pub.owner.room.relay.log.Debug("ask for a keyframe",
+			slog.Int64("from", pub.owner.userID), slog.Any("error", err))
+	}
+}
+
+// blocked reports whether this publication is currently allowed to reach
+// anybody at all.
+//
+// The two reasons are different and deliberately not folded together. A
+// microphone is stopped by its owner being muted, which is a decision about a
+// voice. A screen and its sound are stopped by the share not running, which is
+// a decision about a screen — so muting yourself while sharing a video leaves
+// the video playing, and stopping the share does not silence you.
+func (pub *publication) blocked() bool {
+	if pub.purpose == protocol.TrackMic {
+		return pub.owner.muted.Load()
+	}
+	return !pub.owner.streaming.Load()
+}
+
+// forward copies RTP from one publisher to everyone receiving it, until the
+// track ends. It is the only hot path in the server, so it allocates nothing
+// per packet and takes exactly one read lock.
 //
 // Reading into a buffer of its own is what makes the first half of that true.
 // TrackRemote.ReadRTP, the obvious call, allocates a receive buffer and a
 // packet on every call — at fifty packets a second per publisher, a room of
 // ten people is a thousand allocations a second and most of a megabyte, all of
 // it garbage, all of it in the one loop that must not be interrupted by a
-// collection. Reading and unmarshalling into the same two values instead costs
-// nothing per packet.
+// collection, and a shared screen is an order of magnitude more packets again.
+// Reading and unmarshalling into the same two values instead costs nothing per
+// packet.
 //
 // It is only safe because every write below is synchronous: Unmarshal points
 // packet.Payload straight into buf, and pion's SRTP session marshals header
@@ -911,10 +1592,10 @@ func (pub *publication) detachAll() map[int64]*sink {
 // them. rtp.Header.Unmarshal reuses its CSRC and extension slices for the same
 // reason, so the packet is meant to be filled in over and over.
 //
-// A muted publisher and a deafened subscriber are both handled by not writing
-// the packet. The gap that leaves in the sequence numbers is what the far end's
-// concealment is for, and it is the same gap a lost packet leaves.
-func (pub *publication) forward(remote *webrtc.TrackRemote, log *slog.Logger) {
+// A blocked publication and a deafened subscriber are both handled by not
+// writing the packet. The gap that leaves in the sequence numbers is what the
+// far end's concealment is for, and it is the same gap a lost packet leaves.
+func (pub *publication) forward(remote *webrtc.TrackRemote, generation uint64, log *slog.Logger) {
 	owner := pub.owner
 	buf := make([]byte, receiveMTU)
 	var packet rtp.Packet
@@ -925,29 +1606,42 @@ func (pub *publication) forward(remote *webrtc.TrackRemote, log *slog.Logger) {
 			// The peer connection closed, which is the ordinary way out.
 			return
 		}
-		if owner.muted.Load() {
+		pub.mu.RLock()
+		stale := pub.generation != generation
+		pub.mu.RUnlock()
+		if stale {
+			// A newer track arrived on this section and has a loop of its own.
+			return
+		}
+		if pub.blocked() {
 			continue
 		}
 		if err := packet.Unmarshal(buf[:n]); err != nil {
 			// A packet that will not parse is one packet, not a reason to stop
-			// carrying the rest of somebody's audio.
+			// carrying the rest of somebody's media.
 			log.Debug("read voice packet",
-				slog.Int64("from", owner.userID), slog.Any("error", err))
+				slog.Int64("from", owner.userID),
+				slog.String("carries", pub.purpose),
+				slog.Any("error", err))
 			continue
 		}
 
 		pub.mu.RLock()
 		for _, s := range pub.sinks {
-			if s.peer.deafened.Load() {
+			// Deafening stops sound and nothing else. A shared screen keeps
+			// arriving, because somebody who has stopped listening to a
+			// meeting is very often still reading the slides.
+			if !pub.video && s.peer.deafened.Load() {
 				continue
 			}
 			if err := s.track.WriteRTP(&packet); err != nil {
 				// One subscriber's transport going away must not stop the
-				// others hearing anything; the peer's own state change is what
-				// removes it.
+				// others receiving anything; the peer's own state change is
+				// what removes it.
 				log.Debug("forward voice packet",
 					slog.Int64("from", owner.userID),
 					slog.Int64("to", s.peer.userID),
+					slog.String("carries", pub.purpose),
 					slog.Any("error", err))
 			}
 		}
@@ -955,14 +1649,32 @@ func (pub *publication) forward(remote *webrtc.TrackRemote, log *slog.Logger) {
 	}
 }
 
-// drainRTCP reads and discards the receiver reports a subscriber sends back.
-// They are not acted on, but leaving them unread stalls the interceptor chain
-// that produced them.
-func drainRTCP(sender *webrtc.RTPSender) {
-	buf := make([]byte, rtcpDrainBuffer)
+// readRTCP reads what a subscriber sends back about a track it is receiving.
+//
+// Most of it is receiver reports, which are not acted on but must be read:
+// leaving them unread stalls the interceptor chain that produced them. The two
+// that are acted on both mean the same thing — the far end has nothing it can
+// decode — and are passed back to whoever can do something about it, which is
+// never this server.
+func readRTCP(sender *webrtc.RTPSender, onKeyframeWanted func()) {
+	buf := make([]byte, rtcpBuffer)
 	for {
-		if _, _, err := sender.Read(buf); err != nil {
+		n, _, err := sender.Read(buf)
+		if err != nil {
 			return
+		}
+		if onKeyframeWanted == nil {
+			continue
+		}
+		packets, err := rtcp.Unmarshal(buf[:n])
+		if err != nil {
+			continue
+		}
+		for _, packet := range packets {
+			switch packet.(type) {
+			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+				onKeyframeWanted()
+			}
 		}
 	}
 }

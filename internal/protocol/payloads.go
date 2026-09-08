@@ -173,6 +173,36 @@ type Voice struct {
 	// MaxParticipants caps live audio sessions in one channel. Zero leaves it
 	// to the channel's own user limit.
 	MaxParticipants int `json:"maxParticipants"`
+	// Screen is the video plane: whether a voice channel here may carry a
+	// shared screen, and how large a one.
+	Screen Screen `json:"screen"`
+}
+
+// Screen is what a client is told about screen sharing before it starts one,
+// so the picker can offer the qualities this server will actually carry rather
+// than let somebody choose one and be refused.
+//
+// The three ceilings are the operator's, and Enforced says whether they are in
+// force. They are not in client_host mode: nothing crosses the server there,
+// so the bandwidth being spent is the two participants' own and the ceilings
+// would be a limit on somebody else's line. Enforced is sent rather than
+// derived from Mode so that both ends apply one rule and cannot drift apart on
+// what it was.
+type Screen struct {
+	Enabled bool `json:"enabled"`
+	// Audio reports whether a shared screen may carry the machine's sound.
+	Audio bool `json:"audio"`
+	// Enforced reports whether the ceilings below bound what a client may
+	// send. When it is false they are the operator's configuration, shown to
+	// an administrator and applied to nobody.
+	Enforced     bool `json:"enforced"`
+	MaxHeight    int  `json:"maxHeight"`
+	MaxFramerate int  `json:"maxFramerate"`
+	MaxBitrate   int  `json:"maxBitrate"`
+	// MaxStreams caps concurrent screen shares in one channel, MaxViewers caps
+	// who may watch one. Zero means uncapped.
+	MaxStreams int `json:"maxStreams"`
+	MaxViewers int `json:"maxViewers"`
 }
 
 // ICEServer is one STUN or TURN server, in the shape RTCConfiguration expects.
@@ -205,6 +235,42 @@ const (
 // than another client. It cannot collide with a user: identities start at 1.
 const ServerPeer int64 = 0
 
+// What a media section in a client's offer is for.
+//
+// A media session carries up to three things from one participant, and two of
+// them are audio, so the kind of the track is not enough to tell them apart. A
+// client therefore names each of its own sections by media id when it opens
+// the session, and the relay reads that rather than guessing from the order
+// they appear in.
+const (
+	// TrackMic is the microphone, which every session has.
+	TrackMic = "mic"
+	// TrackScreen is the shared picture.
+	TrackScreen = "screen"
+	// TrackScreenAudio is the sound of the machine whose screen is shared,
+	// which is separate from the microphone and separately muted.
+	TrackScreenAudio = "screen_audio"
+)
+
+// ValidTrackPurpose reports whether a purpose is one this server knows. An
+// unknown one is refused rather than ignored: a section nobody agrees the
+// meaning of is media that would arrive somewhere unexpected.
+func ValidTrackPurpose(purpose string) bool {
+	switch purpose {
+	case TrackMic, TrackScreen, TrackScreenAudio:
+		return true
+	default:
+		return false
+	}
+}
+
+// Where a shared picture comes from, which is the sender's own account of it
+// and is shown next to the stream rather than acted on.
+const (
+	ScreenSourceDisplay = "screen"
+	ScreenSourceWindow  = "window"
+)
+
 // VoiceState is what everybody in a channel is told about one participant.
 //
 // Sitting in a voice channel and holding a live audio session are two different
@@ -226,6 +292,12 @@ type VoiceState struct {
 	// Host reports that this participant relays the channel, which only ever
 	// happens in client_host mode.
 	Host bool `json:"host"`
+	// Streaming reports that this participant is sharing a screen right now.
+	// It is on the state rather than only on voice.stream because it is what
+	// every member list draws a "live" badge from, and a badge that depended
+	// on having heard an event would be missing for everybody who arrived
+	// after the stream started.
+	Streaming bool `json:"streaming"`
 }
 
 // Muted reports whether any reason to stop this participant transmitting
@@ -836,6 +908,23 @@ type VoiceSettings struct {
 	DTX             bool   `json:"dtx"`
 	Stereo          bool   `json:"stereo"`
 	MaxParticipants int    `json:"maxParticipants"`
+	// Screen is the video plane, replaced whole for the same reason the rest
+	// of this structure is: its fields constrain one another.
+	Screen ScreenSettings `json:"screen"`
+}
+
+// ScreenSettings is the video plane an administrator may change at runtime. It
+// is the configuration rather than what is in force: the ceilings are shown
+// here whatever the hosting mode, and whether they bind anybody is
+// Voice.Screen.Enforced.
+type ScreenSettings struct {
+	Enabled      bool `json:"enabled"`
+	Audio        bool `json:"audio"`
+	MaxHeight    int  `json:"maxHeight"`
+	MaxFramerate int  `json:"maxFramerate"`
+	MaxBitrate   int  `json:"maxBitrate"`
+	MaxStreams   int  `json:"maxStreams"`
+	MaxViewers   int  `json:"maxViewers"`
 }
 
 type UserUpdateRequest struct {
@@ -1369,6 +1458,18 @@ type ServerUpdatedEvent struct {
 type VoiceConnectRequest struct {
 	ChannelID int64  `json:"channelId"`
 	SDP       string `json:"sdp,omitempty"`
+	// Purposes names each media section of the caller's own offer by media id:
+	// which one is the microphone, which is a shared screen, which is that
+	// screen's sound. It travels in server_host mode, where the relay is the
+	// far end and has to know what it is being handed.
+	//
+	// A client sends every section it will ever send, whether or not it is
+	// carrying anything yet. That is what lets somebody start sharing a screen
+	// mid-call without renegotiating: the section was agreed when the session
+	// opened, and starting to share is a track being put on a sender that was
+	// already there. It is also why exactly one side offers on any link, which
+	// is the property the whole of this design rests on.
+	Purposes map[string]string `json:"purposes,omitempty"`
 }
 
 // VoiceConnectResult is everything a client needs to bring media up.
@@ -1390,6 +1491,10 @@ type VoiceConnectResult struct {
 	// which saves a joining client from having to infer it from events that
 	// were sent before it was listening.
 	Participants []VoiceState `json:"participants"`
+	// Streams is every screen share running in the channel right now, for the
+	// same reason: a stream that started before this client arrived would
+	// otherwise be invisible until the next time it changed.
+	Streams []VoiceStreamEvent `json:"streams,omitempty"`
 }
 
 // VoiceSignalRequest carries one SDP or ICE frame towards a peer.
@@ -1409,6 +1514,11 @@ type VoiceSignalRequest struct {
 	// somebody else's track has no way to rename it — so the host says which
 	// media id is whose, and the server passes it along without reading it.
 	Tracks map[string]int64 `json:"tracks,omitempty"`
+	// Purposes maps the same media ids to what each section carries — a
+	// microphone, a screen, a screen's sound. It travels beside Tracks for the
+	// same reason and is relayed just as unread: a receiver has to know both
+	// whose media a section holds and which of that person's media it is.
+	Purposes map[string]string `json:"purposes,omitempty"`
 }
 
 // VoiceStateRequest sets the caller's own mute and deafen. Absent fields are
@@ -1455,6 +1565,8 @@ type VoiceSignalEvent struct {
 	Candidate  *ICECandidate `json:"candidate,omitempty"`
 	// Tracks is the map described on VoiceSignalRequest, relayed unread.
 	Tracks map[string]int64 `json:"tracks,omitempty"`
+	// Purposes is the other half of it, relayed just as unread.
+	Purposes map[string]string `json:"purposes,omitempty"`
 }
 
 // Actions a VoicePeerEvent can ask the host for.
@@ -1494,6 +1606,80 @@ const (
 type VoiceResetEvent struct {
 	ChannelID int64  `json:"channelId"`
 	Reason    string `json:"reason"`
+}
+
+// --- screen sharing ----------------------------------------------------------
+
+// VideoQuality is one screen share as its sender means to encode it.
+//
+// Height rather than a width and a height, because a shared screen keeps the
+// aspect ratio of whatever is being shared and only one number is a choice:
+// asking for 1080 means "scale the long way to 1080 lines", which is what
+// every quality picker anywhere means by 1080p.
+type VideoQuality struct {
+	Height    int `json:"height"`
+	Framerate int `json:"framerate"`
+	Bitrate   int `json:"bitrate"`
+}
+
+// VoiceStreamRequest starts, changes or stops the caller's screen share.
+//
+// It is a statement about media that is already flowing, or about to be: the
+// media section it travels on was negotiated when the session opened, so this
+// carries no SDP and needs no answer beyond the quality it is allowed. Sending
+// it with Active false stops the share; sending it again with a different
+// quality changes one without stopping it.
+type VoiceStreamRequest struct {
+	Active  bool          `json:"active"`
+	Quality *VideoQuality `json:"quality,omitempty"`
+	// Audio says the share carries the machine's own sound as well.
+	Audio bool `json:"audio"`
+	// Source is "screen" or "window", the sender's own account of what is
+	// being shared. It is shown beside the stream and acted on nowhere: a
+	// client that lied about it would have lied about the picture too.
+	Source string `json:"source,omitempty"`
+}
+
+// VoiceStreamResult is the quality actually permitted, which is the request
+// held inside whatever the server carries. A client applies what comes back
+// rather than what it asked for.
+type VoiceStreamResult struct {
+	Active  bool         `json:"active"`
+	Quality VideoQuality `json:"quality"`
+	Audio   bool         `json:"audio"`
+}
+
+// VoiceStreamEvent tells a channel that somebody's screen share started,
+// changed or stopped. The quality travels with it so a viewer can size the
+// picture and say what it is before a single frame has arrived.
+type VoiceStreamEvent struct {
+	ChannelID int64        `json:"channelId"`
+	UserID    int64        `json:"userId"`
+	Active    bool         `json:"active"`
+	Quality   VideoQuality `json:"quality"`
+	Audio     bool         `json:"audio"`
+	Source    string       `json:"source,omitempty"`
+}
+
+// VoiceWatchRequest starts or stops receiving one participant's screen.
+//
+// Watching is explicit because a picture is expensive and a voice channel is
+// not: everybody in a call hears everybody, and nobody wants to be sent four
+// screens they are not looking at. It is the same reason Discord asks.
+type VoiceWatchRequest struct {
+	UserID   int64 `json:"userId"`
+	Watching bool  `json:"watching"`
+}
+
+// VoiceWatchEvent tells the host of a client_host channel to carry one
+// person's screen to one viewer, or to stop. Only the host receives it, and
+// only in that mode: in server_host the relay is told directly and no client
+// needs to know who is watching whom.
+type VoiceWatchEvent struct {
+	ChannelID   int64 `json:"channelId"`
+	ViewerID    int64 `json:"viewerId"`
+	PublisherID int64 `json:"publisherId"`
+	Watching    bool  `json:"watching"`
 }
 
 // ServerMetricsRequest asks the server for live telemetry and storage breakdown.

@@ -178,6 +178,8 @@ const (
 	OpVoiceState    = "voice.state"    // set your own mute and deafen
 	OpVoiceModerate = "voice.moderate" // mute or deafen somebody else
 	OpVoiceSpeaking = "voice.speaking" // announce a speaking transition
+	OpVoiceStream   = "voice.stream"   // start, change or stop sharing a screen
+	OpVoiceWatch    = "voice.watch"    // start or stop receiving somebody's screen
 )
 
 // Event ops, pushed by the server.
@@ -257,6 +259,8 @@ const (
 	EvVoicePeer     = "voice.peer"     // client_host: dial this peer, or drop it
 	EvVoiceHost     = "voice.host"     // client_host: who relays a channel now
 	EvVoiceReset    = "voice.reset"    // your media session is gone; start over
+	EvVoiceStream   = "voice.stream"   // somebody started, changed or stopped a screen share
+	EvVoiceWatch    = "voice.watch"    // client_host: carry this screen to this viewer, or stop
 )
 
 // Error codes. Clients switch on Code, never on Message.
@@ -284,6 +288,7 @@ const (
 	ErrPostLocked         = "post_locked"    // no more comments are accepted on it
 	ErrVoiceDisabled      = "voice_disabled" // this server runs no audio plane
 	ErrVoiceFailed        = "voice_failed"   // the media session could not be set up
+	ErrStreamDisabled     = "stream_disabled" // this server does not carry screen shares
 	// ErrBanned is the refusal a banned connection is given. Its message
 	// carries the reason and, when the ban ends, when.
 	ErrBanned = "banned"

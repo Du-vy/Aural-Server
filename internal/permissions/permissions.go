@@ -73,6 +73,12 @@ const (
 	// act — putting a file everybody's client will fetch into a shared
 	// namespace — and differ only in where it is rendered.
 	ManageExpressions Permission = 1 << 22
+	// Stream covers sharing a screen or a window into the voice channel you
+	// are sitting in. It is separate from Speak because the two are different
+	// acts with very different costs: a voice carries a few tens of kilobits,
+	// a screen carries a few megabits, and a channel that wants everybody
+	// talking very often wants only a few people transmitting a picture.
+	Stream Permission = 1 << 23
 
 	// Administrator bypasses every other check, including channel overwrites.
 	Administrator Permission = 1 << 31
@@ -85,7 +91,7 @@ const None Permission = 0
 var order = []Permission{
 	ViewChannel, Connect, Speak, SendMessages, ChangeNickname, Register, AttachFiles,
 	SendDirectMessages,
-	CreatePosts, UseSoundboard,
+	CreatePosts, UseSoundboard, Stream,
 	ManageChannels, ManageRoles, ManageServer, ManageNicknames, ManageMessages,
 	ManageWebhooks, ManageExpressions,
 	KickUsers, BanUsers, MoveUsers, MuteUsers, DeafenUsers,
@@ -104,6 +110,7 @@ var names = map[Permission]string{
 	SendDirectMessages: "SendDirectMessages",
 	CreatePosts:        "CreatePosts",
 	UseSoundboard:      "UseSoundboard",
+	Stream:             "Stream",
 	ManageChannels:     "ManageChannels",
 	ManageRoles:        "ManageRoles",
 	ManageServer:       "ManageServer",
@@ -133,7 +140,7 @@ var All = func() Permission {
 // user, guests included: they can look around, talk, write to somebody
 // privately, and claim an account.
 const DefaultEveryone = ViewChannel | Connect | Speak | SendMessages | ChangeNickname |
-	Register | AttachFiles | SendDirectMessages | CreatePosts | UseSoundboard
+	Register | AttachFiles | SendDirectMessages | CreatePosts | UseSoundboard | Stream
 
 // DefaultRegistered is granted on top of DefaultEveryone once a user claims an
 // account. It is deliberately empty so that a fresh server treats guests and

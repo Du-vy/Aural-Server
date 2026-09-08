@@ -157,6 +157,55 @@ type Voice struct {
 	// somebody's router. Credentials here reach authenticated clients only:
 	// the public server preview deliberately leaves them out.
 	ICEServers []ICEServer `json:"ice_servers"`
+	// Screen governs sharing a screen or a window into a voice channel. It
+	// travels inside Voice because it is the same media session: a picture is
+	// carried by whoever carries the audio, and turning voice off takes it
+	// with it.
+	Screen Screen `json:"screen"`
+}
+
+// Screen is the video plane: whether a voice channel may carry a picture, and
+// how large a one this server is willing to.
+//
+// The ceilings are a promise about bandwidth, and a promise only the server
+// can make. In server_host every stream is uploaded once and sent out once per
+// viewer, so a single person at 8 Mb/s with four viewers is 40 Mb/s of the
+// operator's line; capping that is the difference between a server that stays
+// up and one that does not. In client_host nothing crosses the server at all,
+// so the ceilings do not apply and are not sent — the two people paying for a
+// stream there are the two people in it, and it is theirs to decide.
+//
+// Enabled is the exception and applies in both modes. It is policy rather than
+// bandwidth: an operator who does not want screens shared on their server
+// wants that whoever is carrying the packets.
+type Screen struct {
+	// Enabled turns screen sharing off entirely, in either hosting mode. Voice
+	// is unaffected: this is a picture on top of a call, never the call.
+	Enabled bool `json:"enabled"`
+	// Audio allows a shared screen to carry the machine's own sound alongside
+	// the picture. It is separate because it is a separate risk: a window
+	// shared by mistake shows one application, a desktop shared with audio
+	// carries everything the machine plays.
+	Audio bool `json:"audio"`
+	// MaxHeight is the tallest picture a client may send, in pixels of the
+	// encoded frame — 720 means 720p whatever the aspect ratio. A client
+	// scales to fit rather than being refused.
+	MaxHeight int `json:"max_height"`
+	// MaxFramerate is the highest frame rate a client may send.
+	MaxFramerate int `json:"max_framerate"`
+	// MaxBitrate is the ceiling on one stream, in bits per second. It is the
+	// number that actually bounds what a server pays for, because resolution
+	// and frame rate only predict bandwidth while the picture is still.
+	MaxBitrate int `json:"max_bitrate"`
+	// MaxStreams caps how many people may share a screen in one channel at
+	// once. Zero leaves it uncapped. Discord allows one; allowing several is
+	// what makes a channel usable for two people pairing on the same problem,
+	// and the cost is bounded by the ceilings above.
+	MaxStreams int `json:"max_streams"`
+	// MaxViewers caps how many people may watch one stream at once, which is
+	// the multiplier on everything else in server_host mode. Zero leaves it to
+	// the channel.
+	MaxViewers int `json:"max_viewers"`
 }
 
 // ICEServer is one STUN or TURN server, in the shape WebRTC expects.
@@ -525,6 +574,30 @@ const (
 	MaxOpusBitrate = 510000
 )
 
+// The video plane a fresh install starts from. 1080p30 at 2.5 Mb/s is what a
+// shared screen actually needs to be readable — text at 720p is the single
+// most common complaint about screen sharing anywhere — and it is a ceiling a
+// domestic uplink can carry for two or three viewers, which is the size of
+// server this is written for. An operator with a real line raises it; one on a
+// home connection lowers it and nothing else changes.
+const (
+	DefaultScreenMaxHeight    = 1080
+	DefaultScreenMaxFramerate = 30
+	DefaultScreenMaxBitrate   = 2_500_000
+)
+
+// The bounds an operator may configure the video plane within. The ceiling is
+// 4K120 at 40 Mb/s because that is past anything a browser will encode in
+// software, so the limit that bites is always the machine rather than this.
+const (
+	MinScreenHeight    = 144
+	MaxScreenHeight    = 2160
+	MinScreenFramerate = 1
+	MaxScreenFramerate = 120
+	MinScreenBitrate   = 100_000
+	MaxScreenBitrate   = 40_000_000
+)
+
 // Default returns the configuration a fresh install starts from.
 func Default() Config {
 	return Config{
@@ -563,6 +636,18 @@ func Default() Config {
 			DTX:        false,
 			Stereo:     false,
 			ICEServers: []ICEServer{},
+			// Screen sharing is on by default because a voice channel nobody
+			// can show anything in is half a voice channel, and the ceilings
+			// are what keep that affordable rather than the feature being off.
+			Screen: Screen{
+				Enabled:      true,
+				Audio:        true,
+				MaxHeight:    DefaultScreenMaxHeight,
+				MaxFramerate: DefaultScreenMaxFramerate,
+				MaxBitrate:   DefaultScreenMaxBitrate,
+				MaxStreams:   0,
+				MaxViewers:   0,
+			},
 		},
 		Uploads: Uploads{
 			Enabled:           true,
@@ -904,6 +989,10 @@ func (v *Voice) validate() error {
 		return errors.New("voice.max_participants must not be negative")
 	}
 
+	if err := v.Screen.validate(); err != nil {
+		return err
+	}
+
 	v.PublicIP = strings.TrimSpace(v.PublicIP)
 	if v.PublicIP != "" && net.ParseIP(v.PublicIP) == nil && !isHostname(v.PublicIP) {
 		return fmt.Errorf("voice.public_ip %q is neither an IP address nor a hostname", v.PublicIP)
@@ -1156,6 +1245,42 @@ func isHostname(s string) bool {
 	return true
 }
 
+// validate checks the video plane and fills in the values an operator left
+// out. A zero is read as "unset" rather than as "forbid everything", because a
+// configuration file written before this existed has zeroes in every one of
+// these fields and must keep working exactly as it did.
+func (s *Screen) validate() error {
+	if s.MaxHeight == 0 {
+		s.MaxHeight = DefaultScreenMaxHeight
+	}
+	if s.MaxFramerate == 0 {
+		s.MaxFramerate = DefaultScreenMaxFramerate
+	}
+	if s.MaxBitrate == 0 {
+		s.MaxBitrate = DefaultScreenMaxBitrate
+	}
+
+	if s.MaxHeight < MinScreenHeight || s.MaxHeight > MaxScreenHeight {
+		return fmt.Errorf("voice.screen.max_height %d is outside the %d-%d this server will carry",
+			s.MaxHeight, MinScreenHeight, MaxScreenHeight)
+	}
+	if s.MaxFramerate < MinScreenFramerate || s.MaxFramerate > MaxScreenFramerate {
+		return fmt.Errorf("voice.screen.max_framerate %d is outside the %d-%d this server will carry",
+			s.MaxFramerate, MinScreenFramerate, MaxScreenFramerate)
+	}
+	if s.MaxBitrate < MinScreenBitrate || s.MaxBitrate > MaxScreenBitrate {
+		return fmt.Errorf("voice.screen.max_bitrate %d is outside the %d-%d bit/s this server will carry",
+			s.MaxBitrate, MinScreenBitrate, MaxScreenBitrate)
+	}
+	if s.MaxStreams < 0 {
+		return errors.New("voice.screen.max_streams must not be negative")
+	}
+	if s.MaxViewers < 0 {
+		return errors.New("voice.screen.max_viewers must not be negative")
+	}
+	return nil
+}
+
 // SameAs reports whether two audio planes are identical. Voice holds a slice,
 // so it cannot be compared with ==, and the comparison matters: it is what
 // keeps an administrator saving an unrelated setting from cutting off a call.
@@ -1170,6 +1295,7 @@ func (v Voice) SameAs(other Voice) bool {
 		v.DTX != other.DTX ||
 		v.Stereo != other.Stereo ||
 		v.MaxParticipants != other.MaxParticipants ||
+		v.Screen != other.Screen ||
 		v.PublicIP != other.PublicIP ||
 		v.UDPPortMin != other.UDPPortMin ||
 		v.UDPPortMax != other.UDPPortMax ||
