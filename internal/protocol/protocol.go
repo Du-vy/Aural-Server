@@ -283,11 +283,11 @@ const (
 	ErrTooLarge           = "too_large"    // one upload exceeded the file ceiling
 	ErrStorageFull        = "storage_full" // the server-wide upload ceiling is reached
 	ErrUploadsDisabled    = "uploads_disabled"
-	ErrDMDisabled         = "dm_disabled"    // this server carries no private messages
-	ErrDMBlocked          = "dm_blocked"     // the other person does not accept them
-	ErrPostLocked         = "post_locked"    // no more comments are accepted on it
-	ErrVoiceDisabled      = "voice_disabled" // this server runs no audio plane
-	ErrVoiceFailed        = "voice_failed"   // the media session could not be set up
+	ErrDMDisabled         = "dm_disabled"     // this server carries no private messages
+	ErrDMBlocked          = "dm_blocked"      // the other person does not accept them
+	ErrPostLocked         = "post_locked"     // no more comments are accepted on it
+	ErrVoiceDisabled      = "voice_disabled"  // this server runs no audio plane
+	ErrVoiceFailed        = "voice_failed"    // the media session could not be set up
 	ErrStreamDisabled     = "stream_disabled" // this server does not carry screen shares
 	// ErrBanned is the refusal a banned connection is given. Its message
 	// carries the reason and, when the ban ends, when.
