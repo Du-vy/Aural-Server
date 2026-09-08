@@ -21,6 +21,8 @@ type User struct {
 	Banner       *string
 	Status       string
 	CustomStatus string
+	ThemeColor   string
+	CustomFrame  string
 	// DMPrivacy is who may write to this identity privately: DMEveryone,
 	// DMRegistered or DMNone. It is the user's own setting and nobody else's
 	// business, so it never travels in anybody else's view of them.
@@ -58,13 +60,13 @@ func (u User) AcceptsDMFrom(other User) bool {
 }
 
 const (
-	userColumns    = `id, nickname, username, password_hash, avatar, banner, status, custom_status, dm_privacy, registered_at, created_at, last_seen_at`
-	userColumnsAsU = `u.id, u.nickname, u.username, u.password_hash, u.avatar, u.banner, u.status, u.custom_status, u.dm_privacy, u.registered_at, u.created_at, u.last_seen_at`
+	userColumns    = `id, nickname, username, password_hash, avatar, banner, status, custom_status, dm_privacy, registered_at, created_at, last_seen_at, theme_color, custom_frame`
+	userColumnsAsU = `u.id, u.nickname, u.username, u.password_hash, u.avatar, u.banner, u.status, u.custom_status, u.dm_privacy, u.registered_at, u.created_at, u.last_seen_at, u.theme_color, u.custom_frame`
 )
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Nickname, &u.Username, &u.PasswordHash, &u.Avatar, &u.Banner, &u.Status, &u.CustomStatus, &u.DMPrivacy, &u.RegisteredAt, &u.CreatedAt, &u.LastSeenAt)
+	err := row.Scan(&u.ID, &u.Nickname, &u.Username, &u.PasswordHash, &u.Avatar, &u.Banner, &u.Status, &u.CustomStatus, &u.DMPrivacy, &u.RegisteredAt, &u.CreatedAt, &u.LastSeenAt, &u.ThemeColor, &u.CustomFrame)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, ErrNotFound
 	}
@@ -101,6 +103,7 @@ func (s *Store) CreateGuest(ctx context.Context, nickname string) (User, error) 
 	}
 	return User{
 		ID: id, Nickname: nickname, Status: "online", CustomStatus: "",
+		ThemeColor: "", CustomFrame: "",
 		DMPrivacy: DMEveryone, CreatedAt: ts, LastSeenAt: ts,
 	}, nil
 }
@@ -201,9 +204,10 @@ func (s *Store) SetStatus(ctx context.Context, id int64, status string, customSt
 	return requireOneRow(res, "user")
 }
 
-// UpdateProfile updates nickname, avatar, banner, status, custom status or
-// direct-message privacy for a user. A nil field is left alone.
-func (s *Store) UpdateProfile(ctx context.Context, id int64, nickname *string, avatar **string, banner **string, status *string, customStatus *string, dmPrivacy *string) (User, error) {
+// UpdateProfile updates nickname, avatar, banner, status, custom status,
+// direct-message privacy, theme color or custom avatar frame for a user.
+// A nil field is left alone.
+func (s *Store) UpdateProfile(ctx context.Context, id int64, nickname *string, avatar **string, banner **string, status *string, customStatus *string, dmPrivacy *string, themeColor *string, customFrame *string) (User, error) {
 	var sets []string
 	var args []any
 
@@ -230,6 +234,14 @@ func (s *Store) UpdateProfile(ctx context.Context, id int64, nickname *string, a
 	if dmPrivacy != nil {
 		sets = append(sets, "dm_privacy = ?")
 		args = append(args, *dmPrivacy)
+	}
+	if themeColor != nil {
+		sets = append(sets, "theme_color = ?")
+		args = append(args, *themeColor)
+	}
+	if customFrame != nil {
+		sets = append(sets, "custom_frame = ?")
+		args = append(args, *customFrame)
 	}
 
 	if len(sets) == 0 {

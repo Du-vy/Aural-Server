@@ -334,6 +334,14 @@ func userView(u store.User, roleIDs []int64, channelID *int64, online, owner boo
 	if status == "" {
 		status = "online"
 	}
+	var customFrame *protocol.CustomAvatarFrame
+	if u.CustomFrame != "" {
+		var cf protocol.CustomAvatarFrame
+		if err := json.Unmarshal([]byte(u.CustomFrame), &cf); err == nil && cf.Style != "" && cf.Style != "none" {
+			customFrame = &cf
+		}
+	}
+
 	return protocol.User{
 		ID:           u.ID,
 		Owner:        owner,
@@ -347,6 +355,8 @@ func userView(u store.User, roleIDs []int64, channelID *int64, online, owner boo
 		CustomStatus: u.CustomStatus,
 		Avatar:       u.Avatar,
 		Banner:       u.Banner,
+		ThemeColor:   u.ThemeColor,
+		CustomFrame:  customFrame,
 		// Only ever reaches its own subject: MaskUser clears it for everybody
 		// else, and offlineView never carries one at all.
 		DMPrivacy: u.DMPrivacy,

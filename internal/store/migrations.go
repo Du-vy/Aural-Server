@@ -692,6 +692,11 @@ var migrations = []string{
 	-- scan the table to find them.
 	CREATE INDEX idx_post_views_user ON post_views(user_id);
 	`,
+	// 20: profile theme color and custom avatar frame cosmetics.
+	`
+	ALTER TABLE users ADD COLUMN theme_color TEXT NOT NULL DEFAULT '';
+	ALTER TABLE users ADD COLUMN custom_frame TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate brings the schema up to len(migrations) using SQLite's own

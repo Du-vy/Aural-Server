@@ -100,7 +100,8 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 		return nil, failure
 	}
 	if req.Nickname == nil && req.Status == nil && req.CustomStatus == nil &&
-		req.Avatar == nil && req.Banner == nil && req.DMPrivacy == nil {
+		req.Avatar == nil && req.Banner == nil && req.DMPrivacy == nil &&
+		req.ThemeColor == nil && req.CustomFrame == nil {
 		return nil, protocol.Errorf(protocol.ErrBadRequest, "nothing to update")
 	}
 
@@ -137,7 +138,7 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 	}
 
 	if !isSelf && (req.Status != nil || req.CustomStatus != nil || req.Avatar != nil ||
-		req.Banner != nil || req.DMPrivacy != nil) {
+		req.Banner != nil || req.DMPrivacy != nil || req.ThemeColor != nil || req.CustomFrame != nil) {
 		return nil, protocol.Errorf(protocol.ErrForbidden, "you may only update your own profile details")
 	}
 
@@ -168,6 +169,24 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 		validatedDMPrivacy = &privacy
 	}
 
+	var validatedThemeColor *string
+	if req.ThemeColor != nil {
+		tc, failure := validateHexColor(*req.ThemeColor)
+		if failure != nil {
+			return nil, failure
+		}
+		validatedThemeColor = &tc
+	}
+
+	var validatedCustomFrame *string
+	if req.CustomFrame != nil {
+		cfJSON, failure := validateCustomFrame(req.CustomFrame)
+		if failure != nil {
+			return nil, failure
+		}
+		validatedCustomFrame = cfJSON
+	}
+
 	validatedAvatar, failure := s.hub.validateMediaField(req.Avatar, "avatar")
 	if failure != nil {
 		return nil, failure
@@ -178,7 +197,8 @@ func handleUserUpdate(ctx context.Context, s *Session, raw json.RawMessage) (any
 	}
 
 	updatedUser, err := s.hub.st.UpdateProfile(ctx, targetID, validatedNickname,
-		validatedAvatar, validatedBanner, validatedStatus, validatedCustomStatus, validatedDMPrivacy)
+		validatedAvatar, validatedBanner, validatedStatus, validatedCustomStatus, validatedDMPrivacy,
+		validatedThemeColor, validatedCustomFrame)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, protocol.Errorf(protocol.ErrNotFound, "no such user")

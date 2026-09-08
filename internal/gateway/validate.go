@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"crypto/subtle"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"unicode"
@@ -158,6 +159,91 @@ func validateColor(raw string) (string, *protocol.Error) {
 		}
 	}
 	return strings.ToLower(color), nil
+}
+
+// validateHexColor accepts an empty string or a 3, 4, 6 or 8-digit #hex color.
+func validateHexColor(raw string) (string, *protocol.Error) {
+	color := strings.TrimSpace(raw)
+	if color == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(color, "#") {
+		return "", protocol.Errorf(protocol.ErrBadRequest, "color must start with #")
+	}
+	hexPart := color[1:]
+	if len(hexPart) != 3 && len(hexPart) != 4 && len(hexPart) != 6 && len(hexPart) != 8 {
+		return "", protocol.Errorf(protocol.ErrBadRequest, "color must be in #rgb, #rgba, #rrggbb or #rrggbbaa form")
+	}
+	for _, r := range hexPart {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return "", protocol.Errorf(protocol.ErrBadRequest, fmt.Sprintf("color contains invalid hex character %q", string(r)))
+		}
+	}
+	return strings.ToLower(color), nil
+}
+
+// validateCustomFrame normalises and validates avatar frame cosmetics, returning JSON to store.
+func validateCustomFrame(raw *protocol.CustomAvatarFrame) (*string, *protocol.Error) {
+	if raw == nil {
+		return nil, nil
+	}
+	cf := *raw
+	cf.Style = strings.TrimSpace(cf.Style)
+	if cf.Style == "" {
+		cf.Style = "none"
+	}
+	switch cf.Style {
+	case "none", "ring", "glow", "neon", "cyber", "double", "crown":
+	default:
+		return nil, protocol.Errorf(protocol.ErrBadRequest, fmt.Sprintf("invalid frame style %q", cf.Style))
+	}
+
+	cf.ColorMode = strings.TrimSpace(cf.ColorMode)
+	if cf.ColorMode == "" {
+		cf.ColorMode = "profile"
+	}
+	switch cf.ColorMode {
+	case "profile", "custom", "gradient":
+	default:
+		return nil, protocol.Errorf(protocol.ErrBadRequest, fmt.Sprintf("invalid frame color mode %q", cf.ColorMode))
+	}
+
+	cf.Animation = strings.TrimSpace(cf.Animation)
+	if cf.Animation == "" {
+		cf.Animation = "none"
+	}
+	switch cf.Animation {
+	case "none", "pulse", "spin", "shimmer", "rainbow":
+	default:
+		return nil, protocol.Errorf(protocol.ErrBadRequest, fmt.Sprintf("invalid frame animation %q", cf.Animation))
+	}
+
+	if cf.CustomColor != "" {
+		c, err := validateHexColor(cf.CustomColor)
+		if err != nil {
+			return nil, err
+		}
+		cf.CustomColor = c
+	}
+	if cf.CustomColor2 != "" {
+		c2, err := validateHexColor(cf.CustomColor2)
+		if err != nil {
+			return nil, err
+		}
+		cf.CustomColor2 = c2
+	}
+
+	if cf.Style == "none" {
+		empty := ""
+		return &empty, nil
+	}
+
+	encoded, err := json.Marshal(cf)
+	if err != nil {
+		return nil, protocol.Errorf(protocol.ErrBadRequest, fmt.Sprintf("malformed custom frame: %v", err))
+	}
+	str := string(encoded)
+	return &str, nil
 }
 
 // validateChannelType rejects anything outside the known kinds.

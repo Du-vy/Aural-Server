@@ -362,6 +362,18 @@ type ActivityParty struct {
 }
 
 // User is a member of the server. Guests are users too: they simply have no
+// CustomAvatarFrame carries modular cosmetics for a user's avatar frame.
+type CustomAvatarFrame struct {
+	Style        string `json:"style"`
+	ColorMode    string `json:"colorMode"`
+	CustomColor  string `json:"customColor,omitempty"`
+	CustomColor2 string `json:"customColor2,omitempty"`
+	Animation    string `json:"animation"`
+}
+
+// User is the full identity of a participant, sent on connect and updated
+// live. It is shared between guests and registered accounts: a guest is one
+// whose Username is nil, who holds no roles, and who has never claimed a
 // username yet.
 type User struct {
 	ID int64 `json:"id"`
@@ -369,17 +381,19 @@ type User struct {
 	// role produces it: the owner holds every permission and outranks every
 	// role for as long as they own the server, whatever roles they are given
 	// or stripped of.
-	Owner        bool    `json:"owner,omitempty"`
-	Nickname     string  `json:"nickname"`
-	Username     *string `json:"username"` // nil while the user is still a guest
-	Registered   bool    `json:"registered"`
-	Roles        []int64 `json:"roles"`
-	ChannelID    *int64  `json:"channelId"` // nil when the user is in no channel
-	Online       bool    `json:"online"`
-	Status       string  `json:"status"` // "online", "idle", "dnd", "offline", "invisible"
-	CustomStatus string  `json:"customStatus,omitempty"`
-	Avatar       *string `json:"avatar,omitempty"`
-	Banner       *string `json:"banner,omitempty"`
+	Owner        bool               `json:"owner,omitempty"`
+	Nickname     string             `json:"nickname"`
+	Username     *string            `json:"username"` // nil while the user is still a guest
+	Registered   bool               `json:"registered"`
+	Roles        []int64            `json:"roles"`
+	ChannelID    *int64             `json:"channelId"` // nil when the user is in no channel
+	Online       bool               `json:"online"`
+	Status       string             `json:"status"` // "online", "idle", "dnd", "offline", "invisible"
+	CustomStatus string             `json:"customStatus,omitempty"`
+	Avatar       *string            `json:"avatar,omitempty"`
+	Banner       *string            `json:"banner,omitempty"`
+	ThemeColor   string             `json:"themeColor,omitempty"`
+	CustomFrame  *CustomAvatarFrame `json:"customFrame,omitempty"`
 	// DMPrivacy is "everyone", "registered" or "none", and is only ever set on
 	// your own entry: what somebody accepts privately is theirs to read and
 	// nobody else's to see. Everybody else's copy of you carries an empty
@@ -946,6 +960,10 @@ type UserUpdateRequest struct {
 	// or "none". It is your own setting and cannot be changed for anybody else,
 	// whatever permissions the caller holds.
 	DMPrivacy *string `json:"dmPrivacy,omitempty"`
+	// ThemeColor sets the profile theme color (e.g. "#5865F2"). Send empty string to clear.
+	ThemeColor *string `json:"themeColor,omitempty"`
+	// CustomFrame configures modular avatar cosmetics (style, colorMode, animation, custom colors).
+	CustomFrame *CustomAvatarFrame `json:"customFrame,omitempty"`
 }
 
 // UserActivityRequest reports what the caller is doing outside Aural.
