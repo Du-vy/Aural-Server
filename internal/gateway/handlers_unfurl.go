@@ -203,8 +203,8 @@ func (s *Server) handleUnfurl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use Discordbot User-Agent because social platforms and web servers optimize OpenGraph for it.
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Discordbot/2.0; +https://aural.chat)")
+	// Use Auralbot User-Agent. Note: Discordbot causes FxTwitter and some scrapers to strip video tags in favor of oEmbed.
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Auralbot/1.0; +https://aural.chat)")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9,es;q=0.8")
 
