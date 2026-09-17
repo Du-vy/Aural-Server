@@ -144,3 +144,57 @@ func TestMigration15Backfill(t *testing.T) {
 		t.Fatalf("expected backfilled WebhookSource 'discord', got %v", reloaded.WebhookSource)
 	}
 }
+
+func TestCreateWebhookPost(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+
+	channels, err := s.AllChannels(ctx)
+	if err != nil || len(channels) == 0 {
+		t.Fatalf("Channels: %v", err)
+	}
+	channelID := channels[0].ID
+
+	webhookID := int64(101)
+	source := "discord"
+	avatar := "https://example.com/avatar.png"
+
+	created, body, err := s.CreateWebhookPost(ctx, Post{
+		ChannelID: channelID,
+		Author:    "DiscordArtist",
+		Title:     "Sunset Painting",
+	}, Message{
+		ChannelID:     channelID,
+		Author:        "DiscordArtist",
+		Content:       "Here is a sunset I painted",
+		WebhookID:     &webhookID,
+		WebhookAvatar: &avatar,
+		WebhookSource: &source,
+	})
+	if err != nil {
+		t.Fatalf("CreateWebhookPost: %v", err)
+	}
+
+	if created.Title != "Sunset Painting" {
+		t.Fatalf("expected title 'Sunset Painting', got %q", created.Title)
+	}
+	if created.Author != "DiscordArtist" {
+		t.Fatalf("expected author 'DiscordArtist', got %q", created.Author)
+	}
+	if created.UserID != nil {
+		t.Fatalf("expected nil UserID for webhook post, got %v", created.UserID)
+	}
+	if created.RootMessageID == nil || *created.RootMessageID != body.ID {
+		t.Fatalf("expected RootMessageID %d, got %v", body.ID, created.RootMessageID)
+	}
+
+	if body.Content != "Here is a sunset I painted" {
+		t.Fatalf("expected body content, got %q", body.Content)
+	}
+	if body.WebhookSource == nil || *body.WebhookSource != "discord" {
+		t.Fatalf("expected WebhookSource 'discord', got %v", body.WebhookSource)
+	}
+	if body.PostID == nil || *body.PostID != created.ID {
+		t.Fatalf("expected body.PostID == %d, got %v", created.ID, body.PostID)
+	}
+}

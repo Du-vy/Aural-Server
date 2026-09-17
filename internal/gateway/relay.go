@@ -650,8 +650,14 @@ func (r *discordRelay) onDiscordDelete(_ context.Context, channelID string, ids 
 // everybody in it.
 func (r *discordRelay) deliverToAural(ctx context.Context, link store.RelayLink, m discord.Message) error {
 	channel, ok := r.hub.Channel(link.ChannelID)
-	if !ok || channel.Type != protocol.ChannelText {
-		return fmt.Errorf("relay link %d points at a channel that is not a text channel", link.ID)
+	if !ok {
+		return fmt.Errorf("relay link %d points at a channel that does not exist", link.ID)
+	}
+	if channel.Type == protocol.ChannelMedia {
+		return r.deliverMediaPostToAural(ctx, link, m)
+	}
+	if channel.Type != protocol.ChannelText {
+		return fmt.Errorf("relay link %d points at a channel that is not text or media", link.ID)
 	}
 
 	webhookID, err := r.inboundWebhook(ctx, link)
@@ -759,6 +765,126 @@ func (r *discordRelay) deliverToAural(ctx context.Context, link store.RelayLink,
 
 	r.noteSuccess(ctx, link.ID)
 	r.log.Debug("relayed a Discord message",
+		slog.Int64("link", link.ID), slog.String("author", m.DisplayName()),
+		slog.Int("files", len(attachments)))
+	return nil
+}
+
+// deliverMediaPostToAural writes one Discord message as a media post into its
+// Aural media channel. Messages without attachments are dropped because media
+// posts require at least one file.
+func (r *discordRelay) deliverMediaPostToAural(ctx context.Context, link store.RelayLink, m discord.Message) error {
+	if len(m.Attachments) == 0 {
+		r.log.Debug("ignoring Discord message without attachments for media channel",
+			slog.Int64("link", link.ID), slog.String("discord_id", m.ID))
+		return nil
+	}
+
+	files, err := r.fetchInboundFiles(ctx, link, m)
+	if err != nil {
+		r.log.Warn("fetch a relayed attachment", slog.Int64("link", link.ID), slog.Any("error", err))
+		r.noteFailure(ctx, link.ID, err)
+	}
+	if len(files) == 0 {
+		return nil
+	}
+
+	rawContent := strings.TrimSpace(m.Content)
+	var title, bodyContent string
+	if rawContent != "" {
+		lines := strings.SplitN(rawContent, "\n", 2)
+		title = strings.TrimSpace(lines[0])
+		if len(lines) > 1 {
+			bodyContent = strings.TrimSpace(lines[1])
+		}
+	}
+	title = truncateRunes(cleanText(title), maxPostTitle)
+	if title == "" {
+		if len(files) > 0 && files[0].filename != "" {
+			title = truncateRunes(cleanText(files[0].filename), maxPostTitle)
+		}
+		if title == "" {
+			title = "Media"
+		}
+	}
+
+	bodyContent = r.renderInbound(discord.Message{Content: bodyContent}, false)
+	if runes := []rune(bodyContent); len(runes) > maxMessageRunes {
+		bodyContent = string(runes[:maxMessageRunes])
+	}
+
+	titleVerdict, blocked := r.hub.screenRelayed(ctx, link.ChannelID, title, m.DisplayName())
+	if blocked {
+		r.discardUploads(files)
+		return nil
+	}
+	title = titleVerdict
+
+	bodyVerdict, blocked := r.hub.screenRelayed(ctx, link.ChannelID, bodyContent, m.DisplayName())
+	if blocked {
+		r.discardUploads(files)
+		return nil
+	}
+	bodyContent = bodyVerdict
+
+	author := truncateRunes(cleanText(m.DisplayName()), maxWebhookUsername)
+	if author == "" {
+		author = relayInboundWebhookName
+	}
+	avatar := m.AvatarURL(relayAvatarSize)
+	source := protocol.MessageSourceDiscord
+	webhookID, err := r.inboundWebhook(ctx, link)
+	if err != nil {
+		r.discardUploads(files)
+		return err
+	}
+
+	created, body, err := r.st.CreateWebhookPost(ctx, store.Post{
+		ChannelID: link.ChannelID,
+		Author:    author,
+		Title:     title,
+	}, store.Message{
+		ChannelID:     link.ChannelID,
+		Author:        author,
+		Content:       bodyContent,
+		WebhookID:     &webhookID,
+		WebhookAvatar: &avatar,
+		WebhookSource: &source,
+	})
+	if err != nil {
+		r.discardUploads(files)
+		return err
+	}
+
+	attachments, err := r.attachInboundFiles(ctx, link, body.ID, files)
+	if err != nil {
+		if delErr := r.st.DeletePost(ctx, created.ID); delErr != nil {
+			r.log.Error("roll back a relayed media post whose files could not be attached",
+				slog.Int64("post", created.ID), slog.Any("error", delErr))
+		}
+		return err
+	}
+
+	if err := r.st.MapRelayMessage(ctx, store.RelayMessage{
+		AuralID:   body.ID,
+		LinkID:    link.ID,
+		DiscordID: m.ID,
+		Origin:    store.RelayOriginDiscord,
+	}); err != nil {
+		r.log.Warn("record what a relayed media post is called on Discord", slog.Any("error", err))
+	}
+
+	bodyView := messageView(body, attachments, nil)
+	if bodyView.Webhook != nil {
+		bodyView.Webhook.Source = protocol.MessageSourceDiscord
+	}
+	view := postView(created, &bodyView, store.PostStats{}, store.PostRSVPCounts{}, "", false)
+	r.hub.BroadcastChannelEvent(
+		protocol.Event(protocol.EvPostCreated, protocol.PostEvent{Post: view}),
+		created.ChannelID)
+
+	r.noteSuccess(ctx, link.ID)
+	r.log.Debug("relayed a Discord media post",
 		slog.Int64("link", link.ID), slog.String("author", m.DisplayName()),
 		slog.Int("files", len(attachments)))
 	return nil
@@ -903,6 +1029,33 @@ func (r *discordRelay) applyDiscordEdit(ctx context.Context, link store.RelayLin
 	if err != nil {
 		return err
 	}
+
+	if updated.PostID != nil {
+		post, err := r.st.PostByID(ctx, *updated.PostID)
+		if err != nil {
+			return err
+		}
+		rawContent := strings.TrimSpace(m.Content)
+		if rawContent != "" {
+			lines := strings.SplitN(rawContent, "\n", 2)
+			newTitle := truncateRunes(cleanText(lines[0]), maxPostTitle)
+			if newTitle != "" && newTitle != post.Title {
+				post.Title = newTitle
+				_ = r.st.UpdatePost(ctx, post)
+				post, _ = r.st.PostByID(ctx, post.ID)
+			}
+		}
+		postBodyView := messageView(updated, attachments, nil)
+		if postBodyView.Webhook != nil {
+			postBodyView.Webhook.Source = protocol.MessageSourceDiscord
+		}
+		postEventView := postView(post, &postBodyView, store.PostStats{}, store.PostRSVPCounts{}, "", false)
+		r.hub.BroadcastChannelEvent(
+			protocol.Event(protocol.EvPostUpdated, protocol.PostEvent{Post: postEventView}),
+			updated.ChannelID)
+		return nil
+	}
+
 	view := messageView(updated, attachments, resolveMessageReply(ctx, r.st, updated.ReplyToID))
 	if view.Webhook != nil {
 		view.Webhook.Source = protocol.MessageSourceDiscord
@@ -927,6 +1080,26 @@ func (r *discordRelay) applyDiscordDelete(ctx context.Context, link store.RelayL
 	if err != nil {
 		return err
 	}
+
+	if message.PostID != nil {
+		postID := *message.PostID
+		postAttachments, err := r.st.AttachmentsForPost(ctx, postID)
+		if err != nil {
+			return err
+		}
+		if err := r.st.DeletePost(ctx, postID); err != nil {
+			return err
+		}
+		r.hub.RemoveFiles(postAttachments)
+		if err := r.st.ForgetRelayMessage(ctx, message.ID); err != nil {
+			r.log.Debug("forget a relayed post message pairing", slog.Any("error", err))
+		}
+		r.hub.BroadcastChannelEvent(protocol.Event(protocol.EvPostDeleted,
+			protocol.PostDeletedEvent{PostID: postID, ChannelID: message.ChannelID}),
+			message.ChannelID)
+		return nil
+	}
+
 	attachments, err := r.st.AttachmentsForMessage(ctx, message.ID)
 	if err != nil {
 		return err

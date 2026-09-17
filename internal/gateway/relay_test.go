@@ -136,7 +136,7 @@ func TestRelayLinkRefusesADirectionThatMeansNothing(t *testing.T) {
 	}, protocol.ErrBadRequest)
 }
 
-func TestRelayLinkOnlyPointsAtATextChannel(t *testing.T) {
+func TestRelayLinkOnlyPointsAtATextOrMediaChannel(t *testing.T) {
 	h := newHarness(t, nil)
 	admin, ready := h.admin("Root")
 
@@ -144,6 +144,12 @@ func TestRelayLinkOnlyPointsAtATextChannel(t *testing.T) {
 	// nothing to write.
 	admin.fails(protocol.OpRelayCreate, protocol.RelayCreateRequest{
 		ChannelID: voiceChannel(t, ready), WebhookURL: aValidWebhookURL,
+	}, protocol.ErrBadRequest)
+
+	// A forum channel holds topics and is not supported for relaying.
+	forum := h.postChannel(admin, protocol.ChannelForum, "forum")
+	admin.fails(protocol.OpRelayCreate, protocol.RelayCreateRequest{
+		ChannelID: forum.ID, WebhookURL: aValidWebhookURL,
 	}, protocol.ErrBadRequest)
 
 	// And a channel that does not exist is a not-found rather than a bad

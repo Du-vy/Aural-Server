@@ -2,8 +2,10 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -404,6 +406,111 @@ func TestSanitiseEmbedsKeepsTheKindDiscordUnfurled(t *testing.T) {
 			}
 			if out[0].Type != tc.want {
 				t.Fatalf("type: got %q, want %q", out[0].Type, tc.want)
+			}
+		})
+	}
+}
+
+func TestMediaPostOutboundFormatting(t *testing.T) {
+	cases := []struct {
+		name        string
+		title       string
+		content     string
+		wantContent string
+	}{
+		{
+			name:        "title and content",
+			title:       "My Photo",
+			content:     "Took this at the beach",
+			wantContent: "**My Photo**\nTook this at the beach",
+		},
+		{
+			name:        "title only",
+			title:       "Sunset",
+			content:     "",
+			wantContent: "**Sunset**",
+		},
+		{
+			name:        "content only without title",
+			title:       "",
+			content:     "Just an image description",
+			wantContent: "Just an image description",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			title := discord.EscapeOutbound(strings.TrimSpace(tc.title))
+			rawContent := strings.TrimSpace(tc.content)
+			var got string
+			if title != "" && rawContent != "" {
+				got = fmt.Sprintf("**%s**\n%s", title, discord.EscapeOutbound(rawContent))
+			} else if title != "" {
+				got = fmt.Sprintf("**%s**", title)
+			} else {
+				got = discord.EscapeOutbound(rawContent)
+			}
+			if got != tc.wantContent {
+				t.Fatalf("got %q, want %q", got, tc.wantContent)
+			}
+		})
+	}
+}
+
+func TestMediaPostInboundTitleParsing(t *testing.T) {
+	cases := []struct {
+		name        string
+		content     string
+		filenames   []string
+		wantTitle   string
+		wantContent string
+	}{
+		{
+			name:        "multiline content uses first line as title",
+			content:     "Epic Artwork\nDone with Blender and Photoshop",
+			filenames:   []string{"render.png"},
+			wantTitle:   "Epic Artwork",
+			wantContent: "Done with Blender and Photoshop",
+		},
+		{
+			name:        "single line content",
+			content:     "Cool Meme",
+			filenames:   []string{"meme.jpg"},
+			wantTitle:   "Cool Meme",
+			wantContent: "",
+		},
+		{
+			name:        "empty content uses filename as title",
+			content:     "",
+			filenames:   []string{"photo_2026.png"},
+			wantTitle:   "photo_2026.png",
+			wantContent: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rawContent := strings.TrimSpace(tc.content)
+			var title, bodyContent string
+			if rawContent != "" {
+				lines := strings.SplitN(rawContent, "\n", 2)
+				title = strings.TrimSpace(lines[0])
+				if len(lines) > 1 {
+					bodyContent = strings.TrimSpace(lines[1])
+				}
+			}
+			title = truncateRunes(cleanText(title), maxPostTitle)
+			if title == "" {
+				if len(tc.filenames) > 0 && tc.filenames[0] != "" {
+					title = truncateRunes(cleanText(tc.filenames[0]), maxPostTitle)
+				}
+				if title == "" {
+					title = "Media"
+				}
+			}
+			if title != tc.wantTitle {
+				t.Fatalf("title: got %q, want %q", title, tc.wantTitle)
+			}
+			if bodyContent != tc.wantContent {
+				t.Fatalf("bodyContent: got %q, want %q", bodyContent, tc.wantContent)
 			}
 		})
 	}

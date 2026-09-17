@@ -146,6 +146,67 @@ func (s *Store) CreatePost(ctx context.Context, p Post, content string) (Post, M
 	return created, body, nil
 }
 
+// CreateWebhookPost stores a post and its body message that arrived through a
+// webhook or relay.
+//
+// Like CreateWebhookMessage, the author is captured rather than resolved from
+// users, and user_id is NULL. Both rows are written in one transaction.
+func (s *Store) CreateWebhookPost(ctx context.Context, p Post, m Message) (Post, Message, error) {
+	ts := now()
+	var postID, bodyID int64
+	author := p.Author
+	if author == "" {
+		author = m.Author
+	}
+
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO posts (channel_id, user_id, author, title, created_at,
+				starts_at, ends_at, all_day, location)
+			 VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)`,
+			p.ChannelID, author, p.Title, ts,
+			p.StartsAt, p.EndsAt, p.AllDay, p.Location)
+		if err != nil {
+			return fmt.Errorf("store: create webhook post: %w", err)
+		}
+		if postID, err = res.LastInsertId(); err != nil {
+			return fmt.Errorf("store: create webhook post: %w", err)
+		}
+
+		resBody, err := tx.ExecContext(ctx,
+			`INSERT INTO messages (channel_id, post_id, user_id, author, content, search_text,
+				created_at, webhook_id, webhook_avatar, webhook_source, embeds)
+			 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			p.ChannelID, postID, author, m.Content, foldForSearch(m.Content),
+			ts, m.WebhookID, m.WebhookAvatar, m.WebhookSource, m.Embeds)
+		if err != nil {
+			return fmt.Errorf("store: create webhook post body: %w", err)
+		}
+		if bodyID, err = resBody.LastInsertId(); err != nil {
+			return fmt.Errorf("store: create webhook post body: %w", err)
+		}
+
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE posts SET root_message_id = ? WHERE id = ?`, bodyID, postID); err != nil {
+			return fmt.Errorf("store: create webhook post: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return Post{}, Message{}, err
+	}
+
+	created, err := s.PostByID(ctx, postID)
+	if err != nil {
+		return Post{}, Message{}, err
+	}
+	body, err := s.MessageByID(ctx, bodyID)
+	if err != nil {
+		return Post{}, Message{}, err
+	}
+	return created, body, nil
+}
+
 // PostByID loads one post.
 func (s *Store) PostByID(ctx context.Context, id int64) (Post, error) {
 	return scanPost(s.db.QueryRowContext(ctx,

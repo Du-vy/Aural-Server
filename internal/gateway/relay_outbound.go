@@ -73,6 +73,40 @@ func (r *discordRelay) OutboundDelete(m store.Message) {
 	})
 }
 
+// OutboundPost relays a media post created here to the Discord channel its
+// link points at.
+func (r *discordRelay) OutboundPost(p store.Post, body store.Message, attachments []store.Attachment) {
+	if r.isInboundMessage(body) {
+		return
+	}
+	link, ok := r.linkForChannel(p.ChannelID)
+	if !ok || !link.ToDiscord() || r.current() == nil {
+		return
+	}
+	r.enqueue(link.ID, func(ctx context.Context) {
+		if err := r.deliverPostToDiscord(ctx, link, p, body, attachments); err != nil {
+			r.log.Warn("relay a post into Discord",
+				slog.Int64("link", link.ID), slog.Int64("post", p.ID), slog.Any("error", err))
+			r.noteFailure(ctx, link.ID, err)
+		}
+	})
+}
+
+// OutboundDeletePost removes the Discord copy of a post deleted here.
+func (r *discordRelay) OutboundDeletePost(channelID, rootMessageID int64) {
+	link, ok := r.linkForChannel(channelID)
+	if !ok || !link.RelayEdits || !link.ToDiscord() {
+		return
+	}
+	r.enqueue(link.ID, func(ctx context.Context) {
+		if err := r.pushDelete(ctx, link, rootMessageID); err != nil &&
+			!errors.Is(err, store.ErrNotFound) && !errors.Is(err, discord.ErrNotFound) {
+			r.log.Warn("relay a post deletion into Discord",
+				slog.Int64("link", link.ID), slog.Any("error", err))
+		}
+	})
+}
+
 // outboundLink decides whether a message should cross, and to where.
 //
 // This is where the second half of the loop guard sits. A message written by
@@ -165,6 +199,72 @@ func (r *discordRelay) deliverToDiscord(ctx context.Context, link store.RelayLin
 	r.noteSuccess(ctx, link.ID)
 	r.log.Debug("relayed a message into Discord",
 		slog.Int64("link", link.ID), slog.Int64("message", m.ID), slog.Int("files", len(files)))
+	return nil
+}
+
+// deliverPostToDiscord posts one Aural media post through the link's webhook.
+func (r *discordRelay) deliverPostToDiscord(ctx context.Context, link store.RelayLink,
+	p store.Post, body store.Message, attachments []store.Attachment) error {
+
+	title := discord.EscapeOutbound(strings.TrimSpace(p.Title))
+	rawContent := strings.TrimSpace(body.Content)
+	var content string
+	if title != "" && rawContent != "" {
+		content = fmt.Sprintf("**%s**\n%s", title, discord.EscapeOutbound(rawContent))
+	} else if title != "" {
+		content = fmt.Sprintf("**%s**", title)
+	} else {
+		content = discord.EscapeOutbound(rawContent)
+	}
+
+	var files []discord.OutboundFile
+	var skipped []store.Attachment
+	if link.RelayAttachments {
+		files, skipped = r.outboundFiles(attachments)
+	} else {
+		skipped = attachments
+	}
+	if note := r.describeSkipped(skipped); note != "" {
+		if content != "" {
+			content += "\n"
+		}
+		content += note
+	}
+
+	if strings.TrimSpace(content) == "" && len(files) == 0 {
+		return nil
+	}
+
+	content, mentions := r.resolveOutboundMentions(link.DiscordGuildID, content)
+	content = discord.TruncateRunes(content, maxMessageRunes)
+
+	out := discord.OutboundMessage{
+		Content:         content,
+		Username:        r.outboundName(body),
+		AvatarURL:       r.outboundAvatar(body),
+		Files:           files,
+		AllowedMentions: mentions,
+	}
+
+	posted, err := r.restClient().Execute(ctx, link.WebhookID, link.WebhookToken, out)
+	if err != nil {
+		return err
+	}
+
+	if posted.ID != "" {
+		if err := r.st.MapRelayMessage(ctx, store.RelayMessage{
+			AuralID:   body.ID,
+			LinkID:    link.ID,
+			DiscordID: posted.ID,
+			Origin:    store.RelayOriginAural,
+		}); err != nil {
+			r.log.Warn("record what a relayed post is called on Discord", slog.Any("error", err))
+		}
+	}
+
+	r.noteSuccess(ctx, link.ID)
+	r.log.Debug("relayed a post into Discord",
+		slog.Int64("link", link.ID), slog.Int64("post", p.ID), slog.Int("files", len(files)))
 	return nil
 }
 
@@ -348,6 +448,18 @@ func (h *Hub) relayEdit(m store.Message) {
 func (h *Hub) relayDelete(m store.Message) {
 	if h.discord != nil {
 		h.discord.OutboundDelete(m)
+	}
+}
+
+func (h *Hub) relayPost(p store.Post, body store.Message, attachments []store.Attachment) {
+	if h.discord != nil {
+		h.discord.OutboundPost(p, body, attachments)
+	}
+}
+
+func (h *Hub) relayDeletePost(channelID, rootMessageID int64) {
+	if h.discord != nil {
+		h.discord.OutboundDeletePost(channelID, rootMessageID)
 	}
 }
 

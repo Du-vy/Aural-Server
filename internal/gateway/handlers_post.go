@@ -128,6 +128,7 @@ func handlePostCreate(ctx context.Context, s *Session, raw json.RawMessage) (any
 	// for everybody and can go out as it stands.
 	s.hub.BroadcastChannelEvent(
 		protocol.Event(protocol.EvPostCreated, protocol.PostEvent{Post: view}), created.ChannelID)
+	s.hub.relayPost(created, body, attachments)
 	s.log.Info("post created",
 		slog.Int64("post", created.ID), slog.Int64("channel", created.ChannelID))
 
@@ -323,6 +324,9 @@ func handlePostDelete(ctx context.Context, s *Session, raw json.RawMessage) (any
 
 	event := protocol.PostDeletedEvent{PostID: existing.ID, ChannelID: existing.ChannelID}
 	s.hub.BroadcastChannelEvent(protocol.Event(protocol.EvPostDeleted, event), existing.ChannelID)
+	if existing.RootMessageID != nil {
+		s.hub.relayDeletePost(existing.ChannelID, *existing.RootMessageID)
+	}
 	if !own {
 		s.log.Info("post deleted by a moderator",
 			slog.Int64("post", existing.ID), slog.Int64("channel", existing.ChannelID))

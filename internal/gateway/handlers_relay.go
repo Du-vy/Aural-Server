@@ -271,15 +271,14 @@ func handleRelayDelete(ctx context.Context, s *Session, raw json.RawMessage) (an
 }
 
 // requireRelayableChannel checks that a link may point at a channel: it has to
-// exist, and it has to be a text channel, because a bridge carries messages and
-// nothing else does.
+// exist, and it has to be a text or media channel.
 func (s *Session) requireRelayableChannel(channelID int64) *protocol.Error {
 	channel, ok := s.hub.Channel(channelID)
 	if !ok {
 		return protocol.Errorf(protocol.ErrNotFound, "no such channel")
 	}
-	if channel.Type != protocol.ChannelText {
-		return protocol.Errorf(protocol.ErrBadRequest, "only a text channel can be bridged")
+	if channel.Type != protocol.ChannelText && channel.Type != protocol.ChannelMedia {
+		return protocol.Errorf(protocol.ErrBadRequest, "only a text or media channel can be bridged")
 	}
 	return nil
 }
