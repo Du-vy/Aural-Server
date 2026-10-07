@@ -675,22 +675,30 @@ func (c *Client) dispatch(ctx context.Context, f frame) {
 
 	case "GUILD_ROLE_CREATE", "GUILD_ROLE_UPDATE":
 		var payload struct {
-			Role Role `json:"role"`
+			GuildID string `json:"guild_id"`
+			Role    Role   `json:"role"`
 		}
 		if err := json.Unmarshal(f.D, &payload); err == nil {
 			c.mu.Lock()
 			c.roles[payload.Role.ID] = payload.Role
 			c.mu.Unlock()
+			if payload.GuildID != "" {
+				c.rosterChanged(payload.GuildID)
+			}
 		}
 
 	case "GUILD_ROLE_DELETE":
 		var payload struct {
-			RoleID string `json:"role_id"`
+			GuildID string `json:"guild_id"`
+			RoleID  string `json:"role_id"`
 		}
 		if err := json.Unmarshal(f.D, &payload); err == nil {
 			c.mu.Lock()
 			delete(c.roles, payload.RoleID)
 			c.mu.Unlock()
+			if payload.GuildID != "" {
+				c.rosterChanged(payload.GuildID)
+			}
 		}
 
 	case "MESSAGE_CREATE":

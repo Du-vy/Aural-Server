@@ -171,6 +171,9 @@ type RelayMember struct {
 	// Status is "online", "idle", "dnd" or "offline". Somebody invisible is
 	// reported offline, which is what being invisible is for.
 	Status string `json:"status"`
+	// Color is the #rrggbb hex colour of their highest ranked role with a
+	// colour on Discord, or empty if none.
+	Color string `json:"color,omitempty"`
 }
 
 // RelayRoster is the Discord side of one bridged channel.

@@ -214,6 +214,7 @@ func (r *discordRelay) rosterOf(client *discord.Client, guildID string) protocol
 			Avatar: m.Avatar,
 			Bot:    m.Bot,
 			Status: m.Status,
+			Color:  m.Color,
 		})
 	}
 

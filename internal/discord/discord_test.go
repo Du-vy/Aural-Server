@@ -403,3 +403,66 @@ func presenceOf(id, status string) rawPresence {
 	p.Status = status
 	return p
 }
+
+func TestMemberRoleColorResolution(t *testing.T) {
+	c := NewClient(Options{Token: "x"})
+
+	// Setup roles in guild
+	c.cacheGuild(Guild{
+		ID: "g1",
+		Roles: []Role{
+			{ID: "r_default", Name: "@everyone", Position: 0, Color: 0},
+			{ID: "r_red", Name: "Red Team", Position: 1, Color: 0xff0000},
+			{ID: "r_green", Name: "Green VIP", Position: 5, Color: 0x00ff00},
+			{ID: "r_admin_nocolor", Name: "Admin (No Color)", Position: 10, Color: 0},
+		},
+	})
+
+	c.cacheRoster("g1", []rawMember{
+		// No roles
+		{User: User{ID: "1", Username: "noroles"}},
+		// Only role with color 0
+		{User: User{ID: "2", Username: "nocolor"}, Roles: []string{"r_default"}},
+		// Single colored role
+		{User: User{ID: "3", Username: "red_only"}, Roles: []string{"r_red"}},
+		// Multiple roles: Admin (pos 10, color 0), Green (pos 5, color #00ff00), Red (pos 1, color #ff0000)
+		// Should resolve to Green (#00ff00) because pos 10 has color 0
+		{User: User{ID: "4", Username: "multi_roles"}, Roles: []string{"r_red", "r_admin_nocolor", "r_green"}},
+	}, nil, 4)
+
+	members, _ := c.GuildRoster("g1")
+	colors := make(map[string]string)
+	for _, m := range members {
+		colors[m.ID] = m.Color
+	}
+
+	if colors["1"] != "" {
+		t.Fatalf("member with no roles should have empty color, got: %q", colors["1"])
+	}
+	if colors["2"] != "" {
+		t.Fatalf("member with color 0 role should have empty color, got: %q", colors["2"])
+	}
+	if colors["3"] != "#ff0000" {
+		t.Fatalf("member with red role want #ff0000, got: %q", colors["3"])
+	}
+	if colors["4"] != "#00ff00" {
+		t.Fatalf("member with multi roles want #00ff00, got: %q", colors["4"])
+	}
+
+	// Verify MemberByName also returns Color
+	if m, ok := c.MemberByName("g1", "multi_roles"); !ok || m.Color != "#00ff00" {
+		t.Fatalf("MemberByName want color #00ff00, got: %q (ok=%v)", m.Color, ok)
+	}
+
+	// Now simulate updating Red role to position 20 (outranking Green)
+	c.mu.Lock()
+	c.roles["r_red"] = Role{ID: "r_red", Name: "Red Team", Position: 20, Color: 0xff0000}
+	c.mu.Unlock()
+
+	membersAfter, _ := c.GuildRoster("g1")
+	for _, m := range membersAfter {
+		if m.ID == "4" && m.Color != "#ff0000" {
+			t.Fatalf("after promoting red role, want #ff0000, got: %q", m.Color)
+		}
+	}
+}

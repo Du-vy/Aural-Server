@@ -3,6 +3,7 @@ package discord
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -74,6 +75,11 @@ type GuildMember struct {
 	// Status is one of the four above. Somebody with no presence at all is
 	// offline, which is also what a guild that never sent one reports.
 	Status string
+	// Roles holds the role ids this member has in the guild.
+	Roles []string
+	// Color is the #rrggbb hex colour of their highest ranked role that sets
+	// a colour, or empty if none.
+	Color string
 }
 
 // Online reports whether this member counts as around. Idle and do-not-disturb
@@ -92,9 +98,10 @@ type guildRoster struct {
 // rawMember is the member object as it arrives, in GUILD_CREATE, in a chunk,
 // and in GUILD_MEMBER_ADD/UPDATE alike.
 type rawMember struct {
-	User   User    `json:"user"`
-	Nick   *string `json:"nick"`
-	Avatar *string `json:"avatar"`
+	User   User     `json:"user"`
+	Nick   *string  `json:"nick"`
+	Avatar *string  `json:"avatar"`
+	Roles  []string `json:"roles"`
 }
 
 // rawPresence is the presence object, which names only the account it is about.
@@ -128,7 +135,30 @@ func (r rawMember) member(guildID string) GuildMember {
 		Avatar: avatar,
 		Bot:    r.User.Bot,
 		Status: StatusOffline,
+		Roles:  r.Roles,
 	}
+}
+
+// memberColor finds the hex colour (#rrggbb) of the member's highest
+// role that sets one, matching Discord's own display logic.
+// Caller must hold c.mu (either RLock or Lock).
+func (c *Client) memberColor(roles []string) string {
+	bestPos := -1
+	bestColor := 0
+	for _, id := range roles {
+		r, ok := c.roles[id]
+		if !ok || r.Color == 0 {
+			continue
+		}
+		if r.Position > bestPos {
+			bestPos = r.Position
+			bestColor = r.Color
+		}
+	}
+	if bestColor > 0 {
+		return fmt.Sprintf("#%06x", bestColor&0xffffff)
+	}
+	return ""
 }
 
 // GuildRoster is everybody the bot can see in one guild, ordered the way a
@@ -146,6 +176,7 @@ func (c *Client) GuildRoster(guildID string) (members []GuildMember, total int) 
 	}
 	out := make([]GuildMember, 0, len(roster.members))
 	for _, m := range roster.members {
+		m.Color = c.memberColor(m.Roles)
 		out = append(out, m)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -189,6 +220,7 @@ func (c *Client) MemberByName(guildID, name string) (GuildMember, bool) {
 	matches := 0
 	for _, m := range roster.members {
 		if strings.EqualFold(m.Handle, name) {
+			m.Color = c.memberColor(m.Roles)
 			return m, true
 		}
 		if strings.EqualFold(m.Name, name) {
@@ -197,6 +229,7 @@ func (c *Client) MemberByName(guildID, name string) (GuildMember, bool) {
 		}
 	}
 	if matches == 1 {
+		byName.Color = c.memberColor(byName.Roles)
 		return byName, true
 	}
 	return GuildMember{}, false
@@ -234,6 +267,9 @@ func (c *Client) cacheRoster(guildID string, members []rawMember, presences []ra
 		// about it survives the update.
 		if previous, known := roster.members[raw.User.ID]; known {
 			next.Status = previous.Status
+			if raw.Roles == nil && len(previous.Roles) > 0 {
+				next.Roles = previous.Roles
+			}
 		}
 		roster.members[raw.User.ID] = next
 	}

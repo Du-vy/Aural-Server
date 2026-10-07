@@ -190,11 +190,13 @@ func (s StickerItem) StickerURL() string {
 
 // --- the objects the gateway caches -----------------------------------------
 
-// Role is a guild role, kept only so that a role mention in a message can be
-// rendered as the name a reader would have seen.
+// Role is a guild role, kept for mention resolution and for computing
+// a member's role colour in the roster.
 type Role struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Color    int    `json:"color"`
+	Position int    `json:"position"`
 }
 
 // Channel is a guild channel, kept for the same reason — to turn a channel
